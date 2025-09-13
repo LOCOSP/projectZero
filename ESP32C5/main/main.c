@@ -81,6 +81,7 @@ static int g_selected_count = 0;
 
 char * evilTwinSSID = NULL;
 char * evilTwinPassword = NULL;
+int connectAttemptCount = 0;
 
 
 // Methods forward declarations
@@ -133,7 +134,11 @@ static void wifi_event_handler(void *event_handler_arg,
                      (const char*)e->ssid, (int)e->reason);
             if (applicationState == EVIL_TWIN_PASS_CHECK) {
                 ESP_LOGW(TAG, "Evil twin: connection failed, wrong password?");
-                applicationState = DEAUTH_EVIL_TWIN; //go back to deauth
+                if (connectAttemptCount++>3) {
+                    ESP_LOGW(TAG, "Evil twin: Too many failed attempts, giving up.");
+                    applicationState = DEAUTH_EVIL_TWIN; //go back to deauth
+                    connectAttemptCount = 0;
+                }
             } else {
                 applicationState = IDLE;
             }
@@ -173,7 +178,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     strncpy((char *)sta_config.sta.password, msg, sizeof(sta_config.sta.password));
     sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = '\0'; // null-terminate
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(2000));
     esp_wifi_connect();
     vTaskDelay(pdMS_TO_TICKS(100));
     

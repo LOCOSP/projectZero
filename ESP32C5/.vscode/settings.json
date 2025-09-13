@@ -1,0 +1,5 @@
+{
+    "idf.flashType": "UART",
+    "idf.monitorPort": "/dev/tty.usbserial-240",
+    "idf.port": "/dev/tty.usbserial-240"
+}
