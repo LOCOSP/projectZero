@@ -37,8 +37,7 @@
 static const char *TAG = "projectZero";
 
 //Target (ESP32) MAC of the other device (ESP32):
-uint8_t esp32_mac[] = //{0x00, 0x4B, 0x12, 0x3C, 0x03, 0x6C};
-{0x28, 0x37, 0x2F, 0x5F, 0xC3, 0x18};
+uint8_t esp32_mac[] = {0x28, 0x37, 0x2F, 0x5F, 0xC3, 0x18};
 
 
 /**
@@ -471,14 +470,13 @@ static void register_commands(void)
 
 void app_main(void) {
 
-    // esp_log_level_set("wifi", ESP_LOG_INFO);
-    // esp_log_level_set("projectZero", ESP_LOG_INFO);
-    // esp_log_level_set("espnow", ESP_LOG_INFO);
+    esp_log_level_set("wifi", ESP_LOG_INFO);
+    esp_log_level_set("projectZero", ESP_LOG_INFO);
+    esp_log_level_set("espnow", ESP_LOG_INFO);
 
-
-    esp_log_level_set("wifi", ESP_LOG_DEBUG);
-    esp_log_level_set(TAG, ESP_LOG_DEBUG);
-    esp_log_level_set("espnow", ESP_LOG_DEBUG);
+    // esp_log_level_set("wifi", ESP_LOG_DEBUG);
+    // esp_log_level_set(TAG, ESP_LOG_DEBUG);
+    // esp_log_level_set("espnow", ESP_LOG_DEBUG);
 
 
     ESP_LOGI(TAG, "Application starts (ESP32-C5)");
