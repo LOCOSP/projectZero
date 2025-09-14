@@ -854,6 +854,13 @@
 /Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/wifi_provisioning/CMakeFiles/install.dir
 /Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/wifi_provisioning/CMakeFiles/install/local.dir
 /Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/wifi_provisioning/CMakeFiles/install/strip.dir
+/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/espressif__led_strip/CMakeFiles/__idf_espressif__led_strip.dir
+/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/espressif__led_strip/CMakeFiles/edit_cache.dir
+/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/espressif__led_strip/CMakeFiles/rebuild_cache.dir
+/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/espressif__led_strip/CMakeFiles/list_install_components.dir
+/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/espressif__led_strip/CMakeFiles/install.dir
+/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/espressif__led_strip/CMakeFiles/install/local.dir
+/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/espressif__led_strip/CMakeFiles/install/strip.dir
 /Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/main/CMakeFiles/__idf_main.dir
 /Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/main/CMakeFiles/edit_cache.dir
 /Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/main/CMakeFiles/rebuild_cache.dir

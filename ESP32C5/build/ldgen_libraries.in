@@ -166,4 +166,6 @@ $<TARGET_FILE:idf::rt>
 $<TARGET_FILE:idf::spiffs>
 $<TARGET_FILE:idf::wifi_provisioning>
 $<TARGET_FILE:__idf_json>
+$<TARGET_FILE:idf::espressif__led_strip>
 $<TARGET_FILE:idf::main>
+$<TARGET_FILE:__idf_espressif__led_strip>

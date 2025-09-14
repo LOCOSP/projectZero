@@ -121,6 +121,7 @@
 		"/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/ulp/cmake_install.cmake",
 		"/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/usb/cmake_install.cmake",
 		"/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/wifi_provisioning/cmake_install.cmake",
+		"/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/espressif__led_strip/cmake_install.cmake",
 		"/Users/janulrich/kod/dev/projectZero/ESP32C5/build/esp-idf/main/cmake_install.cmake"
 	],
 	"Parallel" : false
