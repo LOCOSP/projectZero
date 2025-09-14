@@ -1,5 +1,11 @@
 # Goal
-2-board evil twin. ESP32C5 &amp; ESP32. CLI and Flipper Zero. Captive portal and password verification.
+This project is an 2-board evil twin. It's based on:
+- ESP32C5 (main CLI steering, deauth and password verification)
+- ESP32 (evil twin captive portal)
+
+It provides CLI and in future will provide an Flipper Zero app running captive portal and password verification.
+
+![alt text](image-10.png)
 
 # Features
 Deauthenticates more than one network, including 5GHz on very high channels. Uses PH country code. 
