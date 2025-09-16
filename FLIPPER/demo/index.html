@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flipper Zero - Evil Twin Controller</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="flipper-container">
+        <!-- Flipper Screen -->
+        <div class="flipper-screen">
+            <!-- Main Menu Screen -->
+            <div id="main-menu" class="screen active">
+                <div class="screen-header">
+                    <h1>Evil Twin Controller</h1>
+                </div>
+                <div class="menu-content">
+                    <div class="menu-item selected" data-index="0">
+                        <span class="menu-number">1.</span> Skanowanie sieci
+                    </div>
+                    <div class="menu-item" data-index="1">
+                        <span class="menu-number">2.</span> Reboot urządzenia
+                    </div>
+                </div>
+                <div class="screen-footer">
+                    <span>↑↓ Nawigacja | OK Wybór</span>
+                </div>
+            </div>
+
+            <!-- Network Scanning Screen -->
+            <div id="scan-networks" class="screen">
+                <div class="screen-header">
+                    <h1>Wybierz sieci</h1>
+                </div>
+                <div class="networks-content">
+                    <div class="networks-header">
+                        <span class="col-index">Idx</span>
+                        <span class="col-rssi">RSSI</span>
+                        <span class="col-auth">Auth</span>
+                        <span class="col-ch">Ch</span>
+                        <span class="col-bssid">BSSID</span>
+                        <span class="col-ssid">SSID</span>
+                    </div>
+                    <div class="networks-list" id="networks-list">
+                        <!-- Networks will be populated by JavaScript -->
+                    </div>
+                </div>
+                <div class="screen-footer">
+                    <div class="footer-actions">
+                        <button id="start-evil-twin" class="btn btn--primary" disabled>Start Evil Twin</button>
+                        <span class="controls-hint">OK Zaznacz | Back Wróć</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Evil Twin Running Screen -->
+            <div id="evil-twin-running" class="screen">
+                <div class="screen-header">
+                    <h1>Evil Twin - Running</h1>
+                </div>
+                <div class="logs-content">
+                    <div class="logs-container" id="logs-container">
+                        <!-- Logs will be populated by JavaScript -->
+                    </div>
+                </div>
+                <div class="screen-footer">
+                    <span>Back Zatrzymaj</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- D-pad Controls -->
+        <div class="dpad-container">
+            <div class="dpad">
+                <button class="dpad-btn dpad-up" id="btn-up">↑</button>
+                <div class="dpad-middle">
+                    <button class="dpad-btn dpad-left" id="btn-left">←</button>
+                    <button class="dpad-btn dpad-ok" id="btn-ok">OK</button>
+                    <button class="dpad-btn dpad-right" id="btn-right">→</button>
+                </div>
+                <button class="dpad-btn dpad-down" id="btn-down">↓</button>
+            </div>
+            <button class="back-btn" id="btn-back">BACK</button>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

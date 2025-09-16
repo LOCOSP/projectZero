@@ -12,7 +12,7 @@ This code is for the Slave - ESP32. Features:
 #include <esp_now.h>
 
 /* Swap these with your esp32-c5 mac */
-uint8_t receiverAddress[] = {0x30, 0xED, 0xA0, 0xE3, 0xEC, 0x18};
+uint8_t receiverAddress[] = {0x30, 0xED, 0xA0, 0xE4, 0x6C, 0x40};
 
 const byte    DNS_PORT = 53;
 IPAddress     apIP(172, 0, 0, 1);

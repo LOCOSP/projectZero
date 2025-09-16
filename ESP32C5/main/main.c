@@ -319,12 +319,17 @@ static void print_scan_results(void) {
 
 // --- CLI: commands ---
 static int cmd_scan_networks(int argc, char **argv) {
+    ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 255, 0));
+    ESP_ERROR_CHECK(led_strip_refresh(strip));
+
     (void)argc; (void)argv;
     esp_err_t err = do_scan_and_store();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Scan failed: %s", esp_err_to_name(err));
         return 1;
     }
+    ESP_ERROR_CHECK(led_strip_clear(strip));
+    ESP_ERROR_CHECK(led_strip_refresh(strip));
     print_scan_results();
     return 0;
 }
