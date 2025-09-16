@@ -10,7 +10,7 @@ typedef struct {
 
 static NetworkListState network_state = {0, 0, false};
 
-// Draw callback for network list z ULEPSZONYM UI
+// PROBLEM 2 FIX: Draw callback that ALWAYS shows "Trwa skanowanie" when UartStateScanning
 static void network_list_draw_callback(Canvas* canvas, void* context) {
     SAFE_CHECK(canvas);
     SAFE_CHECK(context);
@@ -24,24 +24,25 @@ static void network_list_draw_callback(Canvas* canvas, void* context) {
     // Header
     canvas_draw_str(canvas, 2, 8, "Evil Twin ESP32");
 
-    // ZADANIE 3: Show status based on UART state with IMPROVED UI
+    // PROBLEM 2 FIX: ALWAYS show proper status based on UART state
     if(app->uart_state == UartStateScanning) {
-        // SCANNING STATE: "Trwa skanowanie" with progress
+        // SCANNING STATE: "Trwa skanowanie" with progress - PROBLEM 2 FIX
         uint32_t elapsed_ms = get_scan_elapsed_ms(app);
         uint32_t elapsed_sec = elapsed_ms / 1000;
 
+        // Show SCANNING status in header
         canvas_draw_str(canvas, 75, 8, "SCANNING");
         canvas_draw_line(canvas, 0, 10, 128, 10);
 
-        // ZADANIE 3: "Trwa skanowanie" message
+        // PROBLEM 2 FIX: Always show "Trwa skanowanie" when in scanning state
         canvas_set_font(canvas, FontPrimary);
-        canvas_draw_str(canvas, 15, 30, "Trwa skanowanie");
+        canvas_draw_str(canvas, 15, 28, "Trwa skanowanie");
         canvas_set_font(canvas, FontSecondary);
 
-        // Show progress info
+        // Show detailed progress info
         char time_str[32];
         snprintf(time_str, sizeof(time_str), "Czas: %lu sek", elapsed_sec);
-        canvas_draw_str(canvas, 25, 42, time_str);
+        canvas_draw_str(canvas, 25, 40, time_str);
 
         // Show timeout countdown (25 seconds)
         uint32_t timeout_sec = SCAN_TIMEOUT_MS / 1000;
@@ -49,19 +50,25 @@ static void network_list_draw_callback(Canvas* canvas, void* context) {
             uint32_t remaining = timeout_sec - elapsed_sec;
             char timeout_str[32];
             snprintf(timeout_str, sizeof(timeout_str), "Timeout za: %lu s", remaining);
-            canvas_draw_str(canvas, 18, 52, timeout_str);
-        }
-
-        // Show ESP32 response status
-        if(app->esp32_response_detected) {
-            canvas_draw_str(canvas, 15, 62, "ESP32 odpowiada...");
-        } else if(elapsed_sec > 18) {  // After fallback delay
-            canvas_draw_str(canvas, 20, 62, "Tryb fallback");
+            canvas_draw_str(canvas, 18, 50, timeout_str);
         } else {
-            canvas_draw_str(canvas, 18, 62, "Czekam na ESP32");
+            canvas_draw_str(canvas, 25, 50, "Processing...");
         }
 
-        return;
+        // Show ESP32 response status or UART status
+        if(!app->real_esp32_mode) {
+            canvas_draw_str(canvas, 20, 60, "Demo simulation");
+        } else if(app->esp32_response_detected) {
+            canvas_draw_str(canvas, 15, 60, "ESP32 odpowiada...");
+        } else if(elapsed_sec > 18) {  // After fallback delay
+            canvas_draw_str(canvas, 20, 60, "Tryb fallback");
+        } else {
+            canvas_draw_str(canvas, 18, 60, "Czekam na ESP32");
+        }
+
+        // Footer for scanning
+        canvas_draw_str(canvas, 2, 63, "Back=Cancel");
+        return;  // PROBLEM 2 FIX: Always return here when scanning
 
     } else if(app->uart_state == UartStateTimeout) {
         // TIMEOUT STATE - better error display
@@ -108,6 +115,8 @@ static void network_list_draw_callback(Canvas* canvas, void* context) {
 
         if(app->esp32_response_detected) {
             canvas_draw_str(canvas, 8, 42, "ESP32 nie znalazł AP");
+        } else if(!app->real_esp32_mode) {
+            canvas_draw_str(canvas, 8, 42, "Demo mode - fake data");
         } else {
             canvas_draw_str(canvas, 8, 42, "ESP32 nie odpowiadał");
         }
@@ -127,7 +136,7 @@ static void network_list_draw_callback(Canvas* canvas, void* context) {
         return;
     }
 
-    // ZADANIE 3: ŁADNA LISTA SIECI do zaznaczania
+    // NETWORK LIST - show beautiful network list
     if(app->networks_ready && app->network_count > 0) {
         int y = 18;
         int visible = 0;
@@ -147,7 +156,7 @@ static void network_list_draw_callback(Canvas* canvas, void* context) {
         if(network_state.scroll_offset < 0) network_state.scroll_offset = 0;
         if(network_state.scroll_offset >= app->network_count) network_state.scroll_offset = 0;
 
-        // ZADANIE 3: Ładnie sformatowana lista sieci
+        // Beautiful network list
         for(int i = network_state.scroll_offset; i < app->network_count && visible < NETWORK_LIST_MAX_VISIBLE; i++) {
             if(i < 0 || i >= MAX_NETWORKS) break; // Extra bounds check
 
@@ -170,7 +179,7 @@ static void network_list_draw_callback(Canvas* canvas, void* context) {
                 }
             }
 
-            // ZADANIE 3: Ładny format linii sieci
+            // Beautiful format line
             char line[80];
             const char* auth_str = 
                 (net->auth == 0) ? "Open" :
@@ -184,7 +193,7 @@ static void network_list_draw_callback(Canvas* canvas, void* context) {
             strncpy(safe_ssid, net->ssid, sizeof(safe_ssid) - 1);
             safe_ssid[sizeof(safe_ssid) - 1] = '\0';
 
-            // IMPROVED: Better formatting - [X]* SSID (RSSI dBm) AUTH  
+            // Format: [X]* SSID (RSSI dBm) AUTH  
             snprintf(line, sizeof(line), "[%c]%c %s (%d) %s",
                 selected ? 'X' : ' ',
                 is_first ? '*' : ' ',
@@ -202,7 +211,7 @@ static void network_list_draw_callback(Canvas* canvas, void* context) {
         // CRITICAL: Always release mutex
         furi_mutex_release(app->uart_mutex);
 
-        // ZADANIE 3: Start button - improved styling
+        // Start button - improved styling
         if(app->selected_count > 0) {
             int button_y = 56;
             if(network_state.start_button_focused) {
@@ -240,6 +249,7 @@ static bool network_list_input_callback(InputEvent* event, void* context) {
             app->scan_start_time = 0;
             app->scan_completed = false;
             app->esp32_response_detected = false;
+            app->real_esp32_mode = true;  // Reset mode
             if(app->scene_manager && !app->shutdown_requested) {
                 scene_manager_previous_scene(app->scene_manager);
             }
@@ -258,6 +268,7 @@ static bool network_list_input_callback(InputEvent* event, void* context) {
                 app->scan_start_time = 0;
                 app->scan_completed = false;
                 app->esp32_response_detected = false;
+                app->real_esp32_mode = true;  // Reset mode
                 if(app->scene_manager && !app->shutdown_requested) {
                     scene_manager_previous_scene(app->scene_manager);
                 }
@@ -265,7 +276,19 @@ static bool network_list_input_callback(InputEvent* event, void* context) {
             } else if(event->key == InputKeyOk) {
                 // Retry scan
                 clear_networks_safe(app);
-                uart_send_command_safe(app, "scan_networks");
+
+                bool uart_success = uart_send_command_safe(app, "scan_networks");
+                if(uart_success) {
+                    app->uart_state = UartStateScanning;
+                    app->real_esp32_mode = true;
+                } else {
+                    app->uart_state = UartStateScanning;
+                    app->real_esp32_mode = false;  // Fallback mode
+                }
+                app->scan_start_time = furi_get_tick();
+                app->scan_completed = false;
+                app->esp32_response_detected = false;
+                force_ui_refresh(app);
                 return true;
             }
         }
@@ -283,7 +306,19 @@ static bool network_list_input_callback(InputEvent* event, void* context) {
             } else if(event->key == InputKeyOk) {
                 // Retry scan
                 clear_networks_safe(app);
-                uart_send_command_safe(app, "scan_networks");
+
+                bool uart_success = uart_send_command_safe(app, "scan_networks");
+                if(uart_success) {
+                    app->uart_state = UartStateScanning;
+                    app->real_esp32_mode = true;
+                } else {
+                    app->uart_state = UartStateScanning;
+                    app->real_esp32_mode = false;  // Fallback mode
+                }
+                app->scan_start_time = furi_get_tick();
+                app->scan_completed = false;
+                app->esp32_response_detected = false;
+                force_ui_refresh(app);
                 return true;
             }
         }
@@ -301,14 +336,26 @@ static bool network_list_input_callback(InputEvent* event, void* context) {
             } else if(event->key == InputKeyOk) {
                 // Start scan
                 clear_networks_safe(app);
-                uart_send_command_safe(app, "scan_networks");
+
+                bool uart_success = uart_send_command_safe(app, "scan_networks");
+                if(uart_success) {
+                    app->uart_state = UartStateScanning;
+                    app->real_esp32_mode = true;
+                } else {
+                    app->uart_state = UartStateScanning;
+                    app->real_esp32_mode = false;  // Fallback mode
+                }
+                app->scan_start_time = furi_get_tick();
+                app->scan_completed = false;
+                app->esp32_response_detected = false;
+                force_ui_refresh(app);
                 return true;
             }
         }
         return true;
     }
 
-    // ZADANIE 3: Normal network selection input handling - IMPROVED navigation
+    // Normal network selection input handling
     if(app->networks_ready && app->network_count > 0 && event->type == InputTypeShort) {
         switch(event->key) {
             case InputKeyUp:
@@ -343,7 +390,7 @@ static bool network_list_input_callback(InputEvent* event, void* context) {
 
             case InputKeyOk:
                 if(network_state.start_button_focused) {
-                    // ZADANIE 3: Start Evil Twin attack with selected networks
+                    // Start Evil Twin attack with selected networks
                     char command[128];
                     int offset = snprintf(command, sizeof(command), "select_networks");
 
@@ -358,7 +405,7 @@ static bool network_list_input_callback(InputEvent* event, void* context) {
                         scene_manager_next_scene(app->scene_manager, EvilTwinControllerSceneEvilTwinLogs);
                     }
                 } else {
-                    // ZADANIE 3: Toggle network selection with visual feedback
+                    // Toggle network selection with visual feedback
                     int idx = network_state.selected_item;
                     if(idx < 0 || idx >= app->network_count) break;
 
@@ -449,8 +496,11 @@ void evil_twin_controller_scene_network_list_on_enter(void* context) {
         view_dispatcher_switch_to_view(app->view_dispatcher, EvilTwinControllerViewNetworkList);
     }
 
-    FURI_LOG_I(TAG, "Network list entered - state: %d, ESP32 response: %s, networks: %d", 
-              app->uart_state, app->esp32_response_detected ? "YES" : "NO", app->network_count);
+    // PROBLEM 2 FIX: Force UI refresh immediately when entering
+    force_ui_refresh(app);
+
+    FURI_LOG_I(TAG, "Network list entered - state: %d, ESP32 mode: %s, networks: %d", 
+              app->uart_state, app->real_esp32_mode ? "REAL" : "DEMO", app->network_count);
 }
 
 bool evil_twin_controller_scene_network_list_on_event(void* context, SceneManagerEvent event) {
