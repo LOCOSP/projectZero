@@ -188,7 +188,7 @@ void evil_esp_show_popup(EvilEspApp* app, const char* header, const char* text) 
     // Flipper Zero screen is 128x64 pixels
     popup_set_header(app->popup, header, 64, 8, AlignCenter, AlignTop);
     popup_set_text(app->popup, text, 64, 35, AlignCenter, AlignCenter);
-    popup_set_timeout(app->popup, 3000);
+    popup_set_timeout(app->popup, 10000);
     popup_enable_timeout(app->popup);
     view_dispatcher_switch_to_view(app->view_dispatcher, EvilEspViewPopup);
 }
@@ -259,7 +259,7 @@ void evil_esp_send_command(EvilEspApp* app, const char* command) {
 }
 
 void evil_esp_send_scan_command(EvilEspApp* app) {
-    evil_esp_send_command(app, "scan_netorks");
+    evil_esp_send_command(app, "scan_networks");
 }
 
 void evil_esp_send_attack_start(EvilEspApp* app) {
@@ -267,7 +267,7 @@ void evil_esp_send_attack_start(EvilEspApp* app) {
 }
 
 void evil_esp_send_attack_stop(EvilEspApp* app) {
-    evil_esp_send_command(app, "stop");
+    evil_esp_send_command(app, "stop deauther");
 }
 
 void evil_esp_send_sniff_command(EvilEspApp* app, const char* mode) {
@@ -282,7 +282,7 @@ void evil_esp_send_set_target(EvilEspApp* app, const char* targets) {
     if(!app || !targets) return;
 
     char cmd[128];
-    snprintf(cmd, sizeof(cmd), "set target %s", targets);
+    snprintf(cmd, sizeof(cmd), "select_networks %s", targets);
     evil_esp_send_command(app, cmd);
 }
 

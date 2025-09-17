@@ -5,7 +5,7 @@
 #define BAUDRATE (115200)
 #define RX_BUFFER_SIZE (512)
 #define MAX_RECENT_COMMANDS 10
-#define COMMAND_ECHO_TIMEOUT_MS 1000
+#define COMMAND_ECHO_TIMEOUT_MS 10000
 
 // Forward declarations for response handler functions
 static void handle_info_response(EvilEspUartWorker* worker, const char* line);
@@ -55,7 +55,7 @@ static int32_t uart_worker_thread(void* context) {
 
     char* line_buffer = worker->line_buffer; // Use heap-allocated buffer
     size_t line_pos = 0;
-    const size_t max_line_size = 512;
+    const size_t max_line_size = 4096;
 
     while(worker->running) {
         uint8_t byte;
@@ -174,7 +174,7 @@ static void handle_info_response(EvilEspUartWorker* worker, const char* line) {
     // Look for actual scan result lines - must start with "[INFO] " followed by a digit and tab
     else if(strncmp(line, "[INFO] ", 7) == 0 && strlen(line) > 8) {
         const char* after_prefix = line + 7; // Skip "[INFO] "
-        if(after_prefix[0] >= '0' && after_prefix[0] <= '9' && strchr(after_prefix, '\t') != NULL) {
+        if(after_prefix[0] == '"' && strstr(after_prefix, "\",\"") != NULL && strlen(line) > 30) {
             // This looks like a scan result line: "[INFO] 0\tSSID\t..."
             parse_scan_result_line(worker, line);
         }
@@ -272,112 +272,200 @@ static void handle_generic_response(EvilEspUartWorker* worker, const char* line)
     FURI_LOG_I("EvilEsp", "Generic: %s", line);
 }
 
-// Parse scan result line like: "[INFO] 0\tSSID_NAME\tBSSID\tChannel\tRSSI\tFrequency"
 static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line) {
     if(!worker || !worker->app) return;
     if(worker->app->network_count >= EVIL_ESP_MAX_NETWORKS) return;
 
     // Skip "[INFO] " prefix (7 characters)
     const char* data = line + 7;
+    
+    // Sprawdź czy linia zaczyna się od cudzysłowu (format CSV)
+    if(data[0] != '"') {
+        return; // To nie jest linia CSV z wynikami skanowania
+    }
 
-    // Manual tab parsing without strtok (not available in Flipper API)
-    const char* field_starts[6] = {0}; // index, ssid, bssid, channel, rssi, frequency
-    int field_lengths[6] = {0};
-    int field_count = 0;
-
-    // Find field boundaries manually
-    const char* current = data;
-    field_starts[field_count] = current;
-
-    while(*current && field_count < 6) {
-        if(*current == '\t' || *current == '\n' || *current == '\r') {
-            field_lengths[field_count] = current - field_starts[field_count];
-            field_count++;
-
-            if(field_count < 6) {
-                current++; // Skip the tab
-                while(*current == ' ') current++; // Skip any spaces after tab
-                field_starts[field_count] = current;
+    FURI_LOG_I("EvilEsp", "Parsing CSV scan line: %s", data);
+    
+    // Pola do wypełnienia
+    char index_str[16] = "";
+    char ssid[64] = "";
+    char bssid[32] = "";
+    char channel_str[16] = "";
+    char rssi_str[16] = "";
+    char freq_str[16] = "";
+    
+    // Parsowanie CSV
+    const char* fields[] = {index_str, ssid, bssid, channel_str, rssi_str, freq_str};
+    size_t field_sizes[] = {sizeof(index_str), sizeof(ssid), sizeof(bssid), 
+                           sizeof(channel_str), sizeof(rssi_str), sizeof(freq_str)};
+    
+    int field_count = sizeof(fields) / sizeof(fields[0]);
+    int current_field = 0;
+    const char* pos = data;
+    
+    while(*pos && current_field < field_count) {
+        // Oczekuj cudzysłowu na początku pola
+        if(*pos != '"') break;
+        pos++; // Pomiń otwierający cudzysłów
+        
+        // Czytaj zawartość pola
+        char* field_ptr = (char*)fields[current_field];
+        size_t field_pos = 0;
+        size_t max_len = field_sizes[current_field] - 1;
+        
+        while(*pos && field_pos < max_len) {
+            if(*pos == '"') {
+                // Sprawdź czy to escape'owany cudzysłów
+                if(*(pos + 1) == '"') {
+                    // Podwójny cudzysłów = escape'owany cudzysłów
+                    field_ptr[field_pos++] = '"';
+                    pos += 2; // Pomiń oba cudzysłowy
+                } else {
+                    // Pojedynczy cudzysłów = koniec pola
+                    break;
+                }
+            } else {
+                field_ptr[field_pos++] = *pos;
+                pos++;
             }
-        } else {
-            current++;
         }
+        field_ptr[field_pos] = '\0';
+        
+        // Pomiń zamykający cudzysłów
+        if(*pos == '"') pos++;
+        
+        // Pomiń przecinek i spacje
+        while(*pos && (*pos == ',' || *pos == ' ')) pos++;
+        
+        current_field++;
     }
-
-    // Handle the last field if we reached end of string
-    if(field_count < 6 && *current == '\0') {
-        field_lengths[field_count] = current - field_starts[field_count];
-        field_count++;
-    }
-
-    // Need at least 5 fields (index, ssid, bssid, channel, rssi)
-    if(field_count < 5) {
-        FURI_LOG_W("EvilEsp", "Invalid scan line, only %d fields: %s", field_count, line);
+    
+    // Sprawdź czy mamy wszystkie wymagane pola
+    if(current_field < 6 || strlen(index_str) == 0 || strlen(bssid) == 0) {
+        FURI_LOG_W("EvilEsp", "Missing required fields in CSV scan line");
         return;
     }
-
-    // Check if we have space for more networks
-    if(worker->app->network_count >= EVIL_ESP_MAX_NETWORKS) {
-        FURI_LOG_W("EvilEsp", "Maximum networks (%d) reached, ignoring additional network", EVIL_ESP_MAX_NETWORKS);
-        return;
-    }
-
-    // Store network data
+    
+    // Reszta parsowania jak poprzednio...
     int network_idx = worker->app->network_count;
     EvilEspNetwork* network = &worker->app->networks[network_idx];
+    
+    int device_index = atoi(index_str);
+    
+    network->index = network_idx;
+    network->device_index = device_index;
+    network->selected = false;
+    
+    // Kopiuj SSID
+    if(strlen(ssid) == 0) {
+        strcpy(network->ssid, "<Hidden Network>");
+    } else {
+        strncpy(network->ssid, ssid, sizeof(network->ssid) - 1);
+        network->ssid[sizeof(network->ssid) - 1] = '\0';
+    }
+    
+    // Kopiuj BSSID
+    strncpy(network->bssid, bssid, sizeof(network->bssid) - 1);
+    network->bssid[sizeof(network->bssid) - 1] = '\0';
+    
+    network->channel = atoi(channel_str);
+    if(network->channel == 0) network->channel = 1;
+    
+    network->rssi = atoi(rssi_str);
+    if(network->rssi == 0) network->rssi = -99;
+    
+    // Określ pasmo
+    if(strstr(freq_str, "5GHz")) {
+        network->band = EvilEspBand5GHz;
+    } else {
+        network->band = EvilEspBand24GHz;
+    }
+    
+    worker->app->network_count++;
+    
+    FURI_LOG_I("EvilEsp", "Parsed CSV network[%d]: '%s' (%s) Ch:%d RSSI:%d %s",
+        network_idx, network->ssid, network->bssid, 
+        network->channel, network->rssi,
+        (network->band == EvilEspBand5GHz) ? "5GHz" : "2.4GHz");
+}
+/*
+static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line) {
+    if(!worker || !worker->app) return;
+    if(worker->app->network_count >= EVIL_ESP_MAX_NETWORKS) return;
 
-    // Helper function to convert field to string
-    char temp_field[128];
+    const char* data = line + 7; // Skip "[INFO] "
 
-    // Parse device index (field 0) - this is the index from the ESP device
-    int len = (field_lengths[0] < 127) ? field_lengths[0] : 127;
-    strncpy(temp_field, field_starts[0], len);
-    temp_field[len] = '\0';
-    int device_index = atoi(temp_field);
+    char temp[128];
+    const char* current = data;
 
-    FURI_LOG_I("EvilEsp", "UART: Parsing field[0]='%s' -> device_index=%d", temp_field, device_index);
+    // Skip leading spaces
+    while(*current == ' ') current++;
 
-    // Use our internal array index for consistency, but store device index for commands
-    network->index = network_idx; // Internal array index for menu selection
-    network->device_index = device_index; // Original device index for commands
+    // Parse device index
+    const char* idx_start = current;
+    while(*current && *current != ' ') current++;
+    int idx_len = current - idx_start;
+    if(idx_len >= (int)sizeof(temp)) idx_len = (int)sizeof(temp) - 1;
+    strncpy(temp, idx_start, idx_len);
+    temp[idx_len] = '\0';
+    int device_index = atoi(temp);
 
-    // Initialize selection state
+    // Find BSSID (MAC address)
+    const char* bssid_start = NULL;
+    const char* scan = current;
+    while(*scan) {
+        if(isxdigit((unsigned char)scan[0]) && isxdigit((unsigned char)scan[1]) && scan[2] == ':' &&
+           isxdigit((unsigned char)scan[3]) && isxdigit((unsigned char)scan[4]) && scan[5] == ':' &&
+           isxdigit((unsigned char)scan[6]) && isxdigit((unsigned char)scan[7]) && scan[8] == ':' &&
+           isxdigit((unsigned char)scan[9]) && isxdigit((unsigned char)scan[10]) && scan[11] == ':' &&
+           isxdigit((unsigned char)scan[12]) && isxdigit((unsigned char)scan[13]) && scan[14] == ':' &&
+           isxdigit((unsigned char)scan[15]) && isxdigit((unsigned char)scan[16])) {
+            bssid_start = scan;
+            break;
+        }
+        scan++;
+    }
+
+    if(!bssid_start) {
+        FURI_LOG_W("EvilEsp", "No BSSID found in line: %s", line);
+        return;
+    }
+
+    // Extract SSID (between device index and BSSID)
+    int ssid_len = bssid_start - current;
+    while(ssid_len > 0 && (current[ssid_len - 1] == ' ' || current[ssid_len - 1] == '\t')) ssid_len--;
+    if(ssid_len >= (int)sizeof(temp)) ssid_len = (int)sizeof(temp) - 1;
+    strncpy(temp, current, ssid_len);
+    temp[ssid_len] = '\0';
+
+    // Extract BSSID
+    char bssid[18];
+    strncpy(bssid, bssid_start, 17);
+    bssid[17] = '\0';
+
+    // Move past BSSID and parse remaining fields
+    current = bssid_start + 17;
+    int channel = 0, rssi = 0;
+    char freq[16] = {0};
+
+    sscanf(current, "%d %d %15s", &channel, &rssi, freq);
+
+    // Store network
+    EvilEspNetwork* network = &worker->app->networks[worker->app->network_count];
+    network->index = worker->app->network_count;
+    network->device_index = device_index;
     network->selected = false;
 
-    // Copy SSID (field 1)
-    len = (field_lengths[1] < (int)(sizeof(network->ssid) - 1)) ? field_lengths[1] : (int)(sizeof(network->ssid) - 1);
-    strncpy(network->ssid, field_starts[1], len);
-    network->ssid[len] = '\0';
+    strncpy(network->ssid, temp, sizeof(network->ssid) - 1);
+    network->ssid[sizeof(network->ssid) - 1] = '\0';
 
-    // Copy BSSID (field 2)
-    len = (field_lengths[2] < (int)(sizeof(network->bssid) - 1)) ? field_lengths[2] : (int)(sizeof(network->bssid) - 1);
-    strncpy(network->bssid, field_starts[2], len);
-    network->bssid[len] = '\0';
+    strncpy(network->bssid, bssid, sizeof(network->bssid) - 1);
+    network->bssid[sizeof(network->bssid) - 1] = '\0';
 
-    // Parse channel (field 3)
-    len = (field_lengths[3] < 127) ? field_lengths[3] : 127;
-    strncpy(temp_field, field_starts[3], len);
-    temp_field[len] = '\0';
-    network->channel = atoi(temp_field);
+    network->channel = channel;
+    network->rssi = rssi;
 
-    // Parse RSSI (field 4)
-    len = (field_lengths[4] < 127) ? field_lengths[4] : 127;
-    strncpy(temp_field, field_starts[4], len);
-    temp_field[len] = '\0';
-    network->rssi = atoi(temp_field);
-
-    // Determine band from frequency field or channel number
-    if(field_count >= 6 && field_lengths[5] > 0) {
-        len = (field_lengths[5] < 127) ? field_lengths[5] : 127;
-        strncpy(temp_field, field_starts[5], len);
-        temp_field[len] = '\0';
-
-        if(strstr(temp_field, "5GHz")) {
-            network->band = EvilEspBand5GHz;
-        } else {
-            network->band = EvilEspBand24GHz;
-        }
-    } else if(network->channel >= 36) {
+    if(strstr(freq, "5GHz") || channel >= 36) {
         network->band = EvilEspBand5GHz;
     } else {
         network->band = EvilEspBand24GHz;
@@ -386,9 +474,11 @@ static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line) 
     worker->app->network_count++;
 
     FURI_LOG_I("EvilEsp", "Parsed network[%d] (device_idx=%d): '%s' (%s) Ch:%d RSSI:%d %s", 
-               network_idx, device_index, network->ssid, network->bssid, network->channel, network->rssi,
+               network->index, device_index, network->ssid, network->bssid, network->channel, network->rssi,
                (network->band == EvilEspBand5GHz) ? "5GHz" : "2.4GHz");
 }
+*/
+
 
 EvilEspUartWorker* evil_esp_uart_init(EvilEspApp* app) {
     EvilEspUartWorker* worker = malloc(sizeof(EvilEspUartWorker));

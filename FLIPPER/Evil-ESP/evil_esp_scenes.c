@@ -196,7 +196,7 @@ bool evil_esp_scene_on_event_main_menu(void* context, SceneManagerEvent event) {
         switch(event.event) {
         case EvilEspMainMenuIndexScanner:
             // Send scan command and open terminal to see results immediately
-            evil_esp_send_command(app, "scan");
+            evil_esp_send_command(app, "scan_networks");
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
             scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
             return true;
@@ -285,7 +285,7 @@ bool evil_esp_scene_on_event_scanner(void* context, SceneManagerEvent event) {
         scan_start_time = furi_get_tick();
     }
 
-    if(furi_get_tick() - scan_start_time > 15000) {
+    if(furi_get_tick() - scan_start_time > 45000) {
         FURI_LOG_I("EvilEsp", "Scan timeout reached with %d networks found", app->network_count);
 
         if(app->network_count == 0) {
@@ -615,7 +615,7 @@ bool evil_esp_scene_on_event_sniffer(void* context, SceneManagerEvent event) {
             for(uint8_t i = 0; i < app->network_count; i++) {
                 if(app->networks[i].selected) {
                     if(!first) {
-                        furi_string_cat_str(target_string, ",");
+                        furi_string_cat_str(target_string, " ");
                     }
                     // FIX: ESP device uses 1-based indexing, so add 1 to our 0-based menu index
                     furi_string_cat_printf(target_string, "%d", i + 1);
@@ -630,7 +630,7 @@ bool evil_esp_scene_on_event_sniffer(void* context, SceneManagerEvent event) {
             if(furi_string_size(target_string) > 0) {
                 // Send target command to Arduino
                 FuriString* set_target_cmd = furi_string_alloc();
-                furi_string_printf(set_target_cmd, "set target %s", furi_string_get_cstr(target_string));
+                furi_string_printf(set_target_cmd, "select_networks %s", furi_string_get_cstr(target_string));
 
                 FURI_LOG_I("EvilEsp", "Sending target command: '%s' (%d targets)", 
                            furi_string_get_cstr(set_target_cmd), selected_count);

