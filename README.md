@@ -81,6 +81,7 @@ Run the app:
 ![alt text](app_icon.png)
 
 Run scan:
+
 ![alt text](main_menu.png)
 
 After clickling 'back' twice, go to Targets and select your target networks (the first one becomes evil twin):
