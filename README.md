@@ -73,3 +73,33 @@ Next, in ESP-IDF in main.c on top enter ESP32 MAC address:
 
 # Now recompile and flash both boards again.
 They should become aware of each other and able to communicate over ESP-NOW.
+
+# Flipper app
+
+Run the app:
+
+![alt text](app_icon.png)
+
+Run scan:
+![alt text](main_menu.png)
+
+After clickling 'back' twice, go to Targets and select your target networks (the first one becomes evil twin):
+
+![alt text](scan_list.png)
+
+Confirm your selection:
+
+![alt text](confirm_sel.png)
+
+
+Select Deauth or Evil Twin if you have ESP32:
+
+![alt text](attack_menu.png)
+
+This is how running deauth looks like:
+
+![alt text](f_deauth.png)
+
+And this is how flipper presents password obtained from Evil Twin portal:
+
+![alt text](f_pass.png)
