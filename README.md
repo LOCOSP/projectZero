@@ -10,9 +10,11 @@ It provides CLI and in future will provide an Flipper Zero app running captive p
 # Features
 Deauthenticates more than one network, including 5GHz on very high channels. Uses PH country code. 
 
-Passes twin network name to ESP32 over ESP-NOW. Sets uo portal and collected password is passed back to C5 for verification. 
+Passes twin network name to ESP32 over ESP-NOW. Sets up portal and collected password is passed back to C5 for verification. 
 
 If verification is succesfull, deauth attack is stopped.
+
+Flipper app - screens below. 
 
 # Usage
 CLI supports up/down arrows and TAB autocompletion. 
