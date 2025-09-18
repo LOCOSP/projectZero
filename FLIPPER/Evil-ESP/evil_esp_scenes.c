@@ -170,11 +170,12 @@ void evil_esp_scene_on_enter_main_menu(void* context) {
     submenu_reset(app->submenu);
     submenu_set_header(app->submenu, "Evil ESP Controller");
 
-    submenu_add_item(app->submenu, "WiFi Scanner", EvilEspMainMenuIndexScanner, evil_esp_submenu_callback_main_menu, app);
-    submenu_add_item(app->submenu, "Attack Mode", EvilEspMainMenuIndexAttacks, evil_esp_submenu_callback_main_menu, app);
-    submenu_add_item(app->submenu, "Set Targets", EvilEspMainMenuIndexSniffer, evil_esp_submenu_callback_main_menu, app);
-    submenu_add_item(app->submenu, "Configuration", EvilEspMainMenuIndexConfig, evil_esp_submenu_callback_main_menu, app);
-    submenu_add_item(app->submenu, "Help", EvilEspMainMenuIndexDeviceInfo, evil_esp_submenu_callback_main_menu, app);
+    submenu_add_item(app->submenu, "Scanner", EvilEspMainMenuIndexScanner, evil_esp_submenu_callback_main_menu, app);
+    submenu_add_item(app->submenu, "Targets", EvilEspMainMenuIndexSniffer, evil_esp_submenu_callback_main_menu, app);
+    submenu_add_item(app->submenu, "Attacks", EvilEspMainMenuIndexAttacks, evil_esp_submenu_callback_main_menu, app);
+
+    //submenu_add_item(app->submenu, "Configuration", EvilEspMainMenuIndexConfig, evil_esp_submenu_callback_main_menu, app);
+    //submenu_add_item(app->submenu, "Help", EvilEspMainMenuIndexDeviceInfo, evil_esp_submenu_callback_main_menu, app);
     submenu_add_item(app->submenu, "UART Terminal", EvilEspMainMenuIndexUartTerminal, evil_esp_submenu_callback_main_menu, app);
 
     submenu_set_selected_item(app->submenu, app->selected_menu_index);
@@ -399,9 +400,9 @@ void evil_esp_scene_on_enter_attacks(void* context) {
     submenu_set_header(app->submenu, "Attack Mode");
 
     submenu_add_item(app->submenu, "Deauth Attack", EvilEspAttacksMenuIndexDeauth, evil_esp_submenu_callback_attacks, app);
-    submenu_add_item(app->submenu, "Disassoc Attack", EvilEspAttacksMenuIndexDisassoc, evil_esp_submenu_callback_attacks, app);
-    submenu_add_item(app->submenu, "Random Attack", EvilEspAttacksMenuIndexRandom, evil_esp_submenu_callback_attacks, app);
-    submenu_add_item(app->submenu, "Stop Attack", EvilEspAttacksMenuIndexStop, evil_esp_submenu_callback_attacks, app);
+    submenu_add_item(app->submenu, "Evil Twin Attack", EvilEspAttacksMenuIndexDisassoc, evil_esp_submenu_callback_attacks, app);
+    submenu_add_item(app->submenu, "WPA3 SAE Overflow", EvilEspAttacksMenuIndexRandom, evil_esp_submenu_callback_attacks, app);
+    //submenu_add_item(app->submenu, "Stop Attack", EvilEspAttacksMenuIndexStop, evil_esp_submenu_callback_attacks, app);
 
     view_dispatcher_switch_to_view(app->view_dispatcher, EvilEspViewMainMenu);
 }
@@ -412,7 +413,7 @@ bool evil_esp_scene_on_event_attacks(void* context, SceneManagerEvent event) {
     if(event.type == SceneManagerEventTypeCustom) {
         switch(event.event) {
         case EvilEspAttacksMenuIndexDeauth:
-            evil_esp_send_attack_start(app);
+            evil_esp_send_command(app, "start_deauth");
             app->attack_state.active = true;
             app->attack_state.mode = EvilEspAttackModeDeauth;
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
@@ -420,7 +421,7 @@ bool evil_esp_scene_on_event_attacks(void* context, SceneManagerEvent event) {
             return true;
 
         case EvilEspAttacksMenuIndexDisassoc:
-            evil_esp_send_command(app, "disassoc");
+            evil_esp_send_command(app, "start_evil_twin");
             app->attack_state.active = true;
             app->attack_state.mode = EvilEspAttackModeDisassoc;
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
@@ -428,7 +429,7 @@ bool evil_esp_scene_on_event_attacks(void* context, SceneManagerEvent event) {
             return true;
 
         case EvilEspAttacksMenuIndexRandom:
-            evil_esp_send_command(app, "random_attack");
+            evil_esp_send_command(app, "sae_overflow");
             app->attack_state.mode = EvilEspAttackModeRandom;
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
             scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);

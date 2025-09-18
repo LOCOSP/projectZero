@@ -14,12 +14,12 @@
 #include <dialogs/dialogs.h>
 #include <storage/storage.h>
 
-#define EVIL_ESP_TEXT_BOX_STORE_SIZE (4096)
-#define EVIL_ESP_TEXT_INPUT_STORE_SIZE (512)
+#define EVIL_ESP_TEXT_BOX_STORE_SIZE (8192)
+#define EVIL_ESP_TEXT_INPUT_STORE_SIZE (2048)
 #define EVIL_ESP_UART_BAUD_RATE (115200)
-#define EVIL_ESP_UART_RX_BUF_SIZE (2048)
-#define EVIL_ESP_MAX_NETWORKS (50)
-#define EVIL_ESP_MAX_TARGETS (10)
+#define EVIL_ESP_UART_RX_BUF_SIZE (4096)
+#define EVIL_ESP_MAX_NETWORKS (1000)
+#define EVIL_ESP_MAX_TARGETS (1000)
 
 // Scene definitions
 typedef enum {
