@@ -16,12 +16,15 @@ If verification is succesfull, deauth attack is stopped.
 
 Flipper app - screens below. 
 
+New feature - WPA3 SAE Overflow attack. Floods exactly one router with SAE Commit Frames.
+
 # Usage
 CLI supports up/down arrows and TAB autocompletion. 
 Typical usage would be:
 scan_networks
 select_networks 1 4
 start_evil_twin
+sae_overflow
 
 Please note order of selected networks is important. While all of them will be deauth'ed, the first one will additionally give name to an evil twin.
 
@@ -35,8 +38,23 @@ In CLI mode, successful attack should look like below. Note deauth stops as soon
 
 ![alt text](image-9.png)
 
+
+
+# WPA3 SAE Overflow Attack
+
+Sends multiple SAE Commit frames with random MAC to a router. This does not affect existing connections, but stops new ones from being established - see connection failed below: 
+
+![alt text](SAE-connection-failed.jpg)
+
+Important: select exactly one target before running this attack.
+
+Wireshark reveals that AP responds it cannot handle so many stations:
+![alt text](wireshark.png)
+
 # Deployment to boards
-It's all about MACs! C5 needs to know ESP32 mac and vice versa. At the moment you need to modify it straight in the code.
+For Evil Twin - it's all about MACs! C5 needs to know ESP32 mac and vice versa. At the moment you need to modify it straight in the code.
+
+All other attacks require just one board and you don't need to worry about it.
 
 ## Initial deployment to ESP32
 Use ArduinoIDE and open EvilTwin_slave.ino file.
