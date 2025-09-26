@@ -349,8 +349,8 @@ EvilEspResponseType evil_esp_parse_response_type(const char* response) {
 bool evil_esp_parse_scan_result(const char* response, EvilEspNetwork* network) {
     if(!response || !network) return false;
 
-    // Parse the format: [INFO] Index\tSSID\t\tBSSID\t\tChannel\tRSSI (dBm)\tFrequency
-    // Example: [INFO] 0\ttest_network\t\t11:22:33:44:55:66\t\t6\t-45\t2.4GHz
+    // Parse the format: [INFO] Index\tSSID\t\tBSSID\t\tChannel\tAuth\tRSSI (dBm)\tFrequency
+    // Example: [INFO] 0\ttest_network\t\t11:22:33:44:55:66\t\t6\tWPA/WPA2 Mixed\t-45\t2.4GHz
 
     // Skip "[INFO] " prefix
     const char* data = response;
@@ -365,7 +365,7 @@ bool evil_esp_parse_scan_result(const char* response, EvilEspNetwork* network) {
     const char* end;
     int field = 0;
 
-    while(*start && field < 6) {
+    while(*start && field < 7) {
         // Find next tab or end of string
         end = strchr(start, '\t');
         if(!end) end = start + strlen(start);
@@ -399,10 +399,17 @@ bool evil_esp_parse_scan_result(const char* response, EvilEspNetwork* network) {
         case 3: // Channel
             network->channel = atoi(field_value);
             break;
-        case 4: // RSSI
+        case 4: // Auth
+            strncpy(network->auth, field_value, sizeof(network->auth) - 1);
+            network->auth[sizeof(network->auth) - 1] = '\0';
+            if(strlen(network->auth) == 0) {
+                strcpy(network->auth, "Unknown");
+            }
+            break;
+        case 5: // RSSI
             network->rssi = atoi(field_value);
             break;
-        case 5: // Frequency
+        case 6: // Frequency
             if(strstr(field_value, "5GHz")) {
                 network->band = EvilEspBand5GHz;
             } else {

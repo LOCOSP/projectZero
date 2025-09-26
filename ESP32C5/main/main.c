@@ -380,16 +380,43 @@ static void escape_csv_field(const char* input, char* output, size_t output_size
     output[out_pos] = '\0';
 }
 
+const char* authmode_to_string(wifi_auth_mode_t mode) {
+    switch(mode) {
+        case WIFI_AUTH_OPEN:
+            return "Open";
+        case WIFI_AUTH_WEP:
+            return "WEP";
+        case WIFI_AUTH_WPA_PSK:
+            return "WPA";
+        case WIFI_AUTH_WPA2_PSK:
+            return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK:
+            return "WPA/WPA2 Mixed";
+        case WIFI_AUTH_WPA2_ENTERPRISE:
+            return "WPA2 Enterprise";
+        case WIFI_AUTH_WPA3_PSK:
+            return "WPA3";
+        case WIFI_AUTH_WPA2_WPA3_PSK:
+            return "WPA2/WPA3 Mixed";
+        case WIFI_AUTH_WAPI_PSK:
+            return "WAPI";
+        default:
+            return "Unknown";
+    }
+}
+
+
 static void print_network_csv(int index, const wifi_ap_record_t* ap) {
     char escaped_ssid[64];
     escape_csv_field((const char*)ap->ssid, escaped_ssid, sizeof(escaped_ssid));
     
-    MY_LOG_INFO(TAG, "\"%d\",\"%s\",\"%02X:%02X:%02X:%02X:%02X:%02X\",\"%d\",\"%d\",\"%s\"",
+    MY_LOG_INFO(TAG, "\"%d\",\"%s\",\"%02X:%02X:%02X:%02X:%02X:%02X\",\"%d\",\"%s\",\"%d\",\"%s\"",
                 (index + 1),
                 escaped_ssid,
                 ap->bssid[0], ap->bssid[1], ap->bssid[2],
                 ap->bssid[3], ap->bssid[4], ap->bssid[5],
                 ap->primary,
+                authmode_to_string(ap->authmode),
                 ap->rssi,
                 ap->primary <= 14 ? "2.4GHz" : "5GHz");
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -458,16 +485,27 @@ static int cmd_select_networks(int argc, char **argv) {
         return 1;
     }
 
-    char buf[200];
-    int len = snprintf(buf, sizeof(buf), "Selected: ");
+    char buf[500];
+    int len = snprintf(buf, sizeof(buf), "Selected Networks:\n");
 
     for (int i = 0; i < g_selected_count; ++i) {
-        const char *selectedSSID = (const char *)g_scan_results[g_selected_indices[i]].ssid;
-        len += snprintf(buf + len, sizeof(buf) - len, "%s%s", selectedSSID, (i + 1 == g_selected_count) ? "" : ",");
+        const wifi_ap_record_t* ap = &g_scan_results[g_selected_indices[i]];
+        
+        // Zakładam, że auth jest dostępne jako string w twojej strukturze, jeśli nie - zastąp odpowiednim polem lub stringiem.
+        const char* auth = authmode_to_string(ap->authmode);
+
+        // Formatowanie: SSID, BSSID, Channel, Auth
+        len += snprintf(buf + len, sizeof(buf) - len, "%s, %02x:%02x:%02x:%02x:%02x:%02x, Ch%d, %s%s\n",
+                        (char*)ap->ssid,
+                        ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                        ap->bssid[3], ap->bssid[4], ap->bssid[5],
+                        ap->primary, auth,
+                        (i + 1 == g_selected_count) ? "" : "");
     }
 
+    vTaskDelay(pdMS_TO_TICKS(100));
     MY_LOG_INFO(TAG, "%s", buf);
-
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     return 0;
 }

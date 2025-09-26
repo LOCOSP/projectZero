@@ -59,6 +59,33 @@ static void debug_clear_log() {
     furi_record_close(RECORD_STORAGE);
 }
 
+// Clear all network scan results and reset selection state
+static void clear_network_scan_results(EvilEspApp* app, const char* debug_message) {
+    // Clear previous scan results and selections completely
+    app->network_count = 0;
+    app->scan_in_progress = true;
+
+    // Explicitly clear all networks and reset selection state
+    for(int i = 0; i < EVIL_ESP_MAX_NETWORKS; i++) {
+        memset(&app->networks[i], 0, sizeof(EvilEspNetwork));
+        app->networks[i].selected = false;
+        app->networks[i].index = i; // Internal array index
+        app->networks[i].device_index = i; // Will be set properly by UART parser
+    }
+
+    // Clear attack state targets since networks are changing
+    app->attack_state.num_targets = 0;
+    memset(app->attack_state.target_indices, 0, sizeof(app->attack_state.target_indices));
+
+    // Clear debug log at start of new scan
+    debug_clear_log();
+    if(debug_message) {
+        debug_write_to_sd(debug_message);
+    }
+
+    FURI_LOG_I("EvilEsp", "Cleared %d networks and all selections: %s", EVIL_ESP_MAX_NETWORKS, debug_message ? debug_message : "");
+}
+
 // Submenu callback functions
 static void evil_esp_submenu_callback_main_menu(void* context, uint32_t index) {
     EvilEspApp* app = context;
@@ -168,7 +195,7 @@ void evil_esp_scene_on_enter_main_menu(void* context) {
     EvilEspApp* app = context;
 
     submenu_reset(app->submenu);
-    submenu_set_header(app->submenu, "Evil ESP Controller");
+    submenu_set_header(app->submenu, "Evil ESP 1.1");
 
     submenu_add_item(app->submenu, "Scanner", EvilEspMainMenuIndexScanner, evil_esp_submenu_callback_main_menu, app);
     submenu_add_item(app->submenu, "Targets", EvilEspMainMenuIndexSniffer, evil_esp_submenu_callback_main_menu, app);
@@ -196,6 +223,9 @@ bool evil_esp_scene_on_event_main_menu(void* context, SceneManagerEvent event) {
 
         switch(event.event) {
         case EvilEspMainMenuIndexScanner:
+            // Clear previous scan results before starting new scan
+            clear_network_scan_results(app, "=== NEW SCAN STARTED FROM MAIN MENU ===");
+            
             // Send scan command and open terminal to see results immediately
             evil_esp_send_command(app, "scan_networks");
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
@@ -241,26 +271,7 @@ void evil_esp_scene_on_enter_scanner(void* context) {
     evil_esp_show_loading(app, "Scanning WiFi networks...");
 
     // Clear previous scan results and selections completely
-    app->network_count = 0;
-    app->scan_in_progress = true;
-
-    // Explicitly clear all networks and reset selection state
-    for(int i = 0; i < EVIL_ESP_MAX_NETWORKS; i++) {
-        memset(&app->networks[i], 0, sizeof(EvilEspNetwork));
-        app->networks[i].selected = false;
-        app->networks[i].index = i; // Internal array index
-        app->networks[i].device_index = i; // Will be set properly by UART parser
-    }
-
-    // Clear attack state targets since networks are changing
-    app->attack_state.num_targets = 0;
-    memset(app->attack_state.target_indices, 0, sizeof(app->attack_state.target_indices));
-
-    // Clear debug log at start of new scan
-    debug_clear_log();
-    debug_write_to_sd("=== NEW SCAN STARTED ===");
-
-    FURI_LOG_I("EvilEsp", "Scanner: Cleared %d networks and all selections", EVIL_ESP_MAX_NETWORKS);
+    clear_network_scan_results(app, "=== NEW SCAN STARTED ===");
 
     // Send scan command - UART worker will handle all parsing
     evil_esp_send_scan_command(app);
@@ -326,7 +337,7 @@ void evil_esp_scene_on_exit_scanner(void* context) {
     evil_esp_hide_loading(app);
 }
 
-// Scene: Scanner Results
+// Scene: Scanner Results - ignore it, it is never displayed to the user!
 void evil_esp_scene_on_enter_scanner_results(void* context) {
     EvilEspApp* app = context;
 
@@ -338,24 +349,22 @@ void evil_esp_scene_on_enter_scanner_results(void* context) {
         furi_string_printf(app->text_box_string, "Found %d networks:\n\n", app->network_count);
 
         for(uint8_t i = 0; i < app->network_count; i++) {
-            char freq_str[8];
+            char freq_str[4];
             if(app->networks[i].channel >= 36) {
-                strcpy(freq_str, "5GHz");
+                strcpy(freq_str, "5G");
             } else {
-                strcpy(freq_str, "2.4GHz");
+                strcpy(freq_str, "2G");
             }
 
+            // More compact format to show longer network names
             furi_string_cat_printf(app->text_box_string, 
-                "[%02d] %s\n"
-                " %s\n"
-                " Ch:%d %ddBm %s\n\n",
-                i + 1, // Show 1-based indexing consistently
-                app->networks[i].ssid,
-                app->networks[i].bssid,
-                app->networks[i].channel,
-                app->networks[i].rssi,
-                freq_str
+                "%d %s %d %s\n",   // indeks, SSID, kanał, autoryzacja
+                i + 1,             // numer sieci (od 1)
+                app->networks[i].ssid,  // SSID
+                app->networks[i].channel, // numer kanału
+                freq_str           // tutaj wstaw info o autoryzacji lub inny string
             );
+
         }
 
         furi_string_cat_printf(app->text_box_string, "Press OK to select targets\nPress BACK to return to menu");
@@ -506,30 +515,33 @@ void evil_esp_scene_on_enter_sniffer(void* context) {
         submenu_add_item(app->submenu, "No Networks Found", 0, NULL, app);
         submenu_add_item(app->submenu, "Run WiFi Scan First", 0, NULL, app);
     } else {
-        // Show all available networks with improved formatting
+        // Show all available networks with optimized formatting for maximum SSID visibility
         for(uint8_t i = 0; i < app->network_count; i++) {
-            char menu_text[100];
-            const char* status = app->networks[i].selected ? "✓" : "○";
-            char band_str[8];
-            strcpy(band_str, (app->networks[i].band == EvilEspBand5GHz) ? "5G" : "2.4G");
+            char menu_text[120];  // Increased buffer size
+            
+            /*char channel_auth_str[40]; // odpowiedni rozmiar bufora
+            snprintf(channel_auth_str, sizeof(channel_auth_str), "%d,%s",
+                    app->networks[i].channel,    // Channel
+                    app->networks[i].auth        // Auth (np. "WPA/WPA2 Mixed", "Open")
+            );*/    
 
-            // Truncate long SSIDs for better display
-            char ssid_display[32];
-            if(strlen(app->networks[i].ssid) > 28) {
-                strncpy(ssid_display, app->networks[i].ssid, 25);
-                ssid_display[25] = '.';
-                ssid_display[26] = '.';
-                ssid_display[27] = '.';
-                ssid_display[28] = '\0';
+            // Allow longer SSIDs with more compact format
+            char ssid_display[40];  // Increased from 32 to 40
+            if(strlen(app->networks[i].ssid) > 36) {  // Increased from 28 to 36
+                strncpy(ssid_display, app->networks[i].ssid, 33);  // Show 33 chars instead of 25
+                ssid_display[33] = '.';
+                ssid_display[34] = '.';
+                ssid_display[35] = '.';
+                ssid_display[36] = '\0';
             } else {
                 strcpy(ssid_display, app->networks[i].ssid);
             }
 
-            snprintf(menu_text, sizeof(menu_text), "%s [%02d] %s (%s)", 
-                     status, 
-                     i + 1, // Show 1-based index to match what we send to device
-                     ssid_display, 
-                     band_str);
+            // More compact format: "✓02:NetworkName (2G)" instead of "✓ [02] NetworkName (2.4G)"
+            snprintf(menu_text, sizeof(menu_text), "%02d:%s",
+                     i + 1,         // 02: (3 chars) 
+                     ssid_display  // NetworkName (up to 36 chars)
+                     );     
 
             submenu_add_item(app->submenu, menu_text, i, evil_esp_submenu_callback_sniffer, app);
 

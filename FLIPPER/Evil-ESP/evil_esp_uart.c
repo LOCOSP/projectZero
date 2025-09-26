@@ -286,18 +286,19 @@ static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line) 
 
     FURI_LOG_I("EvilEsp", "Parsing CSV scan line: %s", data);
     
-    // Pola do wypełnienia
+    // Pola do wypełnienia - dodano auth między channel a rssi
     char index_str[16] = "";
     char ssid[64] = "";
     char bssid[32] = "";
     char channel_str[16] = "";
+    char auth[32] = "";
     char rssi_str[16] = "";
     char freq_str[16] = "";
     
-    // Parsowanie CSV
-    const char* fields[] = {index_str, ssid, bssid, channel_str, rssi_str, freq_str};
+    // Parsowanie CSV - format: index,ssid,bssid,channel,auth,rssi,freq
+    const char* fields[] = {index_str, ssid, bssid, channel_str, auth, rssi_str, freq_str};
     size_t field_sizes[] = {sizeof(index_str), sizeof(ssid), sizeof(bssid), 
-                           sizeof(channel_str), sizeof(rssi_str), sizeof(freq_str)};
+                           sizeof(channel_str), sizeof(auth), sizeof(rssi_str), sizeof(freq_str)};
     
     int field_count = sizeof(fields) / sizeof(fields[0]);
     int current_field = 0;
@@ -340,9 +341,9 @@ static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line) 
         current_field++;
     }
     
-    // Sprawdź czy mamy wszystkie wymagane pola
-    if(current_field < 6 || strlen(index_str) == 0 || strlen(bssid) == 0) {
-        FURI_LOG_W("EvilEsp", "Missing required fields in CSV scan line");
+    // Sprawdź czy mamy wszystkie wymagane pola (index,ssid,bssid,channel,auth,rssi,freq = 7 pól)
+    if(current_field < 7 || strlen(index_str) == 0 || strlen(bssid) == 0) {
+        FURI_LOG_W("EvilEsp", "Missing required fields in CSV scan line (expected 7, got %d)", current_field);
         return;
     }
     
@@ -371,6 +372,13 @@ static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line) 
     network->channel = atoi(channel_str);
     if(network->channel == 0) network->channel = 1;
     
+    // Kopiuj auth type
+    strncpy(network->auth, auth, sizeof(network->auth) - 1);
+    network->auth[sizeof(network->auth) - 1] = '\0';
+    if(strlen(network->auth) == 0) {
+        strcpy(network->auth, "Unknown");
+    }
+    
     network->rssi = atoi(rssi_str);
     if(network->rssi == 0) network->rssi = -99;
     
@@ -383,9 +391,9 @@ static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line) 
     
     worker->app->network_count++;
     
-    FURI_LOG_I("EvilEsp", "Parsed CSV network[%d]: '%s' (%s) Ch:%d RSSI:%d %s",
+    FURI_LOG_I("EvilEsp", "Parsed CSV network[%d]: '%s' (%s) Ch:%d %s RSSI:%d %s",
         network_idx, network->ssid, network->bssid, 
-        network->channel, network->rssi,
+        network->channel, network->auth, network->rssi,
         (network->band == EvilEspBand5GHz) ? "5GHz" : "2.4GHz");
 }
 /*

@@ -118,6 +118,7 @@ typedef struct {
     char ssid[64];
     char bssid[18];
     int channel;
+    char auth[32]; // Authentication/encryption type (e.g., "WPA/WPA2 Mixed", "Open")
     int rssi;
     EvilEspBand band;
     bool selected;
