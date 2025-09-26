@@ -1,5 +1,5 @@
 # Goal
-This project is an 2-board evil twin. It's based on:
+This project is an 2-board evil twin mixed with deauther and SAE-Overflow WPA3 attack. It's based on:
 - ESP32C5 (main CLI steering, deauth and password verification)
 - ESP32 (evil twin captive portal)
 
