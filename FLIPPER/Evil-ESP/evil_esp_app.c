@@ -129,6 +129,12 @@ EvilEspApp* evil_esp_app_alloc(void) {
 void evil_esp_app_free(EvilEspApp* app) {
     furi_assert(app);
 
+    // Disable 5V OTG power when exiting app
+    if(furi_hal_power_is_otg_enabled()) {
+        furi_hal_power_disable_otg();
+        FURI_LOG_I("EvilEsp", "5V OTG power disabled on app exit");
+    }
+
     // Stop UART worker
     if(app->uart_worker) {
         evil_esp_uart_free(app->uart_worker);

@@ -447,12 +447,23 @@ bool evil_esp_scene_on_event_attacks(void* context, SceneManagerEvent event) {
             return true;
 
         case EvilEspAttacksMenuIndexWardrive:
+            // Enable 5V power on GPIO pin 1 for external devices
+            if(furi_hal_power_enable_otg()) {
+                FURI_LOG_I("EvilEsp", "5V OTG power enabled for wardrive");
+            } else {
+                FURI_LOG_W("EvilEsp", "Failed to enable 5V OTG power");
+            }
             evil_esp_send_command(app, "start_wardrive");
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
             scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
             return true;
 
         case EvilEspAttacksMenuIndexStop:
+            // Disable 5V OTG power when stopping attacks
+            if(furi_hal_power_is_otg_enabled()) {
+                furi_hal_power_disable_otg();
+                FURI_LOG_I("EvilEsp", "5V OTG power disabled on attack stop");
+            }
             evil_esp_send_attack_stop(app);
             app->attack_state.active = false;
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
