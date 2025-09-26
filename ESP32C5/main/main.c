@@ -3,6 +3,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -23,6 +26,11 @@
 #include "argtable3/argtable3.h"
 
 #include "driver/uart.h"
+#include "driver/sdmmc_host.h"
+#include "driver/sdspi_host.h"
+#include "driver/spi_master.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
 
 #include "driver/gpio.h"
 
@@ -39,11 +47,42 @@
 #define LED_COUNT          1
 #define RMT_RES_HZ         (10 * 1000 * 1000)  // 10 MHz
 
+// GPS UART pins (Marauder compatible)
+#define GPS_UART_NUM       UART_NUM_1
+#define GPS_TX_PIN         13
+#define GPS_RX_PIN         14
+#define GPS_BUF_SIZE       1024
+
+// SD Card SPI pins (Marauder compatible)
+#define SD_MISO_PIN        2
+#define SD_MOSI_PIN        7  
+#define SD_CLK_PIN         6
+#define SD_CS_PIN          10
+
 #define MY_LOG_INFO(tag, fmt, ...) printf("[INFO] " fmt "\n", ##__VA_ARGS__)
 
+#define MAX_AP_CNT 64
 
 
 static const char *TAG = "projectZero";
+
+// GPS data structure
+typedef struct {
+    float latitude;
+    float longitude;
+    float altitude;
+    float accuracy;
+    bool valid;
+} gps_data_t;
+
+// Wardrive state
+static bool wardrive_active = false;
+static int wardrive_file_counter = 1;
+static gps_data_t current_gps = {0};
+
+// Wardrive buffers (static to avoid stack overflow)
+static char wardrive_gps_buffer[GPS_BUF_SIZE];
+static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
 
 //Target (ESP32) MAC of the other device (ESP32):
 uint8_t esp32_mac[] = {0x28, 0x37, 0x2F, 0x5F, 0xC3, 0x18};
@@ -83,7 +122,6 @@ enum ApplicationState {
 
 volatile enum ApplicationState applicationState = IDLE;
 
-#define MAX_AP_CNT 64
 static wifi_ap_record_t g_scan_results[MAX_AP_CNT];
 static uint16_t g_scan_count = 0;
 
@@ -100,10 +138,17 @@ led_strip_handle_t strip;
 static int cmd_scan_networks(int argc, char **argv);
 static int cmd_select_networks(int argc, char **argv);
 static int cmd_start_evil_twin(int argc, char **argv);
+static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
 static esp_err_t do_scan_and_store(void);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
+// Wardrive functions
+static esp_err_t init_gps_uart(void);
+static esp_err_t init_sd_card(void);
+static bool parse_gps_nmea(const char* nmea_sentence);
+static void get_timestamp_string(char* buffer, size_t size);
+static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 // SAE WPA3 attack methods forward declarations:
 //add methods declarations below:
 static void startRandomMacSaeClientOverflow(const wifi_ap_record_t ap_record);
@@ -610,6 +655,177 @@ static int cmd_reboot(int argc, char **argv)
     return 0;
 }
 
+static int cmd_start_wardrive(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    MY_LOG_INFO(TAG, "Starting wardrive mode...");
+    
+    // Initialize GPS UART
+    esp_err_t ret = init_gps_uart();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX)", GPS_TX_PIN, GPS_RX_PIN);
+    
+    // Initialize SD card
+    ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "SD card initialized on pins MISO:%d MOSI:%d CLK:%d CS:%d", 
+                SD_MISO_PIN, SD_MOSI_PIN, SD_CLK_PIN, SD_CS_PIN);
+    
+    // Set LED to indicate wardrive mode
+    ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 255, 255)); // Cyan
+    ESP_ERROR_CHECK(led_strip_refresh(strip));
+    
+    wardrive_active = true;
+    MY_LOG_INFO(TAG, "Wardrive started. Press any key to stop.");
+    
+    // Main wardrive loop
+    int scan_counter = 0;
+    while (wardrive_active && scan_counter < 100) { // Limit to 100 scans for safety
+        // Read GPS data
+        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            wardrive_gps_buffer[len] = '\0';
+            char* line = strtok(wardrive_gps_buffer, "\r\n");
+            while (line != NULL) {
+                if (parse_gps_nmea(line)) {
+                    MY_LOG_INFO(TAG, "GPS: Lat=%.7f Lon=%.7f Alt=%.1fm Acc=%.1fm", 
+                               current_gps.latitude, current_gps.longitude, 
+                               current_gps.altitude, current_gps.accuracy);
+                }
+                line = strtok(NULL, "\r\n");
+            }
+        }
+        
+        // Scan WiFi networks
+        wifi_scan_config_t scan_cfg = {
+            .ssid = NULL,
+            .bssid = NULL,
+            .channel = 0,
+            .show_hidden = true,
+            .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+            .scan_time.active.min = 100,
+            .scan_time.active.max = 300,
+        };
+        
+        esp_wifi_scan_start(&scan_cfg, true);
+        
+        uint16_t scan_count = MAX_AP_CNT;
+        esp_wifi_scan_get_ap_records(&scan_count, wardrive_scan_results);
+        
+        // Create filename (keep it simple for FAT filesystem)
+        char filename[32];
+        snprintf(filename, sizeof(filename), "/sdcard/w%d.csv", wardrive_file_counter);
+        
+        // Check if /sdcard directory is accessible
+        struct stat st;
+        if (stat("/sdcard", &st) != 0) {
+            MY_LOG_INFO(TAG, "Error: /sdcard directory not accessible");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        // Open file for appending
+        FILE *file = fopen(filename, "a");
+        if (file == NULL) {
+            MY_LOG_INFO(TAG, "Failed to open file %s, errno: %d (%s)", filename, errno, strerror(errno));
+            
+            // Try creating file with different approach
+            file = fopen(filename, "w");
+            if (file == NULL) {
+                MY_LOG_INFO(TAG, "Failed to create file %s, errno: %d (%s)", filename, errno, strerror(errno));
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            MY_LOG_INFO(TAG, "Successfully created file %s", filename);
+        }
+        
+        // Write header if file is new
+        fseek(file, 0, SEEK_END);
+        if (ftell(file) == 0) {
+            fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+        }
+        
+        // Get timestamp
+        char timestamp[32];
+        get_timestamp_string(timestamp, sizeof(timestamp));
+        
+        // Process scan results
+        for (int i = 0; i < scan_count; i++) {
+            wifi_ap_record_t *ap = &wardrive_scan_results[i];
+            
+            // Format MAC address
+            char mac_str[18];
+            snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                    ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                    ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+            
+            // Escape SSID for CSV
+            char escaped_ssid[64];
+            escape_csv_field((const char*)ap->ssid, escaped_ssid, sizeof(escaped_ssid));
+            
+            // Get auth mode string
+            const char* auth_mode = get_auth_mode_wiggle(ap->authmode);
+            
+            // Format line for Wiggle format
+            char line[512];
+            if (current_gps.valid) {
+                snprintf(line, sizeof(line), 
+                        "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
+                        mac_str, escaped_ssid, auth_mode, timestamp,
+                        ap->primary, ap->rssi,
+                        current_gps.latitude, current_gps.longitude,
+                        current_gps.altitude, current_gps.accuracy);
+            } else {
+                snprintf(line, sizeof(line), 
+                        "%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
+                        mac_str, escaped_ssid, auth_mode, timestamp,
+                        ap->primary, ap->rssi);
+            }
+            
+            // Write to file and print to UART
+            fprintf(file, "%s", line);
+            printf("%s", line);
+        }
+        
+        // Close file to ensure data is written
+        fclose(file);
+        
+        if (scan_count > 0) {
+            MY_LOG_INFO(TAG, "Logged %d networks to %s", scan_count, filename);
+        }
+        
+        scan_counter++;
+        
+        // Check if user wants to stop (check console UART for any input)
+        size_t console_available;
+        uart_get_buffered_data_len(UART_NUM_0, &console_available);
+        if (console_available > 0) {
+            MY_LOG_INFO(TAG, "User input detected, stopping wardrive...");
+            wardrive_active = false;
+            // Clear the buffer
+            uint8_t dummy;
+            while (console_available-- > 0) {
+                uart_read_bytes(UART_NUM_0, &dummy, 1, 0);
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 5 seconds between scans
+    }
+    
+    // Clear LED
+    ESP_ERROR_CHECK(led_strip_clear(strip));
+    ESP_ERROR_CHECK(led_strip_refresh(strip));
+    
+    MY_LOG_INFO(TAG, "Wardrive stopped after %d scans.", scan_counter);
+    return 0;
+}
+
 // --- Rejestracja komend w esp_console ---
 static void register_commands(void)
 {
@@ -658,6 +874,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sae_overflow_cmd));
+
+    const esp_console_cmd_t wardrive_cmd = {
+        .command = "start_wardrive",
+        .help = "Starts wardriving with GPS and SD logging",
+        .hint = NULL,
+        .func = &cmd_start_wardrive,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cmd));
 
     const esp_console_cmd_t reboot_cmd = {
         .command = "reboot",
@@ -731,6 +956,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  start_evil_twin");
     MY_LOG_INFO(TAG,"  start_deauth");
     MY_LOG_INFO(TAG,"  sae_overflow");
+    MY_LOG_INFO(TAG,"  start_wardrive");
     MY_LOG_INFO(TAG,"  reboot");
 
     repl_config.prompt = ">";
@@ -1034,6 +1260,204 @@ static void parse_sae_commit(const wifi_promiscuous_pkt_t *pkt) {
         } else if (buf[28] == 0x00) {
             //ESP_LOGI(TAG, "SAE Commit without ACT");
         }
+    }
+}
+
+// === WARDRIVE HELPER FUNCTIONS ===
+
+static esp_err_t init_gps_uart(void) {
+    uart_config_t uart_config = {
+        .baud_rate = 9600,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    
+    ESP_ERROR_CHECK(uart_driver_install(GPS_UART_NUM, GPS_BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(GPS_UART_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    
+    return ESP_OK;
+}
+
+static esp_err_t init_sd_card(void) {
+    esp_err_t ret;
+    
+    // Options for mounting the filesystem
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = true,  // Allow formatting if needed
+        .max_files = 10,                 // Allow more open files
+        .allocation_unit_size = 16 * 1024,
+        .disk_status_check_enable = false
+    };
+    
+    sdmmc_card_t *card;
+    const char mount_point[] = "/sdcard";
+    
+    // Configure SPI bus
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = SD_MOSI_PIN,
+        .miso_io_num = SD_MISO_PIN,
+        .sclk_io_num = SD_CLK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+    
+    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Initialize the SD card host
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI2_HOST;
+    
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = SD_CS_PIN;
+    slot_config.host_id = host.slot;
+    
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+    
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            MY_LOG_INFO(TAG, "Failed to mount filesystem. If you want the card to be formatted, set format_if_mount_failed = true.");
+        } else {
+            MY_LOG_INFO(TAG, "Failed to initialize the card (%s). Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
+        }
+        return ret;
+    }
+    
+    // Print card info
+    MY_LOG_INFO(TAG, "SD card mounted successfully");
+    sdmmc_card_print_info(stdout, card);
+    
+    // Test file creation to verify write access
+    FILE *test_file = fopen("/sdcard/test.txt", "w");
+    if (test_file != NULL) {
+        fprintf(test_file, "Test write\n");
+        fclose(test_file);
+        MY_LOG_INFO(TAG, "SD card write test successful");
+        // Clean up test file
+        unlink("/sdcard/test.txt");
+    } else {
+        MY_LOG_INFO(TAG, "SD card write test failed, errno: %d (%s)", errno, strerror(errno));
+    }
+    
+    return ESP_OK;
+}
+
+static bool parse_gps_nmea(const char* nmea_sentence) {
+    if (!nmea_sentence || strlen(nmea_sentence) < 10) {
+        return false;
+    }
+    
+    // Parse GPGGA sentence for basic GPS data
+    if (strncmp(nmea_sentence, "$GPGGA", 6) == 0 || strncmp(nmea_sentence, "$GNGGA", 6) == 0) {
+        char sentence[256];
+        strncpy(sentence, nmea_sentence, sizeof(sentence) - 1);
+        sentence[sizeof(sentence) - 1] = '\0';
+        
+        char *token = strtok(sentence, ",");
+        int field = 0;
+        float lat_deg = 0, lat_min = 0;
+        float lon_deg = 0, lon_min = 0;
+        char lat_dir = 'N', lon_dir = 'E';
+        int quality = 0;
+        float altitude = 0;
+        float hdop = 1.0;
+        
+        while (token != NULL) {
+            switch (field) {
+                case 2: // Latitude DDMM.MMMM
+                    if (strlen(token) > 4) {
+                        lat_deg = (token[0] - '0') * 10 + (token[1] - '0');
+                        lat_min = atof(token + 2);
+                    }
+                    break;
+                case 3: // Latitude direction
+                    lat_dir = token[0];
+                    break;
+                case 4: // Longitude DDDMM.MMMM
+                    if (strlen(token) > 5) {
+                        lon_deg = (token[0] - '0') * 100 + (token[1] - '0') * 10 + (token[2] - '0');
+                        lon_min = atof(token + 3);
+                    }
+                    break;
+                case 5: // Longitude direction
+                    lon_dir = token[0];
+                    break;
+                case 6: // GPS quality
+                    quality = atoi(token);
+                    break;
+                case 8: // HDOP
+                    hdop = atof(token);
+                    break;
+                case 9: // Altitude
+                    altitude = atof(token);
+                    break;
+            }
+            token = strtok(NULL, ",");
+            field++;
+        }
+        
+        if (quality > 0) {
+            // Convert to decimal degrees
+            current_gps.latitude = lat_deg + lat_min / 60.0;
+            if (lat_dir == 'S') current_gps.latitude = -current_gps.latitude;
+            
+            current_gps.longitude = lon_deg + lon_min / 60.0;
+            if (lon_dir == 'W') current_gps.longitude = -current_gps.longitude;
+            
+            current_gps.altitude = altitude;
+            current_gps.accuracy = hdop * 4.0; // Rough accuracy estimate
+            current_gps.valid = true;
+            
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+static void get_timestamp_string(char* buffer, size_t size) {
+    // For now, use a simple counter-based timestamp
+    // In a real implementation, you'd use RTC or NTP time
+    static uint32_t timestamp_counter = 0;
+    timestamp_counter++;
+    
+    // Format as a simple date-time string
+    snprintf(buffer, size, "2025-09-26 %02d:%02d:%02d", 
+             (int)((timestamp_counter / 3600) % 24),
+             (int)((timestamp_counter / 60) % 60), 
+             (int)(timestamp_counter % 60));
+}
+
+static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode) {
+    switch(mode) {
+        case WIFI_AUTH_OPEN:
+            return "Open";
+        case WIFI_AUTH_WEP:
+            return "WEP";
+        case WIFI_AUTH_WPA_PSK:
+            return "WPA_PSK";
+        case WIFI_AUTH_WPA2_PSK:
+            return "WPA2_PSK";
+        case WIFI_AUTH_WPA_WPA2_PSK:
+            return "WPA_WPA2_PSK";
+        case WIFI_AUTH_WPA2_ENTERPRISE:
+            return "WPA2_ENTERPRISE";
+        case WIFI_AUTH_WPA3_PSK:
+            return "WPA3_PSK";
+        case WIFI_AUTH_WPA2_WPA3_PSK:
+            return "WPA2_WPA3_PSK";
+        case WIFI_AUTH_WAPI_PSK:
+            return "WAPI_PSK";
+        default:
+            return "Unknown";
     }
 }
 
