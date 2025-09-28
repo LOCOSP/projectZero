@@ -149,6 +149,8 @@ static esp_err_t init_sd_card(void);
 static bool parse_gps_nmea(const char* nmea_sentence);
 static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
+static bool wait_for_gps_fix(int timeout_seconds);
+static int find_next_wardrive_file_number(void);
 // SAE WPA3 attack methods forward declarations:
 //add methods declarations below:
 static void startRandomMacSaeClientOverflow(const wifi_ap_record_t ap_record);
@@ -681,12 +683,25 @@ static int cmd_start_wardrive(int argc, char **argv) {
     ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 255, 255)); // Cyan
     ESP_ERROR_CHECK(led_strip_refresh(strip));
     
+    // Find the next file number by scanning existing files
+    wardrive_file_counter = find_next_wardrive_file_number();
+    MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.csv", wardrive_file_counter);
+    
+    // Wait for GPS fix before starting
+    MY_LOG_INFO(TAG, "Waiting for GPS fix...");
+    if (!wait_for_gps_fix(120)) {  // Wait up to 60 seconds for GPS fix
+        MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, continuing without GPS data");
+    } else {
+        MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f", 
+                   current_gps.latitude, current_gps.longitude);
+    }
+    
     wardrive_active = true;
     MY_LOG_INFO(TAG, "Wardrive started. Press any key to stop.");
     
-    // Main wardrive loop
+    // Main wardrive loop (runs until restart or user stops)
     int scan_counter = 0;
-    while (wardrive_active && scan_counter < 100) { // Limit to 100 scans for safety
+    while (wardrive_active) {
         // Read GPS data
         int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         if (len > 0) {
@@ -822,7 +837,7 @@ static int cmd_start_wardrive(int argc, char **argv) {
     ESP_ERROR_CHECK(led_strip_clear(strip));
     ESP_ERROR_CHECK(led_strip_refresh(strip));
     
-    MY_LOG_INFO(TAG, "Wardrive stopped after %d scans.", scan_counter);
+    MY_LOG_INFO(TAG, "Wardrive stopped after %d scans. Last file: w%d.csv", scan_counter, wardrive_file_counter);
     return 0;
 }
 
@@ -1459,6 +1474,62 @@ static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode) {
         default:
             return "Unknown";
     }
+}
+
+static bool wait_for_gps_fix(int timeout_seconds) {
+    int elapsed = 0;
+    current_gps.valid = false;
+    
+    MY_LOG_INFO(TAG, "Waiting for GPS fix (timeout: %d seconds)...", timeout_seconds);
+    
+    while (elapsed < timeout_seconds) {
+        // Read GPS data
+        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
+        if (len > 0) {
+            wardrive_gps_buffer[len] = '\0';
+            char* line = strtok(wardrive_gps_buffer, "\r\n");
+            while (line != NULL) {
+                if (parse_gps_nmea(line)) {
+                    if (current_gps.valid) {
+                        return true;  // GPS fix obtained
+                    }
+                }
+                line = strtok(NULL, "\r\n");
+            }
+        }
+        
+        elapsed++;
+        if (elapsed % 10 == 0) {  // Print status every 10 seconds
+            MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d/%d seconds)", elapsed, timeout_seconds);
+        }
+    }
+    
+    return false;  // Timeout reached without GPS fix
+}
+
+static int find_next_wardrive_file_number(void) {
+    int max_number = 0;
+    char filename[32];
+    
+    // Scan through possible file numbers to find the highest existing one
+    for (int i = 1; i <= 9999; i++) {
+        snprintf(filename, sizeof(filename), "/sdcard/w%d.csv", i);
+        
+        struct stat file_stat;
+        if (stat(filename, &file_stat) == 0) {
+            // File exists, update max_number
+            max_number = i;
+            MY_LOG_INFO(TAG, "Found existing file: w%d.csv", i);
+        } else {
+            // First non-existing file number, we can break here for efficiency
+            break;
+        }
+    }
+    
+    int next_number = max_number + 1;
+    MY_LOG_INFO(TAG, "Highest existing file number: %d, next will be: %d", max_number, next_number);
+    
+    return next_number;
 }
 
 
