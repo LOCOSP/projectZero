@@ -1086,7 +1086,7 @@ void startRandomMacSaeClientOverflow(const wifi_ap_record_t ap_record) {
     prepareAttack(ap_record);
      while (1) {
         inject_sae_commit_frame();
-        vTaskDelay(pdMS_TO_TICKS(12));
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
