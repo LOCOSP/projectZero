@@ -85,7 +85,7 @@ static char wardrive_gps_buffer[GPS_BUF_SIZE];
 static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
 
 //Target (ESP32) MAC of the other device (ESP32):
-uint8_t esp32_mac[] = {0x28, 0x37, 0x2F, 0x5F, 0xC3, 0x18};
+uint8_t esp32_mac[] = {0xCC, 0x8D, 0xA2, 0xEC, 0xEF, 0x38};
 
 
 /**
@@ -685,7 +685,7 @@ static int cmd_start_wardrive(int argc, char **argv) {
     
     // Find the next file number by scanning existing files
     wardrive_file_counter = find_next_wardrive_file_number();
-    MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.csv", wardrive_file_counter);
+    MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", wardrive_file_counter);
     
     // Wait for GPS fix before starting
     MY_LOG_INFO(TAG, "Waiting for GPS fix...");
@@ -735,7 +735,7 @@ static int cmd_start_wardrive(int argc, char **argv) {
         
         // Create filename (keep it simple for FAT filesystem)
         char filename[32];
-        snprintf(filename, sizeof(filename), "/sdcard/w%d.csv", wardrive_file_counter);
+        snprintf(filename, sizeof(filename), "/sdcard/w%d.log", wardrive_file_counter);
         
         // Check if /sdcard directory is accessible
         struct stat st;
@@ -763,6 +763,7 @@ static int cmd_start_wardrive(int argc, char **argv) {
         // Write header if file is new
         fseek(file, 0, SEEK_END);
         if (ftell(file) == 0) {
+            fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
             fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
         }
         
@@ -837,7 +838,7 @@ static int cmd_start_wardrive(int argc, char **argv) {
     ESP_ERROR_CHECK(led_strip_clear(strip));
     ESP_ERROR_CHECK(led_strip_refresh(strip));
     
-    MY_LOG_INFO(TAG, "Wardrive stopped after %d scans. Last file: w%d.csv", scan_counter, wardrive_file_counter);
+    MY_LOG_INFO(TAG, "Wardrive stopped after %d scans. Last file: w%d.log", scan_counter, wardrive_file_counter);
     return 0;
 }
 
@@ -1510,16 +1511,16 @@ static bool wait_for_gps_fix(int timeout_seconds) {
 static int find_next_wardrive_file_number(void) {
     int max_number = 0;
     char filename[32];
-    
+    MY_LOG_INFO(TAG, "Scanning for existing wardrive log files...");
     // Scan through possible file numbers to find the highest existing one
     for (int i = 1; i <= 9999; i++) {
-        snprintf(filename, sizeof(filename), "/sdcard/w%d.csv", i);
+        snprintf(filename, sizeof(filename), "/sdcard/w%d.log", i);
         
         struct stat file_stat;
         if (stat(filename, &file_stat) == 0) {
             // File exists, update max_number
             max_number = i;
-            MY_LOG_INFO(TAG, "Found existing file: w%d.csv", i);
+            MY_LOG_INFO(TAG, "Found existing file: w%d.log", i);
         } else {
             // First non-existing file number, we can break here for efficiency
             break;
