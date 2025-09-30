@@ -159,12 +159,26 @@ static void evil_esp_config_input_callback(void* context) {
 void evil_esp_scene_on_enter_start(void* context) {
     EvilEspApp* app = context;
 
-    // Skip startup screen - go directly to main menu
-    scene_manager_next_scene(app->scene_manager, EvilEspSceneMainMenu);
+    // Show connection message popup
+    popup_set_header(app->popup, "Lab C5 Board", 64, 8, AlignCenter, AlignTop);
+    popup_set_text(app->popup, "Now connect the\nLab C5 Board \n(click Back when ready)", 64, 35, AlignCenter, AlignCenter);
+    popup_set_icon(app->popup, 0, 0, NULL); // No icon
+    popup_set_callback(app->popup, NULL);
+    popup_set_context(app->popup, app);
+    popup_set_timeout(app->popup, 3000); // 3 second timeout
+    popup_enable_timeout(app->popup);
+    view_dispatcher_switch_to_view(app->view_dispatcher, EvilEspViewPopup);
 }
 
 bool evil_esp_scene_on_event_start(void* context, SceneManagerEvent event) {
     EvilEspApp* app = context;
+    
+    static uint32_t popup_start_time = 0;
+    
+    // Initialize popup timer on first call
+    if(popup_start_time == 0) {
+        popup_start_time = furi_get_tick();
+    }
 
     if(event.type == SceneManagerEventTypeCustom) {
         if(event.event == EvilEspEventExit) {
@@ -173,12 +187,29 @@ bool evil_esp_scene_on_event_start(void* context, SceneManagerEvent event) {
             return true;
         }
     }
+    
+    // Handle any button press - go to Main Menu
+    if(event.type == SceneManagerEventTypeBack) {
+        popup_start_time = 0; // Reset timer for next time
+        // Go to main menu instead of UART terminal
+        scene_manager_next_scene(app->scene_manager, EvilEspSceneMainMenu);
+        return true;
+    }
+    
+    // Auto-advance after 3 seconds to Main Menu
+    if(furi_get_tick() - popup_start_time > 3000) {
+        popup_start_time = 0; // Reset timer for next time
+        // Go to main menu after timeout
+        scene_manager_next_scene(app->scene_manager, EvilEspSceneMainMenu);
+        return true;
+    }
 
     return false;
 }
 
 void evil_esp_scene_on_exit_start(void* context) {
-    UNUSED(context);
+    EvilEspApp* app = context;
+    popup_reset(app->popup);
 }
 
 // Scene: Main Menu
@@ -193,6 +224,15 @@ enum EvilEspMainMenuIndex {
 
 void evil_esp_scene_on_enter_main_menu(void* context) {
     EvilEspApp* app = context;
+
+    // If this is the first visit to main menu (after Lab C5 Board splash), go directly to UART Terminal
+    if(app->first_main_menu_visit) {
+        app->first_main_menu_visit = false;
+        // Set UART terminal to display mode (state 1) and go directly there
+        scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
+        scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
+        return;
+    }
 
     submenu_reset(app->submenu);
     submenu_set_header(app->submenu, "Evil ESP 1.1");
@@ -611,6 +651,8 @@ bool evil_esp_scene_on_event_sniffer(void* context, SceneManagerEvent event) {
                 // Refresh the scene by re-entering it (without adding to stack)
                 evil_esp_scene_on_exit_sniffer(app);
                 evil_esp_scene_on_enter_sniffer(app);
+                // Set cursor to "Confirm Targets" after selecting a network
+                submenu_set_selected_item(app->submenu, EvilEspTargetMenuIndexConfirm);
                 return true;
             } else {
                 FURI_LOG_W("EvilEsp", "Invalid network selection: index %lu has empty SSID", selection);
@@ -626,6 +668,8 @@ bool evil_esp_scene_on_event_sniffer(void* context, SceneManagerEvent event) {
             // Refresh scene by re-entering it (without adding to stack)
             evil_esp_scene_on_exit_sniffer(app);
             evil_esp_scene_on_enter_sniffer(app);
+            // Set cursor to "Confirm Targets" after clearing all selections
+            submenu_set_selected_item(app->submenu, EvilEspTargetMenuIndexConfirm);
             return true;
 
         case EvilEspTargetMenuIndexSelectAll:
@@ -636,6 +680,8 @@ bool evil_esp_scene_on_event_sniffer(void* context, SceneManagerEvent event) {
             // Refresh scene by re-entering it (without adding to stack)
             evil_esp_scene_on_exit_sniffer(app);
             evil_esp_scene_on_enter_sniffer(app);
+            // Set cursor to "Confirm Targets" after selecting all networks
+            submenu_set_selected_item(app->submenu, EvilEspTargetMenuIndexConfirm);
             return true;
 
         case EvilEspTargetMenuIndexConfirm:
@@ -1055,6 +1101,13 @@ bool evil_esp_scene_on_event_uart_terminal(void* context, SceneManagerEvent even
             last_log_size = current_log_size;
         }
 
+        return true;
+    }
+    
+    // Handle back event - go to main menu instead of previous scene
+    if(event.type == SceneManagerEventTypeBack) {
+        // Clear the scene stack and go to main menu
+        scene_manager_search_and_switch_to_previous_scene(app->scene_manager, EvilEspSceneMainMenu);
         return true;
     }
 

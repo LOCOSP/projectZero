@@ -195,6 +195,7 @@ typedef struct {
     uint8_t selected_menu_index;
     uint8_t selected_network_index;
     bool show_loading;
+    bool first_main_menu_visit;
 
     // Status
     bool device_connected;

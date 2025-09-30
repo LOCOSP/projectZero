@@ -71,6 +71,9 @@ EvilEspApp* evil_esp_app_alloc(void) {
     // Initialize app structure
     memset(app, 0, sizeof(EvilEspApp));
 
+    // Initialize UI state
+    app->first_main_menu_visit = true;
+
     // Initialize default configuration
     app->config.cycle_delay = 2000;
     app->config.scan_time = 5000;
