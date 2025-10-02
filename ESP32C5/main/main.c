@@ -911,16 +911,6 @@ static void register_commands(void)
 }
 
 void app_main(void) {
-
-    esp_log_level_set("wifi", ESP_LOG_INFO);
-    esp_log_level_set("projectZero", ESP_LOG_INFO);
-    esp_log_level_set("espnow", ESP_LOG_INFO);
-
-    // esp_log_level_set("wifi", ESP_LOG_DEBUG);
-    // esp_log_level_set(TAG, ESP_LOG_DEBUG);
-    // esp_log_level_set("espnow", ESP_LOG_DEBUG);
-
-
     //MY_LOG_INFO(TAG, "Application starts (ESP32-C5)");
 
     // 1. LED strip configuration
@@ -985,6 +975,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+    MY_LOG_INFO(TAG,"BOARD READY");
 }
 
 void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count) {   
