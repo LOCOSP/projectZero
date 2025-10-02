@@ -12,8 +12,9 @@ This code is for the Slave - ESP32. Features:
 #include <esp_now.h>
 
 /* Swap these with your esp32-c5 mac */
-uint8_t receiverAddress[] = {0xD0, 0xCF, 0x13, 0xE0, 0x42, 0x40};
-
+uint8_t receiverAddress[] = 
+//{0xD0, 0xCF, 0x13, 0xE0, 0x42, 0x40};
+{0x30, 0xED, 0xA0, 0xE3, 0xEC, 0x18};
 
 const byte    DNS_PORT = 53;
 IPAddress     apIP(172, 0, 0, 1);
@@ -182,7 +183,7 @@ void setup() {
 
   delay(100);
 
-  WiFi.softAP("---");
+  WiFi.softAP("-x-", "nevermind", 1, true);
   delay(100);
 
   Serial.print("ESP32 MAC Address: ");

@@ -340,8 +340,9 @@ static esp_err_t wifi_init_ap_sta(void) {
 
     wifi_config_t mgmt_wifi_config = {
             .ap = {
-                .ssid = "--",
-                .ssid_len = 2,
+                .ssid = "",
+                .ssid_len = 0,
+                .ssid_hidden = 1,
                 .password = "nevermind",
                 .max_connection = 0,
                 .authmode = WIFI_AUTH_WPA2_PSK
