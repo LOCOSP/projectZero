@@ -3,7 +3,7 @@
 This project is a 2-board evil twin mixed with deauther, SAE-Overflow WPA3 attack and Wardriving. 
 
 It's based on:
-- ESP32C5 (main CLI steering, deauth and password verification)
+- ESP32-C5-WROOM-1-N8R4 / ESP32-C5-WROOM-1U-N8R4 (main CLI steering, deauth and password verification)
 - ESP32 (optional, needed only for evil twin captive portal)
 
 It provides CLI and a Flipper Zero app running captive portal and password verification.
