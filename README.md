@@ -72,15 +72,15 @@ Run scan:
 
 ![alt text](main_menu.png)
 
-After clickling 'back' twice, go to Targets and select your target networks (the first one becomes evil twin):
+After clicking 'back' twice, go to Targets and select your target networks (the first one becomes evil twin). Even though 'Confirm targets' gets selected after every click on each network, you can pres 'Up' button and select more networks.
 
 ![alt text](scan_list.png)
 
-Confirm your selection:
+After selecting network (remember: you can select more than one) you need to confirm your selection:
 
 ![alt text](confirm_sel.png)
 
-Select Deauth or Evil Twin if you have ESP32:
+Once selection is confirmed, select Deauth (or Evil Twin if you have paired additional ESP32):
 
 ![alt text](attack_menu.png)
 
@@ -96,7 +96,7 @@ Wardrive attack produces files in Wigle.net format and waits for GPS fix before 
 
 ![alt text](image-11.png)
 
-SAE Overflow attacks the only one selected network:
+SAE Overflow attacks only one selected network. Remember, you should have confirmed exactly one selected target:
 
 ![alt text](image-12.png)
 
