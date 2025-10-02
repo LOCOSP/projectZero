@@ -8,7 +8,7 @@ It's based on:
 
 It provides CLI and a Flipper Zero app running captive portal and password verification.
 
-![alt text](f_pass.png)
+![alt text](Gfx/f_pass.png)
 
 # Features
 
@@ -24,11 +24,11 @@ If verification is succesful, the deauth attack is stopped.
 
 On iPhone, the Twin network should look like below. Note that an invisible character has been added to the network name to avoid grouping.
 
-![alt text](image-1.png)
+![alt text](Gfx/image-1.png)
 
 In CLI mode, a successful attack should look like below. Note that deauth stops as soon as the password is verified.
 
-![alt text](image-9.png)
+![alt text](Gfx/image-9.png)
 
 
 ## WPA3 SAE Overflow attack. 
@@ -36,12 +36,12 @@ It floods exactly one router with SAE Commit Frames. The router cannot accept so
 
 It sends multiple SAE Commit frames with random MAC to a router. This does not affect existing connections, but stops new ones from being established - see connection failed below: 
 
-![alt text](SAE-connection-failed.jpg)
+![alt text](Gfx/SAE-connection-failed.jpg)
 
 Important: select exactly one target before running this attack.
 
 Wireshark reveals that the AP responds that it cannot handle so many stations:
-![alt text](wireshark.png)
+![alt text](Gfx/wireshark.png)
 
 ## Wardriving
 
@@ -62,43 +62,43 @@ Please note that the order of selected networks is important. While all of them 
 # Flipper application screens and user journey
 Run the app:
 
-![alt text](app_icon.png)
+![alt text](Gfx/app_icon.png)
 
 After running the app, connect the board when you see the splash screen.
 
-![alt text](image.png)
+![alt text](Gfx/image.png)
 
 Run scan:
 
-![alt text](main_menu.png)
+![alt text](Gfx/main_menu.png)
 
 After clicking 'back' twice, go to Targets and select your target networks (the first one becomes the evil twin). Even though 'Confirm targets' gets selected after every click on each network, you can press the 'Up' button and select more networks.
 
-![alt text](scan_list.png)
+![alt text](Gfx/scan_list.png)
 
 After selecting a network (remember: you can select more than one) you need to confirm your selection:
 
-![alt text](confirm_sel.png)
+![alt text](Gfx/confirm_sel.png)
 
 Once the selection is confirmed, select Deauth (or Evil Twin if you have paired an additional ESP32):
 
-![alt text](attack_menu.png)
+![alt text](Gfx/attack_menu.png)
 
 This is how running deauth looks like:
 
-![alt text](f_deauth.png)
+![alt text](Gfx/f_deauth.png)
 
 And this is how the flipper presents the password obtained from the Evil Twin portal:
 
-![alt text](f_pass.png)
+![alt text](Gfx/f_pass.png)
 
 The wardrive attack produces files in Wigle.net format and waits for a GPS fix before starting:
 
-![alt text](image-11.png)
+![alt text](Gfx/image-11.png)
 
 The SAE Overflow attacks only one selected network. Remember, you should have confirmed exactly one selected target:
 
-![alt text](image-12.png)
+![alt text](Gfx/image-12.png)
 
 # Deployment to boards
 For Evil Twin - it's all about MACs! C5 needs to know ESP32 MAC and vice versa. At the moment you need to modify it straight in the code.
@@ -110,37 +110,35 @@ Use Arduino IDE and open the EvilTwin_slave.ino file.
 
 Side note: When uploading code to ESP32C3 (or S3) remember to set USB CDC On Boot to Enabled - otherwise you will not see any serial:
 
-![alt text](image-2.png)
+![alt text](Gfx/image-2.png)
 
 Next, after starting up it will print its MAC in the Serial Monitor:
 
-![alt text](image-3.png)
+![alt text](Gfx/image-3.png)
 Note it down. 
 
 ## Initial deployment to ESP32-C5
 Use ESP-IDF. Open the Folder ESP32C5 and then click Open:
 
-![alt text](image-4.png) 
+![alt text](Gfx/image-4.png) 
 
 
 Next, build, flash and monitor:
 
-![alt text](image-5.png)
+![alt text](Gfx/image-5.png)
 
 After it starts, grab the MAC address of the C5 from the logs:
 
-![alt text](image-6.png)
+![alt text](Gfx/image-6.png)
 
 ## MAC code updates
 Now, in Arduino enter the C5 MAC address (in hex form of byte array):
 
-![alt text](image-7.png)
+![alt text](Gfx/image-7.png)
 
 Next, in ESP-IDF in main.c on top enter the ESP32 MAC address:
 
-![alt text](image-8.png)
+![alt text](Gfx/image-8.png)
 
 # Now recompile and flash both boards again.
 They should become aware of each other and be able to communicate over ESP-NOW.
-
-
