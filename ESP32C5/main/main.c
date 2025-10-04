@@ -316,6 +316,11 @@ static void wifi_event_handler(void *event_handler_arg,
                 g_scan_count = MAX_AP_CNT;
                 esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results);
                 MY_LOG_INFO(TAG, "Retrieved %u network records", g_scan_count);
+                
+                // Automatically display scan results after completion
+                if (g_scan_count > 0 && !sniffer_active) {
+                    print_scan_results();
+                }
             } else {
                 MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
                 g_scan_count = 0;
@@ -644,7 +649,7 @@ static int cmd_scan_networks(int argc, char **argv) {
         return 1;
     }
     
-    MY_LOG_INFO(TAG, "Background scan started. Use 'show_scan_results' to see results when ready.");
+    MY_LOG_INFO(TAG, "Background scan started. Wait approx 15s..");
     return 0;
 }
 
@@ -835,7 +840,7 @@ static int cmd_stop(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Background scan stopped.");
     }
     
-    // Stop sniffer if active
+    // Stop sniffer if active (keep collected data)
     if (sniffer_active) {
         sniffer_active = false;
         sniffer_scan_phase = false;
@@ -848,10 +853,13 @@ static int cmd_stop(int argc, char **argv) {
             MY_LOG_INFO(TAG, "Stopped sniffer channel hopping task");
         }
         
+        // Reset channel state for next session
         sniffer_channel_index = 0;
         sniffer_current_channel = dual_band_channels[0];
         sniffer_last_channel_hop = 0;
-        MY_LOG_INFO(TAG, "Sniffer stopped.");
+        
+        // Note: sniffer_aps and sniffer_ap_count are preserved for show_sniffer_results
+        MY_LOG_INFO(TAG, "Sniffer stopped. Data preserved - use 'show_sniffer_results' to view.");
     }
     
     // Clear LED
@@ -874,6 +882,11 @@ static int cmd_start_sniffer(int argc, char **argv) {
     }
     
     MY_LOG_INFO(TAG, "Starting sniffer mode...");
+    
+    // Clear previous sniffer data when starting new session
+    sniffer_ap_count = 0;
+    memset(sniffer_aps, 0, sizeof(sniffer_aps));
+    MY_LOG_INFO(TAG, "Cleared previous sniffer data.");
     
     // Phase 1: Start network scan
     sniffer_active = true;
@@ -901,18 +914,14 @@ static int cmd_start_sniffer(int argc, char **argv) {
 static int cmd_show_sniffer_results(int argc, char **argv) {
     (void)argc; (void)argv;
     
-    if (!sniffer_active) {
-        MY_LOG_INFO(TAG, "Sniffer is not active. Use 'start_sniffer' first.");
-        return 0;
-    }
-    
-    if (sniffer_scan_phase) {
+    // Allow showing results even after sniffer is stopped
+    if (sniffer_active && sniffer_scan_phase) {
         MY_LOG_INFO(TAG, "Sniffer is still scanning networks. Please wait...");
         return 0;
     }
     
     if (sniffer_ap_count == 0) {
-        MY_LOG_INFO(TAG, "No networks found by sniffer.");
+        MY_LOG_INFO(TAG, "No sniffer data available. Use 'start_sniffer' to collect data.");
         return 0;
     }
     
