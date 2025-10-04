@@ -2500,28 +2500,28 @@ static esp_err_t init_gps_uart(void) {
 static esp_err_t init_sd_card(void) {
     esp_err_t ret;
     
-    // Options for mounting the filesystem
+    // Options for mounting the filesystem (optimized for low memory)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = true,  // Allow formatting if needed
-        .max_files = 10,                 // Allow more open files
-        .allocation_unit_size = 16 * 1024,
+        .format_if_mount_failed = false,  // Don't format automatically to save memory
+        .max_files = 3,                   // Reduced from 10 to 3 to save memory
+        .allocation_unit_size = 0,        // Use default (512 bytes) to save memory
         .disk_status_check_enable = false
     };
     
     sdmmc_card_t *card;
     const char mount_point[] = "/sdcard";
     
-    // Configure SPI bus
+    // Configure SPI bus (balanced for SD card requirements and memory)
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = SD_MOSI_PIN,
         .miso_io_num = SD_MISO_PIN,
         .sclk_io_num = SD_CLK_PIN,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
+        .max_transfer_sz = 4096,  // SD card needs at least 4KB for sector operations
     };
     
-    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);  // DMA required for SD card
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
         return ret;
