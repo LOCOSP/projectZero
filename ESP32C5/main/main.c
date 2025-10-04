@@ -124,6 +124,9 @@ static volatile bool deauth_attack_active = false;
 static TaskHandle_t sae_attack_task_handle = NULL;
 static volatile bool sae_attack_active = false;
 
+// Wardrive task
+static TaskHandle_t wardrive_task_handle = NULL;
+
 // Dual-band channel list (2.4GHz + 5GHz like Marauder)
 static const int dual_band_channels[] = {
     // 2.4GHz channels
@@ -1022,6 +1025,24 @@ static int cmd_stop(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Sniffer stopped. Data preserved - use 'show_sniffer_results' to view.");
     }
     
+    // Stop wardrive task if running
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping wardrive task...");
+        wardrive_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && wardrive_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (wardrive_task_handle != NULL) {
+            vTaskDelete(wardrive_task_handle);
+            wardrive_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Wardrive task forcefully stopped.");
+        }
+    }
+    
     // Clear LED (ignore errors if LED is in invalid state)
     esp_err_t led_err = led_strip_clear(strip);
     if (led_err == ESP_OK) {
@@ -1205,34 +1226,17 @@ static int cmd_reboot(int argc, char **argv)
     return 0;
 }
 
-static int cmd_start_wardrive(int argc, char **argv) {
-    (void)argc; (void)argv;
+// Wardrive task function (runs in background)
+static void wardrive_task(void *pvParameters) {
+    (void)pvParameters;
     
-    // Reset stop flag at the beginning of operation
-    operation_stop_requested = false;
-    
-    MY_LOG_INFO(TAG, "Starting wardrive mode...");
-    
-    // Initialize GPS UART
-    esp_err_t ret = init_gps_uart();
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
-        return 1;
-    }
-    MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX)", GPS_TX_PIN, GPS_RX_PIN);
-    
-    // Initialize SD card
-    ret = init_sd_card();
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
-        return 1;
-    }
-    MY_LOG_INFO(TAG, "SD card initialized on pins MISO:%d MOSI:%d CLK:%d CS:%d", 
-                SD_MISO_PIN, SD_MOSI_PIN, SD_CLK_PIN, SD_CS_PIN);
+    MY_LOG_INFO(TAG, "Wardrive task started.");
     
     // Set LED to indicate wardrive mode
-    ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 255, 255)); // Cyan
-    ESP_ERROR_CHECK(led_strip_refresh(strip));
+    esp_err_t led_err = led_strip_set_pixel(strip, 0, 0, 255, 255); // Cyan
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    }
     
     // Find the next file number by scanning existing files
     wardrive_file_counter = find_next_wardrive_file_number();
@@ -1240,19 +1244,25 @@ static int cmd_start_wardrive(int argc, char **argv) {
     
     // Wait for GPS fix before starting
     MY_LOG_INFO(TAG, "Waiting for GPS fix...");
-    if (!wait_for_gps_fix(120)) {  // Wait up to 60 seconds for GPS fix
+    if (!wait_for_gps_fix(120)) {  // Wait up to 120 seconds for GPS fix
         MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, continuing without GPS data");
     } else {
         MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f", 
                    current_gps.latitude, current_gps.longitude);
     }
     
-    wardrive_active = true;
-    MY_LOG_INFO(TAG, "Wardrive started. Press any key to stop.");
+    MY_LOG_INFO(TAG, "Wardrive started. Use 'stop' command to stop.");
     
-    // Main wardrive loop (runs until restart or user stops)
+    // Main wardrive loop (runs until user stops)
     int scan_counter = 0;
     while (wardrive_active && !operation_stop_requested) {
+        // Check for stop request at the beginning of loop
+        if (operation_stop_requested || !wardrive_active) {
+            MY_LOG_INFO(TAG, "Wardrive: Stop requested, terminating...");
+            operation_stop_requested = false;
+            wardrive_active = false;
+            break;
+        }
         // Read GPS data
         int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         if (len > 0) {
@@ -1395,35 +1405,82 @@ static int cmd_start_wardrive(int argc, char **argv) {
         
         scan_counter++;
         
-        // Check if user wants to stop (check console UART for any input)
-        size_t console_available;
-        uart_get_buffered_data_len(UART_NUM_0, &console_available);
-        if (console_available > 0) {
-            MY_LOG_INFO(TAG, "User input detected, stopping wardrive...");
-            wardrive_active = false;
-            // Clear the buffer
-            uint8_t dummy;
-            while (console_available-- > 0) {
-                uart_read_bytes(UART_NUM_0, &dummy, 1, 0);
-            }
-        }
-        
         // Check for stop command
-        if (operation_stop_requested) {
+        if (operation_stop_requested || !wardrive_active) {
             MY_LOG_INFO(TAG, "Wardrive: Stop requested, terminating...");
             wardrive_active = false;
             operation_stop_requested = false;
             break;
         }
         
+        // Yield to allow console processing
+        taskYIELD();
+        
         vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 5 seconds between scans
     }
     
-    // Clear LED
-    ESP_ERROR_CHECK(led_strip_clear(strip));
-    ESP_ERROR_CHECK(led_strip_refresh(strip));
+    // Clear LED after wardrive finishes
+    led_err = led_strip_clear(strip);
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    }
     
+    wardrive_active = false;
+    wardrive_task_handle = NULL;
     MY_LOG_INFO(TAG, "Wardrive stopped after %d scans. Last file: w%d.log", scan_counter, wardrive_file_counter);
+    
+    vTaskDelete(NULL); // Delete this task
+}
+
+static int cmd_start_wardrive(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    // Check if wardrive is already running
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Wardrive already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    // Reset stop flag at the beginning of operation
+    operation_stop_requested = false;
+    
+    MY_LOG_INFO(TAG, "Starting wardrive mode...");
+    
+    // Initialize GPS UART
+    esp_err_t ret = init_gps_uart();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX)", GPS_TX_PIN, GPS_RX_PIN);
+    
+    // Initialize SD card
+    ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "SD card initialized on pins MISO:%d MOSI:%d CLK:%d CS:%d", 
+                SD_MISO_PIN, SD_MOSI_PIN, SD_CLK_PIN, SD_CS_PIN);
+    
+    // Start wardrive in background task
+    wardrive_active = true;
+    BaseType_t result = xTaskCreate(
+        wardrive_task,
+        "wardrive_task",
+        8192,  // Stack size - needs to be large for file operations
+        NULL,
+        5,     // Priority
+        &wardrive_task_handle
+    );
+    
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create wardrive task!");
+        wardrive_active = false;
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "Wardrive task started. Use 'stop' to stop.");
     return 0;
 }
 

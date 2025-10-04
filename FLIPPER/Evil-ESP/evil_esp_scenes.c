@@ -215,6 +215,8 @@ void evil_esp_scene_on_exit_start(void* context) {
 // Scene: Main Menu
 enum EvilEspMainMenuIndex {
     EvilEspMainMenuIndexScanner,
+    EvilEspMainMenuIndexSniffPackets,
+    EvilEspMainMenuIndexShowClients,
     EvilEspMainMenuIndexAttacks,
     EvilEspMainMenuIndexSniffer,
     EvilEspMainMenuIndexConfig,
@@ -238,6 +240,8 @@ void evil_esp_scene_on_enter_main_menu(void* context) {
     submenu_set_header(app->submenu, "Evil ESP 1.1");
 
     submenu_add_item(app->submenu, "Scanner", EvilEspMainMenuIndexScanner, evil_esp_submenu_callback_main_menu, app);
+    submenu_add_item(app->submenu, "Sniff Packets", EvilEspMainMenuIndexSniffPackets, evil_esp_submenu_callback_main_menu, app);
+    submenu_add_item(app->submenu, "Show Clients", EvilEspMainMenuIndexShowClients, evil_esp_submenu_callback_main_menu, app);
     submenu_add_item(app->submenu, "Targets", EvilEspMainMenuIndexSniffer, evil_esp_submenu_callback_main_menu, app);
     submenu_add_item(app->submenu, "Attacks", EvilEspMainMenuIndexAttacks, evil_esp_submenu_callback_main_menu, app);
 
@@ -268,6 +272,18 @@ bool evil_esp_scene_on_event_main_menu(void* context, SceneManagerEvent event) {
             
             // Send scan command and open terminal to see results immediately
             evil_esp_send_command(app, "scan_networks");
+            scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
+            scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
+            return true;
+        case EvilEspMainMenuIndexSniffPackets:
+            // Start packet sniffer
+            evil_esp_send_command(app, "start_sniffer");
+            scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
+            scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
+            return true;
+        case EvilEspMainMenuIndexShowClients:
+            // Show sniffer results
+            evil_esp_send_command(app, "show_sniffer_results");
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
             scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
             return true;
@@ -1104,10 +1120,35 @@ bool evil_esp_scene_on_event_uart_terminal(void* context, SceneManagerEvent even
         return true;
     }
     
-    // Handle back event - go to main menu instead of previous scene
+    // Handle back event - send stop command if coming from attack or sniffer, then return appropriately
     if(event.type == SceneManagerEventTypeBack) {
-        // Clear the scene stack and go to main menu
-        scene_manager_search_and_switch_to_previous_scene(app->scene_manager, EvilEspSceneMainMenu);
+        // Check if we came from the Attacks scene by checking if it's in the scene stack
+        if(scene_manager_has_previous_scene(app->scene_manager, EvilEspSceneAttacks)) {
+            // We came from an attack - send stop command
+            FURI_LOG_I("EvilEsp", "Stopping attack and returning to attacks menu");
+            evil_esp_send_command(app, "stop");
+            
+            // Brief delay to let the command be sent
+            furi_delay_ms(100);
+            
+            // Return to attacks menu
+            scene_manager_search_and_switch_to_previous_scene(app->scene_manager, EvilEspSceneAttacks);
+        } else if(scene_manager_has_previous_scene(app->scene_manager, EvilEspSceneMainMenu)) {
+            // Check if we came from Sniff Packets by checking the last selected menu index
+            if(app->selected_menu_index == EvilEspMainMenuIndexSniffPackets) {
+                // We came from Sniff Packets - send stop command
+                FURI_LOG_I("EvilEsp", "Stopping sniffer and returning to main menu");
+                evil_esp_send_command(app, "stop");
+                
+                // Brief delay to let the command be sent
+                furi_delay_ms(100);
+            }
+            // Return to main menu
+            scene_manager_search_and_switch_to_previous_scene(app->scene_manager, EvilEspSceneMainMenu);
+        } else {
+            // Otherwise, go to main menu
+            scene_manager_search_and_switch_to_previous_scene(app->scene_manager, EvilEspSceneMainMenu);
+        }
         return true;
     }
 
