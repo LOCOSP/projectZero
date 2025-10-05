@@ -91,8 +91,46 @@ static int32_t uart_worker_thread(void* context) {
                     // ALWAYS log to SD card for debugging
                     debug_write_to_sd(line_buffer);
 
+                    // Check for scan start/completion messages FIRST (before any other processing)
+                    // Scan start: "WiFi scan completed", "Found X networks", "Retrieved X network records"
+                    if(strstr(line_buffer, "WiFi scan completed") != NULL || 
+                       strstr(line_buffer, "Retrieved") != NULL ||
+                       (strstr(line_buffer, "Found") != NULL && strstr(line_buffer, "network") != NULL)) {
+                        if(worker->app) {
+                            worker->app->network_count = 0;
+                            memset(worker->app->networks, 0, sizeof(worker->app->networks));
+                            worker->app->scan_in_progress = true;
+                            FURI_LOG_I("EvilEsp", "SCAN START detected: '%s' - ready to parse CSV", line_buffer);
+                        }
+                    }
+                    // Scan end: "Scan results printed"
+                    else if(strstr(line_buffer, "Scan results printed") != NULL) {
+                        if(worker->app) {
+                            worker->app->scan_in_progress = false;
+                            FURI_LOG_I("EvilEsp", "SCAN END detected: %d networks parsed", worker->app->network_count);
+                            if(worker->app->view_dispatcher) {
+                                view_dispatcher_send_custom_event(worker->app->view_dispatcher, EvilEspEventScanComplete);
+                            }
+                        }
+                    }
+
+                    // Check if this is a CSV scan result line (without [INFO] prefix)
+                    // Format: "1","SSID","BSSID","channel","auth","rssi","freq"
+                    if(line_buffer[0] == '"' && strstr(line_buffer, "\",\"") != NULL && strlen(line_buffer) > 20) {
+                        FURI_LOG_I("EvilEsp", "CSV line detected: scan_in_progress=%d", worker->app ? worker->app->scan_in_progress : -1);
+                        if(worker->app && worker->app->scan_in_progress) {
+                            FURI_LOG_I("EvilEsp", "Parsing CSV scan line (no prefix): %s", line_buffer);
+                            // Add [INFO] prefix for parser compatibility
+                            char temp_line[512];
+                            snprintf(temp_line, sizeof(temp_line), "[INFO] %s", line_buffer);
+                            parse_scan_result_line(worker, temp_line);
+                            FURI_LOG_I("EvilEsp", "After parse: network_count=%d", worker->app->network_count);
+                        } else {
+                            FURI_LOG_W("EvilEsp", "CSV line ignored - not in scan mode");
+                        }
+                    }
                     // Parse different response types (even if echo, for debugging)
-                    if(strncmp(line_buffer, "[INFO]", 6) == 0) {
+                    else if(strncmp(line_buffer, "[INFO]", 6) == 0) {
                         handle_info_response(worker, line_buffer);
                     }
                     else if(strncmp(line_buffer, "[ERROR]", 7) == 0) {
@@ -274,8 +312,12 @@ static void handle_hop_response(EvilEspUartWorker* worker, const char* line) {
 }
 
 static void handle_generic_response(EvilEspUartWorker* worker, const char* line) {
-    UNUSED(worker);
+    if(!worker || !line) return;
+    
     FURI_LOG_I("EvilEsp", "[GENERIC] handler: %s", line);
+    
+    // NOTE: Scan start/end detection is now handled in main worker loop
+    // to avoid double processing
     
     // Check if this might be a response to select_networks or start_deauth
     if(strstr(line, "select") != NULL || strstr(line, "network") != NULL || 
