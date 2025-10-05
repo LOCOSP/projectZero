@@ -160,8 +160,8 @@ void evil_esp_scene_on_enter_start(void* context) {
     EvilEspApp* app = context;
 
     // Show connection message popup
-    popup_set_header(app->popup, "Lab C5 Board", 64, 8, AlignCenter, AlignTop);
-    popup_set_text(app->popup, "Now connect the\nLab C5 Board \n(click Back when ready)", 64, 35, AlignCenter, AlignCenter);
+    popup_set_header(app->popup, "Connect C5 Lab", 64, 8, AlignCenter, AlignTop);
+    popup_set_text(app->popup, "Now connect the board\nand click 'Back'\nafter a few secs", 64, 35, AlignCenter, AlignCenter);
     popup_set_icon(app->popup, 0, 0, NULL); // No icon
     popup_set_callback(app->popup, NULL);
     popup_set_context(app->popup, app);
@@ -236,7 +236,7 @@ void evil_esp_scene_on_enter_main_menu(void* context) {
     }
 
     submenu_reset(app->submenu);
-    submenu_set_header(app->submenu, "Evil ESP 1.2");
+    submenu_set_header(app->submenu, "C5 Lab 1.3");
 
     submenu_add_item(app->submenu, "Scanner", EvilEspMainMenuIndexScanner, evil_esp_submenu_callback_main_menu, app);
     submenu_add_item(app->submenu, "Sniffer", EvilEspMainMenuIndexSnifferMenu, evil_esp_submenu_callback_main_menu, app);
