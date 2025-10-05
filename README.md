@@ -52,7 +52,7 @@ Creates files in Wigle.net format on SD card attached to the C5 board. Waits for
 
 Sniffer is able to passively listen for traffic between AP and Clients. After you interrupt it, you can see list of all APs having clients, their count and MACs.
 
-
+Additionally you can inspect probe requests captured during the scan.
 
 
 # CLI Usage
