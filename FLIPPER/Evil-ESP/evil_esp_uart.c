@@ -31,7 +31,6 @@ struct EvilEspUartWorker {
     uint32_t command_timestamps[MAX_RECENT_COMMANDS];
     int recent_command_index;
     char* line_buffer; // Move line buffer to heap to reduce stack usage
-    uint32_t last_log_update; // Rate limiting for high-volume WebUI data
 };
 
 static EvilEspUartWorker* uart_worker = NULL;
@@ -86,43 +85,44 @@ static int32_t uart_worker_thread(void* context) {
                     // Process complete line
                     FURI_LOG_I("EvilEsp", "RX: %s", line_buffer);
 
-                    // Check if this is a command echo - if so, only skip response processing, not display
+                    // Check if this is a command echo - but still process it for debugging
                     bool is_echo = is_command_echo(worker, line_buffer);
+                    
+                    // ALWAYS log to SD card for debugging
+                    debug_write_to_sd(line_buffer);
 
-                    // Parse different response types only if not an echo
-                    if(!is_echo) {
-                        if(strncmp(line_buffer, "[INFO]", 6) == 0) {
-                            handle_info_response(worker, line_buffer);
-                        }
-                        else if(strncmp(line_buffer, "[ERROR]", 7) == 0) {
-                            handle_error_response(worker, line_buffer);
-                        }
-                        else if(strncmp(line_buffer, "[DEBUG]", 7) == 0) {
-                            handle_debug_response(worker, line_buffer);
-                        }
-                        else if(strncmp(line_buffer, "[CMD]", 5) == 0) {
-                            handle_cmd_response(worker, line_buffer);
-                        }
-                        else if(strncmp(line_buffer, "[MGMT]", 6) == 0) {
-                            handle_mgmt_response(worker, line_buffer);
-                        }
-                        else if(strncmp(line_buffer, "[DATA]", 6) == 0) {
-                            handle_data_response(worker, line_buffer);
-                        }
-                        else if(strncmp(line_buffer, "[HOP]", 5) == 0) {
-                            handle_hop_response(worker, line_buffer);
-                        }
-                        else if(strncmp(line_buffer, "RAW UART RX:", 12) == 0 ||
-                                strncmp(line_buffer, "Received Command:", 17) == 0 ||
-                                strncmp(line_buffer, "SCAN COMMAND", 12) == 0) {
-                            // These are our debug messages from Arduino - handle specially
-                            handle_debug_response(worker, line_buffer);
-                        }
-                        else {
-                            // Generic response - but be more selective
-                            if(strlen(line_buffer) > 3) { // Only process substantial responses
-                                handle_generic_response(worker, line_buffer);
-                            }
+                    // Parse different response types (even if echo, for debugging)
+                    if(strncmp(line_buffer, "[INFO]", 6) == 0) {
+                        handle_info_response(worker, line_buffer);
+                    }
+                    else if(strncmp(line_buffer, "[ERROR]", 7) == 0) {
+                        handle_error_response(worker, line_buffer);
+                    }
+                    else if(strncmp(line_buffer, "[DEBUG]", 7) == 0) {
+                        handle_debug_response(worker, line_buffer);
+                    }
+                    else if(strncmp(line_buffer, "[CMD]", 5) == 0) {
+                        handle_cmd_response(worker, line_buffer);
+                    }
+                    else if(strncmp(line_buffer, "[MGMT]", 6) == 0) {
+                        handle_mgmt_response(worker, line_buffer);
+                    }
+                    else if(strncmp(line_buffer, "[DATA]", 6) == 0) {
+                        handle_data_response(worker, line_buffer);
+                    }
+                    else if(strncmp(line_buffer, "[HOP]", 5) == 0) {
+                        handle_hop_response(worker, line_buffer);
+                    }
+                    else if(strncmp(line_buffer, "RAW UART RX:", 12) == 0 ||
+                            strncmp(line_buffer, "Received Command:", 17) == 0 ||
+                            strncmp(line_buffer, "SCAN COMMAND", 12) == 0) {
+                        // These are our debug messages from Arduino - handle specially
+                        handle_debug_response(worker, line_buffer);
+                    }
+                    else if(!is_echo) {
+                        // Generic response - process all non-echo responses
+                        if(strlen(line_buffer) > 3) { // Only process substantial responses
+                            handle_generic_response(worker, line_buffer);
                         }
                     }
 
@@ -130,14 +130,10 @@ static int32_t uart_worker_thread(void* context) {
                     if(worker->app) {
                         evil_esp_append_log(worker->app, line_buffer);
 
-                        // Rate limit UI updates for high-volume WebUI data
-                        uint32_t now = furi_get_tick();
-                        if(now - worker->last_log_update > 200) { // Max 5 refreshes per second for WebUI data
-                            if(worker->app->view_dispatcher) {
-                                // Simply send refresh event - the scene handler will ignore it if not in UART terminal
-                                view_dispatcher_send_custom_event(worker->app->view_dispatcher, EvilEspEventUartTerminalRefresh);
-                                worker->last_log_update = now;
-                            }
+                        // Send immediate UI update for every line (no rate limiting for better responsiveness)
+                        if(worker->app->view_dispatcher) {
+                            // Simply send refresh event - the scene handler will ignore it if not in UART terminal
+                            view_dispatcher_send_custom_event(worker->app->view_dispatcher, EvilEspEventUartTerminalRefresh);
                         }
                     }
                 }
@@ -160,8 +156,7 @@ static int32_t uart_worker_thread(void* context) {
 static void handle_info_response(EvilEspUartWorker* worker, const char* line) {
     if(!worker->app) return;
 
-    // Write to debug log
-    debug_write_to_sd(line);
+    FURI_LOG_I("EvilEsp", "[INFO] handler: %s", line);
 
     // Parse scan results - look for the actual header format
     if(strstr(line, "Index") != NULL && strstr(line, "SSID") != NULL && strstr(line, "BSSID") != NULL) {
@@ -171,17 +166,24 @@ static void handle_info_response(EvilEspUartWorker* worker, const char* line) {
         worker->app->scan_in_progress = true;
         FURI_LOG_I("EvilEsp", "Scan results header detected - cleared previous results");
     }
-    // Look for actual scan result lines - must start with "[INFO] " followed by a digit and tab
+    // Look for actual scan result lines - must start with "[INFO] " followed by CSV format
     else if(strncmp(line, "[INFO] ", 7) == 0 && strlen(line) > 8) {
         const char* after_prefix = line + 7; // Skip "[INFO] "
-        if(after_prefix[0] == '"' && strstr(after_prefix, "\",\"") != NULL && strlen(line) > 30) {
-            // This looks like a scan result line: "[INFO] 0\tSSID\t..."
+        // Check if this looks like CSV data (starts with quote or digit)
+        if((after_prefix[0] == '"' && strstr(after_prefix, "\",\"") != NULL) || 
+           (isdigit((unsigned char)after_prefix[0]) && strstr(after_prefix, ",") != NULL)) {
+            // This looks like a scan result line in CSV format
+            FURI_LOG_I("EvilEsp", "Attempting to parse CSV scan line");
             parse_scan_result_line(worker, line);
+        } else {
+            FURI_LOG_D("EvilEsp", "INFO line doesn't match CSV format: %s", after_prefix);
         }
     }
     // Scan completion - wait for "Scan results printed" message
     else if(strstr(line, "Scan results printed") != NULL || 
-            strstr(line, "Scan completed") != NULL) {
+            strstr(line, "Scan completed") != NULL ||
+            strstr(line, "scan complete") != NULL ||
+            strstr(line, "Networks found") != NULL) {
         // Scan finished - update UI
         worker->app->scan_in_progress = false;
         FURI_LOG_I("EvilEsp", "Scan completed with %d networks", worker->app->network_count);
@@ -190,26 +192,30 @@ static void handle_info_response(EvilEspUartWorker* worker, const char* line) {
             view_dispatcher_send_custom_event(worker->app->view_dispatcher, EvilEspEventScanComplete);
         }
     }
-    else if(strstr(line, "Deauth") != NULL) {
+    else if(strstr(line, "Deauth") != NULL || strstr(line, "deauth") != NULL) {
         // Attack progress notification
         FURI_LOG_I("EvilEsp", "Attack progress: %s", line);
+    }
+    else {
+        // Log any other INFO messages for debugging
+        FURI_LOG_D("EvilEsp", "Unhandled INFO: %s", line);
     }
 }
 
 static void handle_error_response(EvilEspUartWorker* worker, const char* line) {
     UNUSED(worker);
-    FURI_LOG_E("EvilEsp", "Arduino Error: %s", line);
+    FURI_LOG_E("EvilEsp", "[ERROR] handler: %s", line);
 }
 
 static void handle_debug_response(EvilEspUartWorker* worker, const char* line) {
     UNUSED(worker);
-    FURI_LOG_D("EvilEsp", "Arduino Debug: %s", line);
+    FURI_LOG_D("EvilEsp", "[DEBUG] handler: %s", line);
 }
 
 static void handle_cmd_response(EvilEspUartWorker* worker, const char* line) {
     if(!worker->app) return;
 
-    FURI_LOG_I("EvilEsp", "Command response: %s", line);
+    FURI_LOG_I("EvilEsp", "[CMD] handler: %s", line);
 
     // Update sniffer state based on command responses
     if(strstr(line, "sniffing mode") != NULL) {
@@ -269,7 +275,14 @@ static void handle_hop_response(EvilEspUartWorker* worker, const char* line) {
 
 static void handle_generic_response(EvilEspUartWorker* worker, const char* line) {
     UNUSED(worker);
-    FURI_LOG_I("EvilEsp", "Generic: %s", line);
+    FURI_LOG_I("EvilEsp", "[GENERIC] handler: %s", line);
+    
+    // Check if this might be a response to select_networks or start_deauth
+    if(strstr(line, "select") != NULL || strstr(line, "network") != NULL || 
+       strstr(line, "target") != NULL || strstr(line, "deauth") != NULL ||
+       strstr(line, "attack") != NULL || strstr(line, "start") != NULL) {
+        FURI_LOG_I("EvilEsp", "Possible command response detected: %s", line);
+    }
 }
 
 static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line) {
@@ -502,7 +515,7 @@ EvilEspUartWorker* evil_esp_uart_init(EvilEspApp* app) {
     memset(worker->command_timestamps, 0, sizeof(worker->command_timestamps));
 
     // Allocate line buffer on heap to reduce stack usage
-    worker->line_buffer = malloc(512); // Larger buffer for WebUI data
+    worker->line_buffer = malloc(4096); // Larger buffer for WebUI data
     if(!worker->line_buffer) {
         FURI_LOG_E("EvilEsp", "Failed to allocate line buffer");
         furi_stream_buffer_free(worker->rx_stream);
@@ -510,7 +523,6 @@ EvilEspUartWorker* evil_esp_uart_init(EvilEspApp* app) {
         free(worker);
         return NULL;
     }
-    worker->last_log_update = 0;
 
     // Get serial handle based on GPIO pin configuration
     FuriHalSerialId serial_id;
@@ -712,7 +724,7 @@ bool is_command_echo(EvilEspUartWorker* worker, const char* line) {
             if(current_time - worker->command_timestamps[i] < COMMAND_ECHO_TIMEOUT_MS) {
                 // Check if line matches the command (case insensitive)
                 if(strcasecmp(line, worker->recent_commands[i]) == 0) {
-                    FURI_LOG_D("EvilEsp", "Filtered echo: %s", line);
+                    FURI_LOG_D("EvilEsp", "✓ Echo detected and filtered: '%s'", line);
                     return true;
                 }
             } else {
@@ -723,6 +735,8 @@ bool is_command_echo(EvilEspUartWorker* worker, const char* line) {
         }
     }
 
+    // Not an echo - this is a real response
+    FURI_LOG_D("EvilEsp", "✗ Not an echo, processing: '%s'", line);
     return false;
 }
 
@@ -733,6 +747,9 @@ void store_sent_command(EvilEspUartWorker* worker, const char* command) {
     strncpy(worker->recent_commands[worker->recent_command_index], command, 63);
     worker->recent_commands[worker->recent_command_index][63] = '\0';
     worker->command_timestamps[worker->recent_command_index] = furi_get_tick();
+
+    FURI_LOG_D("EvilEsp", "Stored command for echo filtering: '%s' at index %d", 
+               command, worker->recent_command_index);
 
     worker->recent_command_index = (worker->recent_command_index + 1) % MAX_RECENT_COMMANDS;
 }

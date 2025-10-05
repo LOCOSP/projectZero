@@ -1097,7 +1097,8 @@ void evil_esp_scene_on_enter_uart_terminal(void* context) {
         text_box_set_focus(app->text_box, TextBoxFocusEnd);
         view_dispatcher_switch_to_view(app->view_dispatcher, EvilEspViewTextBox);
 
-        // Note: Live updates are now triggered directly by UART worker when data arrives
+        // Force initial refresh to show any pending data
+        view_dispatcher_send_custom_event(app->view_dispatcher, EvilEspEventUartTerminalRefresh);
     }
 }
 
@@ -1108,50 +1109,45 @@ bool evil_esp_scene_on_event_uart_terminal(void* context, SceneManagerEvent even
     uint32_t state = scene_manager_get_scene_state(app->scene_manager, EvilEspSceneUartTerminal);
     if(state != 1) return false;
 
-    // Handle refresh timer event
+    // Handle refresh event - update display with current log content
     if(event.type == SceneManagerEventTypeCustom && event.event == EvilEspEventUartTerminalRefresh) {
-        // Only update if log actually changed to reduce CPU usage
-        static size_t last_log_size = 0;
         size_t current_log_size = furi_string_size(app->log_string);
 
-        if(current_log_size != last_log_size) {
-            // Create display string with header + current log content
-            furi_string_reset(app->uart_log_string);
-            furi_string_printf(app->uart_log_string, "=== UART TERMINAL ===\n");
-            const char* gpio_pins = (app->config.gpio_pins == EvilEspGpioPins13_14) ? "13↔14" : "15↔16";
-            furi_string_cat_printf(app->uart_log_string, "115200 baud, GPIO %s\n", gpio_pins);
-            furi_string_cat_printf(app->uart_log_string, "ESP GPIO1←TX GPIO3→RX\n");
-            furi_string_cat_printf(app->uart_log_string, "Status: ACTIVE\n\n");
+        // ALWAYS update display to show new data immediately
+        // Create display string with header + current log content
+        furi_string_reset(app->uart_log_string);
+        furi_string_printf(app->uart_log_string, "=== UART TERMINAL ===\n");
+        const char* gpio_pins = (app->config.gpio_pins == EvilEspGpioPins13_14) ? "13↔14" : "15↔16";
+        furi_string_cat_printf(app->uart_log_string, "115200 baud, GPIO %s\n", gpio_pins);
+        furi_string_cat_printf(app->uart_log_string, "ESP GPIO1←TX GPIO3→RX\n");
+        furi_string_cat_printf(app->uart_log_string, "Status: ACTIVE\n\n");
 
-            // Add current log content (which is updated by UART worker)
-            if(current_log_size > 0) {
-                furi_string_cat(app->uart_log_string, app->log_string);
-            } else {
-                furi_string_cat_printf(app->uart_log_string, "[Waiting for UART data...]\n");
-            }
-
-            // Limit total size to prevent memory issues
-            if(furi_string_size(app->uart_log_string) > EVIL_ESP_TEXT_BOX_STORE_SIZE - 512) {
-                // Keep header and recent content
-                const char* gpio_pins_str = (app->config.gpio_pins == EvilEspGpioPins13_14) ? "13↔14" : "15↔16";
-                char header[256];
-                snprintf(header, sizeof(header), "=== UART TERMINAL ===\n115200 baud, GPIO %s\nESP GPIO1←TX GPIO3→RX\nStatus: ACTIVE\n\n[...truncated...]\n", gpio_pins_str);
-                size_t keep_size = EVIL_ESP_TEXT_BOX_STORE_SIZE / 2;
-
-                // Get recent content from app->log_string
-                if(current_log_size > keep_size) {
-                    furi_string_set_str(app->uart_log_string, header);
-                    const char* recent_content = furi_string_get_cstr(app->log_string) + (current_log_size - keep_size);
-                    furi_string_cat_str(app->uart_log_string, recent_content);
-                }
-            }
-
-            // Update the display
-            text_box_set_text(app->text_box, furi_string_get_cstr(app->uart_log_string));
-            text_box_set_focus(app->text_box, TextBoxFocusEnd);
-
-            last_log_size = current_log_size;
+        // Add current log content (which is updated by UART worker)
+        if(current_log_size > 0) {
+            furi_string_cat(app->uart_log_string, app->log_string);
+        } else {
+            furi_string_cat_printf(app->uart_log_string, "[Waiting for UART data...]\n");
         }
+
+        // Limit total size to prevent memory issues
+        if(furi_string_size(app->uart_log_string) > EVIL_ESP_TEXT_BOX_STORE_SIZE - 512) {
+            // Keep header and recent content
+            const char* gpio_pins_str = (app->config.gpio_pins == EvilEspGpioPins13_14) ? "13↔14" : "15↔16";
+            char header[256];
+            snprintf(header, sizeof(header), "=== UART TERMINAL ===\n115200 baud, GPIO %s\nESP GPIO1←TX GPIO3→RX\nStatus: ACTIVE\n\n[...truncated...]\n", gpio_pins_str);
+            size_t keep_size = EVIL_ESP_TEXT_BOX_STORE_SIZE / 2;
+
+            // Get recent content from app->log_string
+            if(current_log_size > keep_size) {
+                furi_string_set_str(app->uart_log_string, header);
+                const char* recent_content = furi_string_get_cstr(app->log_string) + (current_log_size - keep_size);
+                furi_string_cat_str(app->uart_log_string, recent_content);
+            }
+        }
+
+        // Update the display
+        text_box_set_text(app->text_box, furi_string_get_cstr(app->uart_log_string));
+        text_box_set_focus(app->text_box, TextBoxFocusEnd);
 
         return true;
     }
