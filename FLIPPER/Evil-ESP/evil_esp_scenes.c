@@ -444,6 +444,7 @@ void evil_esp_scene_on_exit_scanner_results(void* context) {
 enum EvilEspSnifferMenuIndex {
     EvilEspSnifferMenuIndexSniffPackets,
     EvilEspSnifferMenuIndexShowClients,
+    EvilEspSnifferMenuIndexShowProbes,
 };
 
 void evil_esp_scene_on_enter_sniffer_menu(void* context) {
@@ -454,6 +455,7 @@ void evil_esp_scene_on_enter_sniffer_menu(void* context) {
 
     submenu_add_item(app->submenu, "Sniff Packets", EvilEspSnifferMenuIndexSniffPackets, evil_esp_submenu_callback_sniffer, app);
     submenu_add_item(app->submenu, "Show Clients", EvilEspSnifferMenuIndexShowClients, evil_esp_submenu_callback_sniffer, app);
+    submenu_add_item(app->submenu, "Show Probes", EvilEspSnifferMenuIndexShowProbes, evil_esp_submenu_callback_sniffer, app);
 
     view_dispatcher_switch_to_view(app->view_dispatcher, EvilEspViewMainMenu);
 }
@@ -472,6 +474,12 @@ bool evil_esp_scene_on_event_sniffer_menu(void* context, SceneManagerEvent event
         case EvilEspSnifferMenuIndexShowClients:
             // Show sniffer results
             evil_esp_send_command(app, "show_sniffer_results");
+            scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
+            scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
+            return true;
+        case EvilEspSnifferMenuIndexShowProbes:
+            // Show probe requests
+            evil_esp_send_command(app, "show_probes");
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
             scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
             return true;

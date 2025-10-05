@@ -59,13 +59,22 @@
 #define SD_CLK_PIN         6
 #define SD_CS_PIN          10
 
-#define MY_LOG_INFO(tag, fmt, ...) printf("[INFO] " fmt "\n", ##__VA_ARGS__)
+#define MY_LOG_INFO(tag, fmt, ...) printf("" fmt "\n", ##__VA_ARGS__)
 
 #define MAX_AP_CNT 64
 #define MAX_CLIENTS_PER_AP 50
 #define MAX_SNIFFER_APS 100
+#define MAX_PROBE_REQUESTS 200
 
 static const char *TAG = "projectZero";
+
+// Probe request data structure
+typedef struct {
+    uint8_t mac[6];
+    char ssid[33];
+    int rssi;
+    uint32_t last_seen;
+} probe_request_t;
 
 // Sniffer data structures
 typedef struct {
@@ -108,6 +117,10 @@ static int sniffer_ap_count = 0;
 static volatile bool sniffer_active = false;
 static volatile bool sniffer_scan_phase = false;
 static int sniff_debug = 0; // Debug flag for detailed packet logging
+
+// Probe request storage
+static probe_request_t probe_requests[MAX_PROBE_REQUESTS];
+static int probe_request_count = 0;
 
 // Channel hopping for sniffer (like Marauder dual-band)
 static int sniffer_current_channel = 1;
@@ -206,6 +219,7 @@ static int cmd_start_evil_twin(int argc, char **argv);
 static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
+static int cmd_show_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
@@ -234,7 +248,6 @@ static bool wait_for_gps_fix(int timeout_seconds);
 static int find_next_wardrive_file_number(void);
 // SAE WPA3 attack methods forward declarations:
 //add methods declarations below:
-static void startRandomMacSaeClientOverflow(const wifi_ap_record_t ap_record);
 static void inject_sae_commit_frame();
 static void prepareAttack(const wifi_ap_record_t ap_record);
 static void update_spoofed_src_random(void);
@@ -1072,6 +1085,8 @@ static int cmd_start_sniffer(int argc, char **argv) {
     // Clear previous sniffer data when starting new session
     sniffer_ap_count = 0;
     memset(sniffer_aps, 0, sizeof(sniffer_aps));
+    probe_request_count = 0;
+    memset(probe_requests, 0, sizeof(probe_requests));
     MY_LOG_INFO(TAG, "Cleared previous sniffer data.");
     
     // Phase 1: Start network scan
@@ -1157,20 +1172,14 @@ static int cmd_show_sniffer_results(int argc, char **argv) {
         // Print AP info in compact format: SSID, CH: CLIENT_COUNT
         printf("%s, CH%d: %d\n", ap->ssid, ap->channel, ap->client_count);
         
-        // Print all client MACs in one line, separated by ", "
+        // Print each client MAC on a separate line with 1 space indentation
         if (ap->client_count > 0) {
             for (int j = 0; j < ap->client_count; j++) {
                 sniffer_client_t *client = &ap->clients[j];
-                printf("%02X:%02X:%02X:%02X:%02X:%02X",
+                printf(" %02X:%02X:%02X:%02X:%02X:%02X\n",
                        client->mac[0], client->mac[1], client->mac[2],
                        client->mac[3], client->mac[4], client->mac[5]);
-                
-                // Add separator if not last client
-                if (j < ap->client_count - 1) {
-                    printf(", ");
-                }
             }
-            printf("\n");
         }
         
         vTaskDelay(pdMS_TO_TICKS(20)); // Small delay to avoid overwhelming UART
@@ -1178,6 +1187,30 @@ static int cmd_show_sniffer_results(int argc, char **argv) {
     
     if (displayed_count == 0) {
         MY_LOG_INFO(TAG, "No APs with clients found.");
+    }
+    
+    return 0;
+}
+
+static int cmd_show_probes(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    if (probe_request_count == 0) {
+        MY_LOG_INFO(TAG, "No probe requests captured. Use 'start_sniffer' to collect data.");
+        return 0;
+    }
+    
+    MY_LOG_INFO(TAG, "Probe requests: %d", probe_request_count);
+    
+    // Display each probe request: SSID (MAC)
+    for (int i = 0; i < probe_request_count; i++) {
+        probe_request_t *probe = &probe_requests[i];
+        printf("%s (%02X:%02X:%02X:%02X:%02X:%02X)\n",
+               probe->ssid,
+               probe->mac[0], probe->mac[1], probe->mac[2],
+               probe->mac[3], probe->mac[4], probe->mac[5]);
+        
+        vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to avoid overwhelming UART
     }
     
     return 0;
@@ -1520,6 +1553,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_sniffer_cmd));
 
+    const esp_console_cmd_t show_probes_cmd = {
+        .command = "show_probes",
+        .help = "Shows captured probe requests with SSIDs",
+        .hint = NULL,
+        .func = &cmd_show_probes,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&show_probes_cmd));
+
     const esp_console_cmd_t sniffer_debug_cmd = {
         .command = "sniffer_debug",
         .help = "Enable/disable detailed sniffer debug logging: sniffer_debug <0|1>",
@@ -1659,6 +1701,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  start_wardrive");
     MY_LOG_INFO(TAG,"  start_sniffer");
     MY_LOG_INFO(TAG,"  show_sniffer_results");
+    MY_LOG_INFO(TAG,"  show_probes");
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
     MY_LOG_INFO(TAG,"  stop");
     MY_LOG_INFO(TAG,"  reboot");
@@ -2368,12 +2411,79 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                 return;
             }
             
-            // For probe requests, we don't have specific AP, so skip for now
+            // For probe requests, extract SSID and store
             if (frame_type == 0x40) {
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - probe request (no specific AP association)", packet_counter);
+                // Parse probe request to extract SSID
+                // Probe request format: MAC header (24 bytes) + Frame body
+                // Frame body starts with fixed parameters, then tagged parameters
+                // SSID is usually the first tagged parameter (Tag Number = 0)
+                
+                if (len > 24 && probe_request_count < MAX_PROBE_REQUESTS) {
+                    const uint8_t *body = frame + 24; // Skip MAC header
+                    int body_len = len - 24;
+                    
+                    char ssid[33] = {0};
+                    bool ssid_found = false;
+                    uint8_t ssid_length = 0;
+                    
+                    // Parse tagged parameters to find SSID (tag 0)
+                    int offset = 0;
+                    while (offset + 2 <= body_len) {
+                        uint8_t tag_number = body[offset];
+                        uint8_t tag_length = body[offset + 1];
+                        
+                        if (offset + 2 + tag_length > body_len) {
+                            break; // Invalid tag
+                        }
+                        
+                        if (tag_number == 0) { // SSID tag
+                            ssid_length = tag_length;
+                            if (tag_length > 0 && tag_length <= 32) {
+                                memcpy(ssid, &body[offset + 2], tag_length);
+                                ssid[tag_length] = '\0';
+                                ssid_found = true;
+                            } else if (tag_length == 0) {
+                                strcpy(ssid, "<Broadcast>");
+                                ssid_found = true;
+                            }
+                            break;
+                        }
+                        
+                        offset += 2 + tag_length;
+                    }
+                    
+                    // Store probe request if SSID found and not broadcast probe
+                    if (ssid_found && ssid_length > 0) {
+                        // Check if this MAC+SSID combination already exists
+                        bool already_exists = false;
+                        for (int i = 0; i < probe_request_count; i++) {
+                            if (memcmp(probe_requests[i].mac, client_mac, 6) == 0 &&
+                                strcmp(probe_requests[i].ssid, ssid) == 0) {
+                                // Update existing entry
+                                probe_requests[i].last_seen = esp_timer_get_time() / 1000;
+                                probe_requests[i].rssi = pkt->rx_ctrl.rssi;
+                                already_exists = true;
+                                break;
+                            }
+                        }
+                        
+                        // Add new probe request if not exists
+                        if (!already_exists) {
+                            memcpy(probe_requests[probe_request_count].mac, client_mac, 6);
+                            strncpy(probe_requests[probe_request_count].ssid, ssid, sizeof(probe_requests[probe_request_count].ssid) - 1);
+                            probe_requests[probe_request_count].rssi = pkt->rx_ctrl.rssi;
+                            probe_requests[probe_request_count].last_seen = esp_timer_get_time() / 1000;
+                            probe_request_count++;
+                            
+                            if (sniff_debug) {
+                                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Stored probe request for SSID '%s' from %02X:%02X:%02X:%02X:%02X:%02X", 
+                                           packet_counter, ssid,
+                                           client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
+                            }
+                        }
+                    }
                 }
-                return;
+                return; // Don't process probe requests for AP client association
             }
             
             // For association/auth requests, find or create the target AP
