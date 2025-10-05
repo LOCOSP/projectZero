@@ -27,6 +27,7 @@ typedef enum {
     EvilEspSceneMainMenu,
     EvilEspSceneScanner,
     EvilEspSceneScannerResults,
+    EvilEspSceneSnifferMenu,
     EvilEspSceneAttacks,
     EvilEspSceneAttackConfig,
     EvilEspSceneSniffer,
@@ -233,6 +234,7 @@ void evil_esp_scene_on_enter_start(void* context);
 void evil_esp_scene_on_enter_main_menu(void* context);
 void evil_esp_scene_on_enter_scanner(void* context);
 void evil_esp_scene_on_enter_scanner_results(void* context);
+void evil_esp_scene_on_enter_sniffer_menu(void* context);
 void evil_esp_scene_on_enter_attacks(void* context);
 void evil_esp_scene_on_enter_attack_config(void* context);
 void evil_esp_scene_on_enter_sniffer(void* context);
@@ -245,6 +247,7 @@ bool evil_esp_scene_on_event_start(void* context, SceneManagerEvent event);
 bool evil_esp_scene_on_event_main_menu(void* context, SceneManagerEvent event);
 bool evil_esp_scene_on_event_scanner(void* context, SceneManagerEvent event);
 bool evil_esp_scene_on_event_scanner_results(void* context, SceneManagerEvent event);
+bool evil_esp_scene_on_event_sniffer_menu(void* context, SceneManagerEvent event);
 bool evil_esp_scene_on_event_attacks(void* context, SceneManagerEvent event);
 bool evil_esp_scene_on_event_attack_config(void* context, SceneManagerEvent event);
 bool evil_esp_scene_on_event_sniffer(void* context, SceneManagerEvent event);
@@ -257,6 +260,7 @@ void evil_esp_scene_on_exit_start(void* context);
 void evil_esp_scene_on_exit_main_menu(void* context);
 void evil_esp_scene_on_exit_scanner(void* context);
 void evil_esp_scene_on_exit_scanner_results(void* context);
+void evil_esp_scene_on_exit_sniffer_menu(void* context);
 void evil_esp_scene_on_exit_attacks(void* context);
 void evil_esp_scene_on_exit_attack_config(void* context);
 void evil_esp_scene_on_exit_sniffer(void* context);

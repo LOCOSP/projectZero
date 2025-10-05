@@ -107,7 +107,7 @@ static sniffer_ap_t sniffer_aps[MAX_SNIFFER_APS];
 static int sniffer_ap_count = 0;
 static volatile bool sniffer_active = false;
 static volatile bool sniffer_scan_phase = false;
-static int sniff_debug = 1; // Debug flag for detailed packet logging
+static int sniff_debug = 0; // Debug flag for detailed packet logging
 
 // Channel hopping for sniffer (like Marauder dual-band)
 static int sniffer_current_channel = 1;
@@ -1135,9 +1135,7 @@ static int cmd_show_sniffer_results(int argc, char **argv) {
         }
     }
     
-    MY_LOG_INFO(TAG, "Sniffer Results (%d networks monitored, showing only APs with clients):", sniffer_ap_count);
-    MY_LOG_INFO(TAG, "Format: SSID, BSSID, Channel, Clients, [Client MACs...]");
-    
+    // Compact format for Flipper Zero display
     int displayed_count = 0;
     for (int i = 0; i < sniffer_ap_count; i++) {
         int idx = sorted_indices[i];
@@ -1155,34 +1153,30 @@ static int cmd_show_sniffer_results(int argc, char **argv) {
         
         displayed_count++;
         
-        // Print AP info
-        char ap_info[200];
-        snprintf(ap_info, sizeof(ap_info), "\"%s\", %02X:%02X:%02X:%02X:%02X:%02X, Ch%d, %d clients",
-                ap->ssid,
-                ap->bssid[0], ap->bssid[1], ap->bssid[2],
-                ap->bssid[3], ap->bssid[4], ap->bssid[5],
-                ap->channel, ap->client_count);
+        // Print AP info in compact format: SSID, CH: CLIENT_COUNT
+        printf("%s, CH%d: %d\n", ap->ssid, ap->channel, ap->client_count);
         
-        MY_LOG_INFO(TAG, "%s", ap_info);
-        
-        // Print clients
-        for (int j = 0; j < ap->client_count; j++) {
-            sniffer_client_t *client = &ap->clients[j];
-            MY_LOG_INFO(TAG, "  Client: %02X:%02X:%02X:%02X:%02X:%02X (RSSI: %d)",
+        // Print all client MACs in one line, separated by ", "
+        if (ap->client_count > 0) {
+            for (int j = 0; j < ap->client_count; j++) {
+                sniffer_client_t *client = &ap->clients[j];
+                printf("%02X:%02X:%02X:%02X:%02X:%02X",
                        client->mac[0], client->mac[1], client->mac[2],
-                       client->mac[3], client->mac[4], client->mac[5],
-                       client->rssi);
+                       client->mac[3], client->mac[4], client->mac[5]);
+                
+                // Add separator if not last client
+                if (j < ap->client_count - 1) {
+                    printf(", ");
+                }
+            }
+            printf("\n");
         }
         
-        if (ap->client_count == 0) {
-            MY_LOG_INFO(TAG, "  No clients detected");
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(50)); // Small delay to avoid overwhelming UART
+        vTaskDelay(pdMS_TO_TICKS(20)); // Small delay to avoid overwhelming UART
     }
     
     if (displayed_count == 0) {
-        MY_LOG_INFO(TAG, "No APs with clients found. APs without clients are hidden.");
+        MY_LOG_INFO(TAG, "No APs with clients found.");
     }
     
     return 0;
@@ -2221,10 +2215,14 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
     static uint32_t packet_counter = 0;
     static uint32_t last_debug_packet = 0;
     packet_counter++;
-    //printf("SNIFFER_CALLBACK: Packet %lu processed\n", packet_counter);
     
     if (!sniffer_active || sniffer_scan_phase) {
         return; // No debug logging here - too frequent
+    }
+    
+    // Show packet count every 20 packets when debug is OFF
+    if (!sniff_debug && (packet_counter % 20) == 0) {
+        printf("Sniffer packet count: %lu\n", packet_counter);
     }
     
     // Perform packet-based channel hopping (10 packets OR time-based task will handle it)

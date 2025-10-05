@@ -47,6 +47,14 @@ Wireshark reveals that the AP responds that it cannot handle so many stations:
 
 Creates files in Wigle.net format on SD card attached to the C5 board. Waits for GPS fix prior to actual wardriving.
 
+
+## Sniffer
+
+Sniffer is able to passively listen for traffic between AP and Clients. After you interrupt it, you can see list of all APs having clients, their count and MACs.
+
+
+
+
 # CLI Usage
 The board, when connected to USB, offers a CLI interface. 
 The CLI supports up/down arrows and TAB autocompletion. 
@@ -99,6 +107,21 @@ The wardrive attack produces files in Wigle.net format and waits for a GPS fix b
 The SAE Overflow attacks only one selected network. Remember, you should have confirmed exactly one selected target:
 
 ![alt text](Gfx/image-12.png)
+
+
+Sniffer menu. First, select Sniff Pockets option. 
+
+![alt text](Gfx/sniffer_menu.png)
+
+
+You will see how number of sniffed pockets increases. The longer you leave it on, the more clients will sniff. 
+
+![alt text](Gfx/snifferLog.png)
+
+Finally when you run Show Clients you can see report for each client:
+
+![alt text](Gfx/sniffer_results.png)
+
 
 # Deployment to boards
 For Evil Twin - it's all about MACs! C5 needs to know ESP32 MAC and vice versa. At the moment you need to modify it straight in the code.
