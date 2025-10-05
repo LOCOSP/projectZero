@@ -118,9 +118,14 @@ You will see how number of sniffed pockets increases. The longer you leave it on
 
 ![alt text](Gfx/snifferLog.png)
 
-Finally when you run Show Clients you can see report for each client:
+When you run Show Clients you can see report for each client:
 
 ![alt text](Gfx/sniffer_results.png)
+
+Finally when you run Show Probes you can see report of probe requests:
+
+![alt text](Gfx/probes.png)
+
 
 
 # Deployment to boards
