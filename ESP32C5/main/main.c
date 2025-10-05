@@ -905,9 +905,10 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
             vTaskDelay(pdMS_TO_TICKS(100));
             ESP_ERROR_CHECK(esp_now_send(esp32_mac, (uint8_t *)msg, strlen(msg)));
+            MY_LOG_INFO(TAG,"Evil twin: %s", evilTwinSSID);
         }
 
-        MY_LOG_INFO(TAG,"Evil twin: %s", evilTwinSSID);
+
         MY_LOG_INFO(TAG,"Attacking %d network(s):", g_selected_count);
         for (int i = 0; i < g_selected_count; ++i) {
             int idx = g_selected_indices[i];
