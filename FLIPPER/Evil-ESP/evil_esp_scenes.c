@@ -159,14 +159,16 @@ static void evil_esp_config_input_callback(void* context) {
 void evil_esp_scene_on_enter_start(void* context) {
     EvilEspApp* app = context;
 
+    // Clear log to monitor for BOARD READY message
+    evil_esp_clear_log(app);
+
     // Show connection message popup
     popup_set_header(app->popup, "Connect C5 Lab", 64, 8, AlignCenter, AlignTop);
-    popup_set_text(app->popup, "Now connect the board\nand click 'Back'\nafter a few secs", 64, 35, AlignCenter, AlignCenter);
+    popup_set_text(app->popup, "Waiting for ESP...\nConnecting board...", 64, 35, AlignCenter, AlignCenter);
     popup_set_icon(app->popup, 0, 0, NULL); // No icon
     popup_set_callback(app->popup, NULL);
     popup_set_context(app->popup, app);
-    popup_set_timeout(app->popup, 3000); // 3 second timeout
-    popup_enable_timeout(app->popup);
+    popup_disable_timeout(app->popup); // Disable auto-timeout, we'll wait for BOARD READY
     view_dispatcher_switch_to_view(app->view_dispatcher, EvilEspViewPopup);
 }
 
@@ -174,6 +176,7 @@ bool evil_esp_scene_on_event_start(void* context, SceneManagerEvent event) {
     EvilEspApp* app = context;
     
     static uint32_t popup_start_time = 0;
+    static uint32_t last_log_check_time = 0;
     
     // Initialize popup timer on first call
     if(popup_start_time == 0) {
@@ -184,21 +187,45 @@ bool evil_esp_scene_on_event_start(void* context, SceneManagerEvent event) {
         if(event.event == EvilEspEventExit) {
             scene_manager_stop(app->scene_manager);
             view_dispatcher_stop(app->view_dispatcher);
+            popup_start_time = 0;
+            last_log_check_time = 0;
             return true;
         }
     }
     
-    // Handle any button press - go to Main Menu
+    // Check log for "BOARD READY" message every 100ms
+    uint32_t current_time = furi_get_tick();
+    if(current_time - last_log_check_time > 100) {
+        last_log_check_time = current_time;
+        
+        // Check if log contains "BOARD READY"
+        if(app->log_string && furi_string_size(app->log_string) > 0) {
+            const char* log_content = furi_string_get_cstr(app->log_string);
+            if(strstr(log_content, "BOARD READY") != NULL) {
+                FURI_LOG_I("EvilEsp", "BOARD READY detected! Auto-advancing to main menu");
+                popup_start_time = 0;
+                last_log_check_time = 0;
+                // Go directly to main menu
+                scene_manager_next_scene(app->scene_manager, EvilEspSceneMainMenu);
+                return true;
+            }
+        }
+    }
+    
+    // Handle manual back button press - allow user to skip waiting
     if(event.type == SceneManagerEventTypeBack) {
-        popup_start_time = 0; // Reset timer for next time
-        // Go to main menu instead of UART terminal
+        popup_start_time = 0;
+        last_log_check_time = 0;
+        // Go to main menu
         scene_manager_next_scene(app->scene_manager, EvilEspSceneMainMenu);
         return true;
     }
     
-    // Auto-advance after 3 seconds to Main Menu
-    if(furi_get_tick() - popup_start_time > 3000) {
-        popup_start_time = 0; // Reset timer for next time
+    // Fallback: Auto-advance after 10 seconds if BOARD READY not detected
+    if(current_time - popup_start_time > 10000) {
+        FURI_LOG_W("EvilEsp", "Timeout waiting for BOARD READY, advancing to main menu anyway");
+        popup_start_time = 0;
+        last_log_check_time = 0;
         // Go to main menu after timeout
         scene_manager_next_scene(app->scene_manager, EvilEspSceneMainMenu);
         return true;
@@ -226,13 +253,9 @@ enum EvilEspMainMenuIndex {
 void evil_esp_scene_on_enter_main_menu(void* context) {
     EvilEspApp* app = context;
 
-    // If this is the first visit to main menu (after Lab C5 Board splash), go directly to UART Terminal
+    // Clear the first visit flag if set (we now go directly to main menu after BOARD READY detection)
     if(app->first_main_menu_visit) {
         app->first_main_menu_visit = false;
-        // Set UART terminal to display mode (state 1) and go directly there
-        scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
-        scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
-        return;
     }
 
     submenu_reset(app->submenu);
