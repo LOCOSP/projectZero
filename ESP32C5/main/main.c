@@ -43,6 +43,9 @@
 #include "mbedtls/entropy.h"
 #include "esp_timer.h"
 
+//Version number
+#define JANOS_VERSION "0.0.1"
+
 #define NEOPIXEL_GPIO      27
 #define LED_COUNT          1
 #define RMT_RES_HZ         (10 * 1000 * 1000)  // 10 MHz
@@ -506,6 +509,7 @@ static esp_err_t wifi_init_ap_sta(void) {
     esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
 
     if (ret == ESP_OK) {
+        MY_LOG_INFO(TAG,"JanOS version: " JANOS_VERSION);
         MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     } else {
@@ -1690,7 +1694,7 @@ void app_main(void) {
 
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
-    
+     MY_LOG_INFO(TAG,"");
     MY_LOG_INFO(TAG,"Available commands:");
     MY_LOG_INFO(TAG,"  scan_networks");
     MY_LOG_INFO(TAG,"  show_scan_results");
