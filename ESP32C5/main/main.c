@@ -44,7 +44,7 @@
 #include "esp_timer.h"
 
 //Version number
-#define JANOS_VERSION "0.0.2"
+#define JANOS_VERSION "0.0.3"
 
 #define NEOPIXEL_GPIO      27
 #define LED_COUNT          1
@@ -1930,7 +1930,7 @@ void app_main(void) {
 
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
-
+ 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
