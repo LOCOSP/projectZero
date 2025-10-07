@@ -44,7 +44,7 @@
 #include "esp_timer.h"
 
 //Version number
-#define JANOS_VERSION "0.0.3"
+#define JANOS_VERSION "0.0.4"
 
 #define NEOPIXEL_GPIO      27
 #define LED_COUNT          1
