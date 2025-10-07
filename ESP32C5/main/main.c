@@ -379,7 +379,11 @@ static void wifi_event_handler(void *event_handler_arg,
             
             g_scan_done = true;
             g_scan_in_progress = false;
-            applicationState = IDLE;
+            
+            // Only reset applicationState to IDLE if not in active attack mode
+            if (applicationState != DEAUTH && applicationState != DEAUTH_EVIL_TWIN && applicationState != EVIL_TWIN_PASS_CHECK) {
+                applicationState = IDLE;
+            }
             
             // Handle sniffer transition from scan to promiscuous mode
             if (sniffer_active && sniffer_scan_phase) {
@@ -1002,9 +1006,9 @@ static void deauth_attack_task(void *pvParameters) {
     deauth_attack_active = false;
     deauth_attack_task_handle = NULL;
     
-    // Clear target BSSIDs when attack ends
-    target_bssid_count = 0;
-    memset(target_bssids, 0, sizeof(target_bssids));
+    // DO NOT clear target BSSIDs when attack ends - keep them for potential restart
+    // target_bssid_count = 0;
+    // memset(target_bssids, 0, sizeof(target_bssids));
     
     MY_LOG_INFO(TAG,"Deauth attack task finished.");
     
@@ -1099,7 +1103,12 @@ static int cmd_start_evil_twin(int argc, char **argv) {
     operation_stop_requested = false;
 
     if (g_selected_count > 0) {
-        applicationState = DEAUTH_EVIL_TWIN;
+        // Set application state based on attack type
+        if (onlyDeauth) {
+            applicationState = DEAUTH;
+        } else {
+            applicationState = DEAUTH_EVIL_TWIN;
+        }
 
         const char *sourceSSID = (const char *)g_scan_results[g_selected_indices[0]].ssid;
         evilTwinSSID = malloc(strlen(sourceSSID) + 1); 
