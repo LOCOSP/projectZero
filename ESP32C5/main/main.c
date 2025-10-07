@@ -150,7 +150,7 @@ static volatile bool deauth_attack_active = false;
 static target_bssid_t target_bssids[MAX_TARGET_BSSIDS];
 static int target_bssid_count = 0;
 static uint32_t last_channel_check_time = 0;
-static const uint32_t CHANNEL_CHECK_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+static const uint32_t CHANNEL_CHECK_INTERVAL_MS = 3 * 60 * 1000; // 3 minutes
 
 // SAE Overflow attack task
 static TaskHandle_t sae_attack_task_handle = NULL;
