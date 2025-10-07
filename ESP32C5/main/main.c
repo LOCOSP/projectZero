@@ -150,7 +150,7 @@ static volatile bool deauth_attack_active = false;
 static target_bssid_t target_bssids[MAX_TARGET_BSSIDS];
 static int target_bssid_count = 0;
 static uint32_t last_channel_check_time = 0;
-static const uint32_t CHANNEL_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+static const uint32_t CHANNEL_CHECK_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 
 // SAE Overflow attack task
 static TaskHandle_t sae_attack_task_handle = NULL;
@@ -971,7 +971,8 @@ static void deauth_attack_task(void *pvParameters) {
         }
         
         // Check if it's time for channel monitoring (every 5 minutes)
-        if (check_channel_changes()) {
+        // Only perform periodic re-scan during active deauth attacks (DEAUTH and DEAUTH_EVIL_TWIN)
+        if ((applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) && check_channel_changes()) {
             MY_LOG_INFO(TAG, "Performing periodic channel check...");
             
             // Temporarily pause deauth for scanning
