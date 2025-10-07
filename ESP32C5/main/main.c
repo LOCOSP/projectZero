@@ -1720,7 +1720,9 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+    vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count) {   
