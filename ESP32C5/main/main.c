@@ -43,6 +43,9 @@
 #include "mbedtls/entropy.h"
 #include "esp_timer.h"
 
+//Version number
+#define JANOS_VERSION "0.0.2"
+
 #define NEOPIXEL_GPIO      27
 #define LED_COUNT          1
 #define RMT_RES_HZ         (10 * 1000 * 1000)  // 10 MHz
@@ -487,7 +490,7 @@ static void espnow_send_cb(const esp_now_send_info_t *send_info, esp_now_send_st
              status == ESP_NOW_SEND_SUCCESS ? "OK" : "ERROR");
 }
 
-// --- Inicjalizacja Wi-Fi (STA, no connection yet) ---
+// --- Wi-Fi initialization (STA, no connection yet) ---
 static esp_err_t wifi_init_ap_sta(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -527,6 +530,7 @@ static esp_err_t wifi_init_ap_sta(void) {
     esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
 
     if (ret == ESP_OK) {
+        MY_LOG_INFO(TAG,"JanOS version: " JANOS_VERSION);
         MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     } else {
@@ -899,13 +903,13 @@ static int cmd_select_networks(int argc, char **argv) {
         int idx = atoi(argv[i]);
         idx--;//because flipper app uses indexes from 1
         if (idx < 0 || idx >= (int)g_scan_count) {
-            ESP_LOGW(TAG,"Fuck it, index %d (out of bounds 0..%u)", idx, g_scan_count ? (g_scan_count - 1) : 0);
+            ESP_LOGW(TAG,"Index %d out of bounds (0..%u)", idx, g_scan_count ? (g_scan_count - 1) : 0);
             continue;
         }
         g_selected_indices[g_selected_count++] = idx;
     }
     if (g_selected_count == 0) {
-        ESP_LOGW(TAG,"Man, first scan_networks.");
+        ESP_LOGW(TAG,"First, run scan_networks.");
         return 1;
     }
 
@@ -915,10 +919,10 @@ static int cmd_select_networks(int argc, char **argv) {
     for (int i = 0; i < g_selected_count; ++i) {
         const wifi_ap_record_t* ap = &g_scan_results[g_selected_indices[i]];
         
-        // Zakładam, że auth jest dostępne jako string w twojej strukturze, jeśli nie - zastąp odpowiednim polem lub stringiem.
+        // I assume auth is available as a string in your structure, if not - replace with appropriate field or string.
         const char* auth = authmode_to_string(ap->authmode);
 
-        // Formatowanie: SSID, BSSID, Channel, Auth
+        // Formatting: SSID, BSSID, Channel, Auth
         len += snprintf(buf + len, sizeof(buf) - len, "%s, %02x:%02x:%02x:%02x:%02x:%02x, Ch%d, %s%s\n",
                         (char*)ap->ssid,
                         ap->bssid[0], ap->bssid[1], ap->bssid[2],
@@ -1715,7 +1719,7 @@ static int cmd_start_wardrive(int argc, char **argv) {
     return 0;
 }
 
-// --- Rejestracja komend w esp_console ---
+// --- Command registration in esp_console ---
 static void register_commands(void)
 {
     const esp_console_cmd_t scan_cmd = {
@@ -1893,11 +1897,11 @@ void app_main(void) {
 
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
-    
+     MY_LOG_INFO(TAG,"");
     MY_LOG_INFO(TAG,"Available commands:");
     MY_LOG_INFO(TAG,"  scan_networks");
     MY_LOG_INFO(TAG,"  show_scan_results");
-    MY_LOG_INFO(TAG,"  select_networks <indeks1> [indeks2] ...");
+    MY_LOG_INFO(TAG,"  select_networks <index1> [index2] ...");
     MY_LOG_INFO(TAG,"  start_evil_twin");
     MY_LOG_INFO(TAG,"  start_deauth");
     MY_LOG_INFO(TAG,"  sae_overflow");
@@ -1919,7 +1923,9 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+    vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count) {   
@@ -2091,9 +2097,6 @@ static void sae_attack_task(void *pvParameters) {
     vTaskDelete(NULL); // Delete this task
 }
 
-// Legacy function removed - SAE attack now runs directly as task via cmd_start_sae_overflow
-
-
 /*
 Injects SAE Commit frame with spoofed source address.
 This function generates a random scalar, computes the corresponding ECC point,
@@ -2252,7 +2255,7 @@ static void parse_sae_commit(const wifi_promiscuous_pkt_t *pkt) {
 
     // Beacon detection 
     if (buf[0] == 0x80) {
-        //ESP_LOGI(TAG, "Wykryto beacon od AP");
+        //ESP_LOGI(TAG, "Beacon detected from AP");
         return;
     }
 

@@ -170,3 +170,18 @@ Next, in ESP-IDF in main.c on top enter the ESP32 MAC address:
 
 # Now recompile and flash both boards again.
 They should become aware of each other and be able to communicate over ESP-NOW.
+
+## Flashing ESP32-C5 Board
+
+To flash the ESP32-C5 board, follow these steps:
+
+1. Navigate to the `binaries-esp32c5` folder.
+2. Launch the flashing script using the command below in your terminal:
+
+   ```
+   python flash_board.py
+   ```
+
+Watch the video below for a step-by-step guide:
+
+[![Flashing ESP32-C5](Gfx/LABC5-flash.mp4)](Gfx/LABC5-flash.mp4)
