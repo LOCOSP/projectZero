@@ -41,6 +41,8 @@ static const char* menu_items[] = {
 static const uint8_t menu_count = sizeof(menu_items) / sizeof(menu_items[0]);
 #define MENU_VISIBLE_COUNT 5
 
+static void serial_rx_callback(FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context);
+
 // Rysowanie ekranu
 static void Lab_C5_app_draw_callback(Canvas* canvas, void* ctx) {
     SimpleApp* app = ctx;
