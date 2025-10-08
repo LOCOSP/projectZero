@@ -44,7 +44,7 @@
 #include "esp_timer.h"
 
 //Version number
-#define JANOS_VERSION "0.0.3"
+#define JANOS_VERSION "0.0.4"
 
 #define NEOPIXEL_GPIO      27
 #define LED_COUNT          1
@@ -1996,7 +1996,7 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
         esp_wifi_set_channel(target_bssids[i].channel, WIFI_SECOND_CHAN_NONE );
         vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
-        
+
         uint8_t deauth_frame[sizeof(deauth_frame_default)];
         memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
         memcpy(&deauth_frame[10], target_bssids[i].bssid, 6);
