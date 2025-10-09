@@ -523,6 +523,7 @@ enum EvilEspAttacksMenuIndex {
     EvilEspAttacksMenuIndexDisassoc,
     EvilEspAttacksMenuIndexRandom,
     EvilEspAttacksMenuIndexWardrive,
+    EvilEspAttacksMenuIndexBlackout,
     EvilEspAttacksMenuIndexStop,
 };
 
@@ -536,6 +537,7 @@ void evil_esp_scene_on_enter_attacks(void* context) {
     submenu_add_item(app->submenu, "Evil Twin Attack", EvilEspAttacksMenuIndexDisassoc, evil_esp_submenu_callback_attacks, app);
     submenu_add_item(app->submenu, "WPA3 SAE Overflow", EvilEspAttacksMenuIndexRandom, evil_esp_submenu_callback_attacks, app);
     submenu_add_item(app->submenu, "Wardrive", EvilEspAttacksMenuIndexWardrive, evil_esp_submenu_callback_attacks, app);
+    submenu_add_item(app->submenu, "Blackout", EvilEspAttacksMenuIndexBlackout, evil_esp_submenu_callback_attacks, app);
     //submenu_add_item(app->submenu, "Stop Attack", EvilEspAttacksMenuIndexStop, evil_esp_submenu_callback_attacks, app);
 
     view_dispatcher_switch_to_view(app->view_dispatcher, EvilEspViewMainMenu);
@@ -577,6 +579,14 @@ bool evil_esp_scene_on_event_attacks(void* context, SceneManagerEvent event) {
                 FURI_LOG_W("EvilEsp", "Failed to enable 5V OTG power");
             }
             evil_esp_send_command(app, "start_wardrive");
+            scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
+            scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
+            return true;
+
+        case EvilEspAttacksMenuIndexBlackout:
+            evil_esp_send_command(app, "start_blackout");
+            app->attack_state.active = true;
+            app->attack_state.mode = EvilEspAttackModeRandom; // Use existing mode for blackout
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
             scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
             return true;
