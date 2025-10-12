@@ -44,7 +44,7 @@
 #include "esp_timer.h"
 
 //Version number
-#define JANOS_VERSION "0.0.4"
+#define JANOS_VERSION "0.0.5"
 
 #define NEOPIXEL_GPIO      27
 #define LED_COUNT          1
@@ -2127,6 +2127,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  start_evil_twin");
     MY_LOG_INFO(TAG,"  start_deauth");
     MY_LOG_INFO(TAG,"  sae_overflow");
+    MY_LOG_INFO(TAG,"  start_blackout");
     MY_LOG_INFO(TAG,"  start_wardrive");
     MY_LOG_INFO(TAG,"  start_sniffer");
     MY_LOG_INFO(TAG,"  show_sniffer_results");
