@@ -4,26 +4,43 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <stdint.h>
+#include <furi_hal_light.h>
+#include <furi_hal_power.h>
 #include <furi_hal_serial.h>
 #include <furi_hal_serial_control.h>
+#include <notification/notification.h>
+#include <notification/notification_messages.h>
+#include <storage/storage.h>
 #include <furi/core/stream_buffer.h>
 
 typedef enum {
     ScreenMenu,
     ScreenSerial,
     ScreenResults,
+    ScreenSetupScanner,
 } AppScreen;
 
 typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
+#ifndef FAP_VERSION_TEXT
+#define FAP_VERSION_TEXT "01"
+#endif
+
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
 #define SCAN_SSID_MAX_LEN 33
 #define SCAN_CHANNEL_MAX_LEN 8
 #define SCAN_TYPE_MAX_LEN 16
 #define SCAN_FIELD_BUFFER_LEN 64
+#define SCAN_POWER_MIN_DBM (-110)
+#define SCAN_POWER_MAX_DBM 0
+#define SCAN_POWER_STEP 1
+#define BACKLIGHT_ON_LEVEL 255
+#define BACKLIGHT_OFF_LEVEL 0
 
 #define SERIAL_BUFFER_SIZE 4096
 #define UART_STREAM_SIZE 1024
@@ -32,23 +49,48 @@ typedef enum {
 #define SERIAL_LINE_CHAR_LIMIT 22
 #define SERIAL_TEXT_LINE_HEIGHT 10
 #define DISPLAY_WIDTH 128
-#define RESULT_MAX_LINES 4
-#define RESULT_LINE_HEIGHT 12
-#define RESULT_LINE_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
+#define RESULT_DEFAULT_MAX_LINES 4
+#define RESULT_DEFAULT_LINE_HEIGHT 12
+#define RESULT_DEFAULT_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
 #define RESULT_START_Y 12
 #define RESULT_ENTRY_SPACING 0
+#define RESULT_PREFIX_X 2
+#define RESULT_TEXT_X 9
+#define RESULT_SCROLL_WIDTH 3
+#define RESULT_SCROLL_GAP 1
 #define MENU_SECTION_ATTACKS 3
+#define SCANNER_FILTER_VISIBLE_COUNT 3
+#define LAB_C5_CONFIG_DIR_PATH "apps_assets/labC5"
+#define LAB_C5_CONFIG_FILE_PATH LAB_C5_CONFIG_DIR_PATH "/config.txt"
 
 typedef enum {
     MenuActionCommand,
     MenuActionResults,
+    MenuActionToggleBacklight,
+    MenuActionOpenScannerSetup,
 } MenuAction;
+
+typedef enum {
+    ScannerOptionShowSSID,
+    ScannerOptionShowBSSID,
+    ScannerOptionShowChannel,
+    ScannerOptionShowSecurity,
+    ScannerOptionShowPower,
+    ScannerOptionShowBand,
+    ScannerOptionMinPower,
+    ScannerOptionCount,
+} ScannerOption;
 
 typedef struct {
     uint16_t number;
     char ssid[SCAN_SSID_MAX_LEN];
+    char bssid[SCAN_FIELD_BUFFER_LEN];
     char channel[SCAN_CHANNEL_MAX_LEN];
-    char type[SCAN_TYPE_MAX_LEN];
+    char security[SCAN_TYPE_MAX_LEN];
+    char power_display[SCAN_FIELD_BUFFER_LEN];
+    char band[SCAN_TYPE_MAX_LEN];
+    int16_t power_dbm;
+    bool power_valid;
     bool selected;
 } ScanResult;
 
@@ -78,8 +120,46 @@ typedef struct {
     bool scan_results_loading;
     char scan_line_buffer[SCAN_LINE_BUFFER_SIZE];
     size_t scan_line_len;
+    uint16_t visible_result_indices[MAX_SCAN_RESULTS];
+    size_t visible_result_count;
+    bool scanner_show_ssid;
+    bool scanner_show_bssid;
+    bool scanner_show_channel;
+    bool scanner_show_security;
+    bool scanner_show_power;
+    bool scanner_show_band;
+    int16_t scanner_min_power;
+    size_t scanner_setup_index;
+    bool scanner_adjusting_power;
+    bool backlight_enabled;
+    bool backlight_insomnia;
+    size_t scanner_view_offset;
+    uint8_t result_line_height;
+    uint8_t result_char_limit;
+    uint8_t result_max_lines;
+    Font result_font;
+    NotificationApp* notifications;
+    bool backlight_notification_enforced;
+    bool config_dirty;
+    char status_message[64];
+    uint32_t status_message_until;
+    bool status_message_fullscreen;
 } SimpleApp;
 static void simple_app_adjust_result_offset(SimpleApp* app);
+static void simple_app_rebuild_visible_results(SimpleApp* app);
+static bool simple_app_result_is_visible(const SimpleApp* app, const ScanResult* result);
+static ScanResult* simple_app_visible_result(SimpleApp* app, size_t visible_index);
+static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, size_t visible_index);
+static void simple_app_update_result_layout(SimpleApp* app);
+static void simple_app_apply_backlight(SimpleApp* app);
+static void simple_app_toggle_backlight(SimpleApp* app);
+static void simple_app_mark_config_dirty(SimpleApp* app);
+static void simple_app_save_config_if_dirty(SimpleApp* app, const char* message, bool fullscreen);
+static bool simple_app_save_config(SimpleApp* app, const char* success_message, bool fullscreen);
+static void simple_app_load_config(SimpleApp* app);
+static void simple_app_show_status_message(SimpleApp* app, const char* message, uint32_t duration_ms, bool fullscreen);
+static void simple_app_clear_status_message(SimpleApp* app);
+static bool simple_app_status_message_is_active(SimpleApp* app);
 
 typedef struct {
     const char* label;
@@ -100,32 +180,33 @@ static const uint8_t image_icon_0_bits[] = {
 };
 
 static const MenuEntry menu_entries_scanners[] = {
-    {"Scan", "scan_networks", MenuActionCommand},
-    {"Resoults", "show_scan_results", MenuActionResults},
+    {"Scan Networks", "scan_networks", MenuActionCommand},
+    {"Results", "show_scan_results", MenuActionResults},
 };
 
 static const MenuEntry menu_entries_sniffers[] = {
-    {"start_sniffer", "start_sniffer", MenuActionCommand},
-    {"show_sniffer_results", "show_sniffer_results", MenuActionCommand},
-    {"show_probes", "show_probes", MenuActionCommand},
-    {"sniffer_debug", "sniffer_debug 1", MenuActionCommand},
+    {"Start Sniffer", "start_sniffer", MenuActionCommand},
+    {"Show Sniffer Results", "show_sniffer_results", MenuActionCommand},
+    {"Show Probes", "show_probes", MenuActionCommand},
+    {"Sniffer Debug", "sniffer_debug 1", MenuActionCommand},
 };
 
 static const MenuEntry menu_entries_targets[] = {
-    {"select_networks", "select_networks 0 1", MenuActionCommand},
+    {"Select Networks", "select_networks 0 1", MenuActionCommand},
 };
 
 static const MenuEntry menu_entries_attacks[] = {
-    {"start_deauth", "start_deauth", MenuActionCommand},
-    {"start_evil_twin", "start_evil_twin", MenuActionCommand},
-    {"sae_overflow", "sae_overflow", MenuActionCommand},
-    {"start_wardrive", "start_wardrive", MenuActionCommand},
+    {"Start Deauth", "start_deauth", MenuActionCommand},
+    {"Start Evil Twin", "start_evil_twin", MenuActionCommand},
+    {"SAE Overflow", "sae_overflow", MenuActionCommand},
+    {"Start Wardrive", "start_wardrive", MenuActionCommand},
 };
 
+static char menu_label_backlight[24] = "Backlight: On";
+
 static const MenuEntry menu_entries_setup[] = {
-    {"LED on/off (todo)", NULL, MenuActionCommand},
-    {"5V on/off (todo)", NULL, MenuActionCommand},
-    {"Backlight on/off (todo)", NULL, MenuActionCommand},
+    {menu_label_backlight, NULL, MenuActionToggleBacklight},
+    {"Scanner Filters", NULL, MenuActionOpenScannerSetup},
 };
 
 static const MenuSection menu_sections[] = {
@@ -168,12 +249,429 @@ static void simple_app_reset_scan_results(SimpleApp* app) {
     memset(app->scan_results, 0, sizeof(app->scan_results));
     memset(app->scan_selected_numbers, 0, sizeof(app->scan_selected_numbers));
     memset(app->scan_line_buffer, 0, sizeof(app->scan_line_buffer));
+    memset(app->visible_result_indices, 0, sizeof(app->visible_result_indices));
     app->scan_result_count = 0;
     app->scan_result_index = 0;
     app->scan_result_offset = 0;
     app->scan_selected_count = 0;
     app->scan_line_len = 0;
     app->scan_results_loading = false;
+    app->visible_result_count = 0;
+}
+
+static bool simple_app_result_is_visible(const SimpleApp* app, const ScanResult* result) {
+    if(!app || !result) return false;
+    if(result->power_valid && result->power_dbm < app->scanner_min_power) {
+        return false;
+    }
+    return true;
+}
+
+static void simple_app_rebuild_visible_results(SimpleApp* app) {
+    if(!app) return;
+    app->visible_result_count = 0;
+    for(size_t i = 0; i < app->scan_result_count && i < MAX_SCAN_RESULTS; i++) {
+        if(simple_app_result_is_visible(app, &app->scan_results[i])) {
+            app->visible_result_indices[app->visible_result_count++] = (uint16_t)i;
+        }
+    }
+    if(app->scan_result_index >= app->visible_result_count) {
+        app->scan_result_index =
+            (app->visible_result_count > 0) ? app->visible_result_count - 1 : 0;
+    }
+    if(app->scan_result_offset >= app->visible_result_count) {
+        app->scan_result_offset =
+            (app->visible_result_count > 0) ? app->visible_result_count - 1 : 0;
+    }
+    if(app->scan_result_offset > app->scan_result_index) {
+        app->scan_result_offset = app->scan_result_index;
+    }
+}
+
+static void simple_app_modify_min_power(SimpleApp* app, int16_t delta) {
+    if(!app) return;
+    int32_t proposed = (int32_t)app->scanner_min_power + delta;
+    if(proposed > SCAN_POWER_MAX_DBM) {
+        proposed = SCAN_POWER_MAX_DBM;
+    } else if(proposed < SCAN_POWER_MIN_DBM) {
+        proposed = SCAN_POWER_MIN_DBM;
+    }
+    if(app->scanner_min_power != proposed) {
+        app->scanner_min_power = (int16_t)proposed;
+        simple_app_rebuild_visible_results(app);
+        simple_app_adjust_result_offset(app);
+        simple_app_mark_config_dirty(app);
+    }
+}
+
+static size_t simple_app_enabled_field_count(const SimpleApp* app) {
+    if(!app) return 0;
+    size_t count = 0;
+    if(app->scanner_show_ssid) count++;
+    if(app->scanner_show_bssid) count++;
+    if(app->scanner_show_channel) count++;
+    if(app->scanner_show_security) count++;
+    if(app->scanner_show_power) count++;
+    if(app->scanner_show_band) count++;
+    return count;
+}
+
+static bool* simple_app_scanner_option_flag(SimpleApp* app, ScannerOption option) {
+    if(!app) return NULL;
+    switch(option) {
+    case ScannerOptionShowSSID:
+        return &app->scanner_show_ssid;
+    case ScannerOptionShowBSSID:
+        return &app->scanner_show_bssid;
+    case ScannerOptionShowChannel:
+        return &app->scanner_show_channel;
+    case ScannerOptionShowSecurity:
+        return &app->scanner_show_security;
+    case ScannerOptionShowPower:
+        return &app->scanner_show_power;
+    case ScannerOptionShowBand:
+        return &app->scanner_show_band;
+    default:
+        return NULL;
+    }
+}
+
+static ScanResult* simple_app_visible_result(SimpleApp* app, size_t visible_index) {
+    if(!app || visible_index >= app->visible_result_count) return NULL;
+    uint16_t actual_index = app->visible_result_indices[visible_index];
+    if(actual_index >= MAX_SCAN_RESULTS) return NULL;
+    return &app->scan_results[actual_index];
+}
+
+static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, size_t visible_index) {
+    if(!app || visible_index >= app->visible_result_count) return NULL;
+    uint16_t actual_index = app->visible_result_indices[visible_index];
+    if(actual_index >= MAX_SCAN_RESULTS) return NULL;
+    return &app->scan_results[actual_index];
+}
+
+static void simple_app_update_backlight_label(SimpleApp* app) {
+    if(!app) return;
+    snprintf(
+        menu_label_backlight,
+        sizeof(menu_label_backlight),
+        "Backlight: %s",
+        app->backlight_enabled ? "On" : "Off");
+}
+
+static void simple_app_update_result_layout(SimpleApp* app) {
+    if(!app) return;
+    size_t enabled_fields = simple_app_enabled_field_count(app);
+    app->result_max_lines = RESULT_DEFAULT_MAX_LINES;
+    if(enabled_fields <= 2) {
+        app->result_font = FontPrimary;
+        app->result_line_height = 14;
+        app->result_max_lines = 3;
+    } else if(enabled_fields <= 4) {
+        app->result_font = FontSecondary;
+        app->result_line_height = RESULT_DEFAULT_LINE_HEIGHT;
+    } else {
+        app->result_font = FontSecondary;
+        app->result_line_height = RESULT_DEFAULT_LINE_HEIGHT;
+    }
+
+    uint8_t char_width = (app->result_font == FontPrimary) ? 7 : 6;
+    uint8_t available_px = DISPLAY_WIDTH - RESULT_TEXT_X - RESULT_SCROLL_WIDTH - RESULT_SCROLL_GAP;
+    uint8_t computed_limit = (char_width > 0) ? (available_px / char_width) : RESULT_DEFAULT_CHAR_LIMIT;
+    if(computed_limit < 10) {
+        computed_limit = 10;
+    }
+    app->result_char_limit = computed_limit;
+
+    if(app->result_line_height == 0) {
+        app->result_line_height = RESULT_DEFAULT_LINE_HEIGHT;
+    }
+    if(app->result_max_lines == 0) {
+        app->result_max_lines = RESULT_DEFAULT_MAX_LINES;
+    }
+}
+
+static void simple_app_append_field(
+    char* buffer,
+    size_t buffer_size,
+    size_t* offset,
+    bool* first_field,
+    const char* prefix,
+    const char* value,
+    const char* suffix) {
+    if(!buffer || buffer_size == 0 || !offset || !first_field || !value || value[0] == '\0') {
+        return;
+    }
+
+    size_t remaining = (buffer_size > *offset) ? (buffer_size - *offset) : 0;
+    if(remaining == 0) return;
+
+    const char* separator = *first_field ? " " : " | ";
+    int written = snprintf(
+        buffer + *offset,
+        remaining,
+        "%s%s%s%s",
+        separator,
+        prefix ? prefix : "",
+        value,
+        suffix ? suffix : "");
+
+    if(written < 0) return;
+    size_t consumed = (size_t)written;
+    if(consumed >= remaining) {
+        *offset = buffer_size - 1;
+        buffer[buffer_size - 1] = '\0';
+    } else {
+        *offset += consumed;
+    }
+    *first_field = false;
+}
+
+static void simple_app_show_status_message(
+    SimpleApp* app,
+    const char* message,
+    uint32_t duration_ms,
+    bool fullscreen) {
+    if(!app) return;
+    if(message && message[0] != '\0') {
+        strncpy(app->status_message, message, sizeof(app->status_message) - 1);
+        app->status_message[sizeof(app->status_message) - 1] = '\0';
+        if(duration_ms == 0) {
+            app->status_message_until = UINT32_MAX;
+        } else {
+            uint32_t timeout_ticks = furi_ms_to_ticks(duration_ms);
+            app->status_message_until = furi_get_tick() + timeout_ticks;
+        }
+        app->status_message_fullscreen = fullscreen;
+    } else {
+        app->status_message[0] = '\0';
+        app->status_message_until = 0;
+        app->status_message_fullscreen = false;
+    }
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_clear_status_message(SimpleApp* app) {
+    if(!app) return;
+    app->status_message[0] = '\0';
+    app->status_message_until = 0;
+    app->status_message_fullscreen = false;
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static bool simple_app_status_message_is_active(SimpleApp* app) {
+    if(!app) return false;
+    if(app->status_message_until == 0 || app->status_message[0] == '\0') return false;
+    if(app->status_message_until != UINT32_MAX && furi_get_tick() >= app->status_message_until) {
+        simple_app_clear_status_message(app);
+        return false;
+    }
+    return true;
+}
+
+static void simple_app_mark_config_dirty(SimpleApp* app) {
+    if(!app) return;
+    app->config_dirty = true;
+}
+
+static bool simple_app_parse_bool_value(const char* value, bool current) {
+    if(!value || value[0] == '\0') return current;
+    if((value[0] == '1' && value[1] == '\0') || value[0] == 'Y' || value[0] == 'y' ||
+       value[0] == 'T' || value[0] == 't') {
+        return true;
+    }
+    if((value[0] == '0' && value[1] == '\0') || value[0] == 'N' || value[0] == 'n' ||
+       value[0] == 'F' || value[0] == 'f') {
+        return false;
+    }
+    return atoi(value) != 0;
+}
+
+static void simple_app_trim(char* text) {
+    if(!text) return;
+    char* start = text;
+    while(*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    char* end = start + strlen(start);
+    while(end > start && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    *end = '\0';
+    if(start != text) {
+        memmove(text, start, (size_t)(end - start) + 1);
+    }
+}
+
+static void simple_app_parse_config_line(SimpleApp* app, char* line) {
+    if(!app || !line) return;
+    simple_app_trim(line);
+    if(line[0] == '\0' || line[0] == '#') return;
+    char* equals = strchr(line, '=');
+    if(!equals) return;
+    *equals = '\0';
+    char* key = line;
+    char* value = equals + 1;
+    simple_app_trim(key);
+    simple_app_trim(value);
+    if(strcmp(key, "show_ssid") == 0) {
+        app->scanner_show_ssid = simple_app_parse_bool_value(value, app->scanner_show_ssid);
+    } else if(strcmp(key, "show_bssid") == 0) {
+        app->scanner_show_bssid = simple_app_parse_bool_value(value, app->scanner_show_bssid);
+    } else if(strcmp(key, "show_channel") == 0) {
+        app->scanner_show_channel = simple_app_parse_bool_value(value, app->scanner_show_channel);
+    } else if(strcmp(key, "show_security") == 0) {
+        app->scanner_show_security = simple_app_parse_bool_value(value, app->scanner_show_security);
+    } else if(strcmp(key, "show_power") == 0) {
+        app->scanner_show_power = simple_app_parse_bool_value(value, app->scanner_show_power);
+    } else if(strcmp(key, "show_band") == 0) {
+        app->scanner_show_band = simple_app_parse_bool_value(value, app->scanner_show_band);
+    } else if(strcmp(key, "min_power") == 0) {
+        app->scanner_min_power = (int16_t)strtol(value, NULL, 10);
+    } else if(strcmp(key, "backlight_enabled") == 0) {
+        app->backlight_enabled = simple_app_parse_bool_value(value, app->backlight_enabled);
+    }
+}
+
+static bool simple_app_save_config(SimpleApp* app, const char* success_message, bool fullscreen) {
+    if(!app) return false;
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+    storage_simply_mkdir(storage, EXT_PATH("apps_assets"));
+    storage_simply_mkdir(storage, EXT_PATH(LAB_C5_CONFIG_DIR_PATH));
+    File* file = storage_file_alloc(storage);
+    bool success = false;
+    if(storage_file_open(file, EXT_PATH(LAB_C5_CONFIG_FILE_PATH), FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        char buffer[256];
+        int len = snprintf(
+            buffer,
+            sizeof(buffer),
+            "show_ssid=%d\n"
+            "show_bssid=%d\n"
+            "show_channel=%d\n"
+            "show_security=%d\n"
+            "show_power=%d\n"
+            "show_band=%d\n"
+            "min_power=%d\n"
+            "backlight_enabled=%d\n",
+            app->scanner_show_ssid ? 1 : 0,
+            app->scanner_show_bssid ? 1 : 0,
+            app->scanner_show_channel ? 1 : 0,
+            app->scanner_show_security ? 1 : 0,
+            app->scanner_show_power ? 1 : 0,
+            app->scanner_show_band ? 1 : 0,
+            (int)app->scanner_min_power,
+            app->backlight_enabled ? 1 : 0);
+        if(len > 0 && len < (int)sizeof(buffer)) {
+            size_t written = storage_file_write(file, buffer, (size_t)len);
+            if(written == (size_t)len) {
+                success = true;
+            }
+        }
+        storage_file_close(file);
+    }
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+    if(success) {
+        app->config_dirty = false;
+        if(success_message) {
+            simple_app_show_status_message(app, success_message, 2000, fullscreen);
+        }
+    }
+    return success;
+}
+
+static void simple_app_load_config(SimpleApp* app) {
+    if(!app) return;
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return;
+    File* file = storage_file_alloc(storage);
+    bool loaded = false;
+    if(storage_file_open(file, EXT_PATH(LAB_C5_CONFIG_FILE_PATH), FSAM_READ, FSOM_OPEN_EXISTING)) {
+        char line[96];
+        size_t pos = 0;
+        uint8_t ch = 0;
+        while(storage_file_read(file, &ch, 1) == 1) {
+            if(ch == '\r') continue;
+            if(ch == '\n') {
+                line[pos] = '\0';
+                simple_app_parse_config_line(app, line);
+                pos = 0;
+                continue;
+            }
+            if(pos + 1 < sizeof(line)) {
+                line[pos++] = (char)ch;
+            }
+        }
+        if(pos > 0) {
+            line[pos] = '\0';
+            simple_app_parse_config_line(app, line);
+        }
+        storage_file_close(file);
+        loaded = true;
+    }
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+    if(loaded) {
+        simple_app_show_status_message(app, "Config loaded", 2000, true);
+        app->config_dirty = false;
+    } else {
+        simple_app_save_config(app, NULL, false);
+        simple_app_show_status_message(app, "Config created", 2000, true);
+    }
+    if(app->scanner_min_power > SCAN_POWER_MAX_DBM) {
+        app->scanner_min_power = SCAN_POWER_MAX_DBM;
+    } else if(app->scanner_min_power < SCAN_POWER_MIN_DBM) {
+        app->scanner_min_power = SCAN_POWER_MIN_DBM;
+    }
+    simple_app_update_result_layout(app);
+    simple_app_rebuild_visible_results(app);
+}
+
+static void simple_app_save_config_if_dirty(SimpleApp* app, const char* message, bool fullscreen) {
+    if(!app) return;
+    if(app->config_dirty) {
+        simple_app_save_config(app, message, fullscreen);
+    }
+}
+
+static void simple_app_apply_backlight(SimpleApp* app) {
+    if(!app) return;
+    uint8_t level = app->backlight_enabled ? BACKLIGHT_ON_LEVEL : BACKLIGHT_OFF_LEVEL;
+    furi_hal_light_set(LightBacklight, level);
+
+    if(app->backlight_enabled) {
+        if(!app->backlight_insomnia) {
+            furi_hal_power_insomnia_enter();
+            app->backlight_insomnia = true;
+        }
+        if(app->notifications && !app->backlight_notification_enforced) {
+            notification_message_block(app->notifications, &sequence_display_backlight_enforce_on);
+            app->backlight_notification_enforced = true;
+        }
+    } else {
+        if(app->backlight_insomnia) {
+            furi_hal_power_insomnia_exit();
+            app->backlight_insomnia = false;
+        }
+        if(app->notifications && app->backlight_notification_enforced) {
+            notification_message(app->notifications, &sequence_display_backlight_enforce_auto);
+            app->backlight_notification_enforced = false;
+        }
+    }
+
+    simple_app_update_backlight_label(app);
+}
+
+static void simple_app_toggle_backlight(SimpleApp* app) {
+    if(!app) return;
+    app->backlight_enabled = !app->backlight_enabled;
+    simple_app_apply_backlight(app);
+    simple_app_mark_config_dirty(app);
 }
 
 static size_t simple_app_parse_quoted_fields(const char* line, char fields[][SCAN_FIELD_BUFFER_LEN], size_t max_fields) {
@@ -239,14 +737,31 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     memset(result, 0, sizeof(ScanResult));
     result->number = (uint16_t)strtoul(fields[0], NULL, 10);
     simple_app_copy_field(result->ssid, sizeof(result->ssid), fields[1], "<hidden>");
+    simple_app_copy_field(result->bssid, sizeof(result->bssid), fields[2], "??:??:??:??:??:??");
     simple_app_copy_field(result->channel, sizeof(result->channel), fields[3], "?");
-    simple_app_copy_field(result->type, sizeof(result->type), fields[6], "?");
+    simple_app_copy_field(result->security, sizeof(result->security), fields[4], "Unknown");
+    simple_app_copy_field(result->power_display, sizeof(result->power_display), fields[5], "?");
+    simple_app_copy_field(result->band, sizeof(result->band), fields[6], "?");
+
+    const char* power_str = fields[5];
+    char* power_end = NULL;
+    long power_value = strtol(power_str, &power_end, 10);
+    if(power_str[0] != '\0' && power_end && *power_end == '\0') {
+        if(power_value < SCAN_POWER_MIN_DBM) {
+            power_value = SCAN_POWER_MIN_DBM;
+        } else if(power_value > SCAN_POWER_MAX_DBM) {
+            power_value = SCAN_POWER_MAX_DBM;
+        }
+        result->power_dbm = (int16_t)power_value;
+        result->power_valid = true;
+    } else {
+        result->power_dbm = 0;
+        result->power_valid = false;
+    }
     result->selected = false;
 
     app->scan_result_count++;
-    if(app->scan_result_index >= app->scan_result_count && app->scan_result_count > 0) {
-        app->scan_result_index = app->scan_result_count - 1;
-    }
+    simple_app_rebuild_visible_results(app);
 
     if(app->screen == ScreenResults) {
         simple_app_adjust_result_offset(app);
@@ -254,48 +769,77 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     }
 }
 
-static size_t simple_app_format_result_line(const ScanResult* result, char* buffer, size_t buffer_size) {
-    if(!result || !buffer || buffer_size == 0) {
+static size_t simple_app_format_result_line(
+    const SimpleApp* app,
+    const ScanResult* result,
+    char* buffer,
+    size_t buffer_size) {
+    if(!app || !result || !buffer || buffer_size == 0) {
         return 0;
     }
 
-    int written = snprintf(
-        buffer,
-        buffer_size,
-        "%u/%s/%s/%s",
-        result->number,
-        result->ssid[0] ? result->ssid : "<hidden>",
-        result->channel[0] ? result->channel : "?",
-        result->type[0] ? result->type : "?");
-
+    const char* selection_marker = result->selected ? "*" : "";
+    int written = snprintf(buffer, buffer_size, "%u%s", (unsigned)result->number, selection_marker);
     if(written < 0) {
         buffer[0] = '\0';
         return 0;
     }
 
-    size_t length = (size_t)written;
-    if(length >= buffer_size) {
-        buffer[buffer_size - 1] = '\0';
-        length = buffer_size - 1;
+    size_t offset = (written < (int)buffer_size) ? (size_t)written : buffer_size - 1;
+    bool first_field = true;
+
+    if(app->scanner_show_ssid) {
+        simple_app_append_field(buffer, buffer_size, &offset, &first_field, NULL, result->ssid, NULL);
+    }
+    if(app->scanner_show_bssid) {
+        simple_app_append_field(
+            buffer, buffer_size, &offset, &first_field, NULL, result->bssid, NULL);
+    }
+    if(app->scanner_show_channel) {
+        simple_app_append_field(buffer, buffer_size, &offset, &first_field, NULL, result->channel, NULL);
+    }
+    if(app->scanner_show_security) {
+        simple_app_append_field(
+            buffer, buffer_size, &offset, &first_field, NULL, result->security, NULL);
+    }
+    if(app->scanner_show_power) {
+        const char* suffix =
+            (strstr(result->power_display, "dBm") != NULL) ? NULL : " dBm";
+        simple_app_append_field(
+            buffer, buffer_size, &offset, &first_field, NULL, result->power_display, suffix);
+    }
+    if(app->scanner_show_band) {
+        simple_app_append_field(
+            buffer, buffer_size, &offset, &first_field, NULL, result->band, NULL);
+    }
+
+    size_t length = (offset < buffer_size) ? offset : buffer_size - 1;
+    if(buffer[length] != '\0') {
+        buffer[length] = '\0';
     }
     return length;
 }
 
-static uint8_t simple_app_result_line_count(const ScanResult* result) {
-    if(!result) return 1;
+static uint8_t simple_app_result_line_count(const SimpleApp* app, const ScanResult* result) {
+    if(!app || !result) return 1;
+    if(app->result_char_limit == 0) return 1;
     char buffer[96];
-    size_t len = simple_app_format_result_line(result, buffer, sizeof(buffer));
-    size_t lines = (len + RESULT_LINE_CHAR_LIMIT - 1) / RESULT_LINE_CHAR_LIMIT;
+    size_t len = simple_app_format_result_line(app, result, buffer, sizeof(buffer));
+    size_t lines = (len + app->result_char_limit - 1) / app->result_char_limit;
     if(lines == 0) lines = 1;
-    if(lines > 2) lines = 2;
+    if(app->result_max_lines > 0 && lines > app->result_max_lines) {
+        lines = app->result_max_lines;
+    }
     return (uint8_t)lines;
 }
 
 static size_t simple_app_total_result_lines(SimpleApp* app) {
     if(!app) return 0;
     size_t total = 0;
-    for(size_t i = 0; i < app->scan_result_count; i++) {
-        total += simple_app_result_line_count(&app->scan_results[i]);
+    for(size_t i = 0; i < app->visible_result_count; i++) {
+        const ScanResult* result = simple_app_visible_result_const(app, i);
+        if(!result) continue;
+        total += simple_app_result_line_count(app, result);
     }
     return total;
 }
@@ -303,8 +847,10 @@ static size_t simple_app_total_result_lines(SimpleApp* app) {
 static size_t simple_app_result_offset_lines(SimpleApp* app) {
     if(!app) return 0;
     size_t lines = 0;
-    for(size_t i = 0; i < app->scan_result_offset && i < app->scan_result_count; i++) {
-        lines += simple_app_result_line_count(&app->scan_results[i]);
+    for(size_t i = 0; i < app->scan_result_offset && i < app->visible_result_count; i++) {
+        const ScanResult* result = simple_app_visible_result_const(app, i);
+        if(!result) continue;
+        lines += simple_app_result_line_count(app, result);
     }
     return lines;
 }
@@ -367,27 +913,30 @@ static void simple_app_toggle_scan_selection(SimpleApp* app, ScanResult* result)
 static void simple_app_adjust_result_offset(SimpleApp* app) {
     if(!app) return;
 
-    if(app->scan_result_count == 0) {
+    if(app->visible_result_count == 0) {
         app->scan_result_offset = 0;
         app->scan_result_index = 0;
         return;
     }
 
-    if(app->scan_result_index >= app->scan_result_count) {
-        app->scan_result_index = app->scan_result_count - 1;
+    if(app->scan_result_index >= app->visible_result_count) {
+        app->scan_result_index = app->visible_result_count - 1;
     }
 
     if(app->scan_result_offset > app->scan_result_index) {
         app->scan_result_offset = app->scan_result_index;
     }
 
-    while(app->scan_result_offset < app->scan_result_count) {
+    while(app->scan_result_offset < app->visible_result_count) {
         size_t lines_used = 0;
         bool index_visible = false;
-        for(size_t i = app->scan_result_offset; i < app->scan_result_count; i++) {
-            uint8_t entry_lines = simple_app_result_line_count(&app->scan_results[i]);
+        size_t available_lines = (app->result_max_lines > 0) ? app->result_max_lines : 1;
+        for(size_t i = app->scan_result_offset; i < app->visible_result_count; i++) {
+            const ScanResult* result = simple_app_visible_result_const(app, i);
+            if(!result) continue;
+            uint8_t entry_lines = simple_app_result_line_count(app, result);
             if(entry_lines == 0) entry_lines = 1;
-            if(lines_used + entry_lines > RESULT_MAX_LINES) break;
+            if(lines_used + entry_lines > available_lines) break;
             lines_used += entry_lines;
             if(i == app->scan_result_index) {
                 index_visible = true;
@@ -401,8 +950,9 @@ static void simple_app_adjust_result_offset(SimpleApp* app) {
         app->scan_result_offset++;
     }
 
-    if(app->scan_result_offset >= app->scan_result_count) {
-        app->scan_result_offset = (app->scan_result_count > 0) ? app->scan_result_count - 1 : 0;
+    if(app->scan_result_offset >= app->visible_result_count) {
+        app->scan_result_offset =
+            (app->visible_result_count > 0) ? app->visible_result_count - 1 : 0;
     }
 }
 
@@ -586,7 +1136,16 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     canvas_set_bitmap_mode(canvas, false);
 
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(canvas, 111, 62, "v.01");
+    if(simple_app_status_message_is_active(app) && !app->status_message_fullscreen) {
+        canvas_draw_str(canvas, 2, 52, app->status_message);
+    }
+    char version_text[16];
+    snprintf(version_text, sizeof(version_text), "v.%s", FAP_VERSION_TEXT);
+    size_t version_len = strlen(version_text);
+    uint8_t version_width = (version_len < 21) ? (uint8_t)(version_len * 6) : DISPLAY_WIDTH;
+    uint8_t version_x =
+        (version_width < DISPLAY_WIDTH) ? (uint8_t)(DISPLAY_WIDTH - version_width - 2) : 0;
+    canvas_draw_str(canvas, version_x, 62, version_text);
 
     if(app->section_index >= menu_section_count) {
         app->section_index = 0;
@@ -710,7 +1269,7 @@ static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
 
     uint8_t y = 8;
     if(lines_filled == 0) {
-        canvas_draw_str(canvas, 2, y, "Brak danych z UART");
+        canvas_draw_str(canvas, 2, y, "No UART data");
     } else {
         for(size_t i = 0; i < lines_filled; i++) {
             canvas_draw_str(canvas, 2, y, display_lines[i][0] ? display_lines[i] : " ");
@@ -763,77 +1322,80 @@ static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_draw_results(SimpleApp* app, Canvas* canvas) {
     canvas_set_color(canvas, ColorBlack);
-    canvas_set_font(canvas, FontSecondary);
+    canvas_set_font(canvas, app->result_font);
 
-    if(app->scan_results_loading && app->scan_result_count == 0) {
+    if(app->scan_results_loading && app->visible_result_count == 0) {
         canvas_draw_str(canvas, 2, 20, "Loading...");
-        canvas_draw_str(canvas, 2, 62, "[Resoults] Selected: 0");
+        canvas_draw_str(canvas, 2, 62, "[Results] Selected: 0");
         return;
     }
 
-    if(app->scan_result_count == 0) {
+    if(app->visible_result_count == 0) {
         canvas_draw_str(canvas, 2, 20, "No results");
-        canvas_draw_str(canvas, 2, 62, "[Resoults] Selected: 0");
+        canvas_draw_str(canvas, 2, 62, "[Results] Selected: 0");
         return;
     }
 
     simple_app_adjust_result_offset(app);
 
     uint8_t y = RESULT_START_Y;
-    size_t lines_left = RESULT_MAX_LINES;
+    size_t visible_line_budget = (app->result_max_lines > 0) ? app->result_max_lines : 1;
+    size_t lines_left = visible_line_budget;
+    size_t char_limit = (app->result_char_limit > 0) ? app->result_char_limit : 1;
 
-    for(size_t idx = app->scan_result_offset; idx < app->scan_result_count && lines_left > 0; idx++) {
-        const ScanResult* result = &app->scan_results[idx];
+    for(size_t idx = app->scan_result_offset; idx < app->visible_result_count && lines_left > 0; idx++) {
+        const ScanResult* result = simple_app_visible_result_const(app, idx);
+        if(!result) continue;
         char line_full[96];
-        size_t line_len = simple_app_format_result_line(result, line_full, sizeof(line_full));
+        size_t line_len = simple_app_format_result_line(app, result, line_full, sizeof(line_full));
 
-        size_t lines_needed = (line_len + RESULT_LINE_CHAR_LIMIT - 1) / RESULT_LINE_CHAR_LIMIT;
-        if(lines_needed == 0) lines_needed = 1;
-        if(lines_needed > 2) lines_needed = 2;
-        if(lines_needed > lines_left) break;
-
-        size_t first_len =
-            (line_len > RESULT_LINE_CHAR_LIMIT) ? RESULT_LINE_CHAR_LIMIT : line_len;
-        char line_first[RESULT_LINE_CHAR_LIMIT + 1];
-        memset(line_first, 0, sizeof(line_first));
-        if(first_len > 0) {
-            memcpy(line_first, line_full, first_len);
+        size_t segments_available = simple_app_result_line_count(app, result);
+        if(segments_available == 0) segments_available = 1;
+        if(segments_available > lines_left) {
+            segments_available = lines_left;
         }
 
-        size_t remaining = (line_len > first_len) ? (line_len - first_len) : 0;
-        char line_second[RESULT_LINE_CHAR_LIMIT + 1];
-        memset(line_second, 0, sizeof(line_second));
-        if(remaining > 0) {
-            size_t second_len =
-                (remaining > RESULT_LINE_CHAR_LIMIT) ? RESULT_LINE_CHAR_LIMIT : remaining;
-            memcpy(line_second, line_full + first_len, second_len);
-            line_second[second_len] = '\0';
-        }
+        size_t consumed = 0;
+        for(size_t segment = 0; segment < segments_available && lines_left > 0; segment++) {
+            size_t remaining = (line_len > consumed) ? (line_len - consumed) : 0;
+            size_t segment_len = (remaining > char_limit) ? char_limit : remaining;
+            char segment_buffer[64];
+            memset(segment_buffer, 0, sizeof(segment_buffer));
+            if(segment_len > 0) {
+                if(segment_len >= sizeof(segment_buffer)) {
+                    segment_len = sizeof(segment_buffer) - 1;
+                }
+                memcpy(segment_buffer, line_full + consumed, segment_len);
+                segment_buffer[segment_len] = '\0';
+            } else {
+                segment_buffer[0] = '\0';
+            }
+            consumed += segment_len;
+            size_t segment_length_actual = strlen(segment_buffer);
+            while(segment_length_actual > 0 && segment_buffer[0] == ' ') {
+                memmove(segment_buffer, segment_buffer + 1, segment_length_actual);
+                segment_length_actual = strlen(segment_buffer);
+            }
 
-        char first_prefix[3] = {' ', ' ', '\0'};
-        if(result->selected) {
-            first_prefix[0] = '*';
-        }
-        if(idx == app->scan_result_index) {
-            first_prefix[0] = '>';
-            first_prefix[1] = result->selected ? '*' : ' ';
-        }
-
-        canvas_draw_str(canvas, 2, y, first_prefix);
-        canvas_draw_str(canvas, 12, y, line_first);
-        y += RESULT_LINE_HEIGHT;
-        lines_left--;
-
-        if(lines_needed > 1 && lines_left > 0) {
-            canvas_draw_str(canvas, 12, y, line_second);
-            y += RESULT_LINE_HEIGHT;
+            if(segment == 0) {
+                if(idx == app->scan_result_index) {
+                    canvas_draw_str(canvas, RESULT_PREFIX_X, y, ">");
+                } else {
+                    canvas_draw_str(canvas, RESULT_PREFIX_X, y, " ");
+                }
+            }
+            canvas_draw_str(canvas, RESULT_TEXT_X, y, segment_buffer);
+            y += app->result_line_height;
             lines_left--;
+            if(lines_left == 0) break;
         }
 
         if(lines_left > 0) {
             bool more_entries = false;
-            for(size_t next = idx + 1; next < app->scan_result_count; next++) {
-                uint8_t next_lines = simple_app_result_line_count(&app->scan_results[next]);
+            for(size_t next = idx + 1; next < app->visible_result_count; next++) {
+                const ScanResult* next_result = simple_app_visible_result_const(app, next);
+                if(!next_result) continue;
+                uint8_t next_lines = simple_app_result_line_count(app, next_result);
                 if(next_lines == 0) next_lines = 1;
                 if(next_lines <= lines_left) {
                     more_entries = true;
@@ -848,17 +1410,17 @@ static void simple_app_draw_results(SimpleApp* app, Canvas* canvas) {
 
     size_t total_lines = simple_app_total_result_lines(app);
     size_t offset_lines = simple_app_result_offset_lines(app);
-    if(total_lines > RESULT_MAX_LINES) {
-        const uint8_t track_width = 3;
-        const uint8_t track_height = RESULT_LINE_HEIGHT * RESULT_MAX_LINES;
+    if(total_lines > visible_line_budget) {
+        const uint8_t track_width = RESULT_SCROLL_WIDTH;
+        const uint8_t track_height = (uint8_t)(app->result_line_height * visible_line_budget);
         const uint8_t track_x = DISPLAY_WIDTH - track_width;
-        const uint8_t track_y = RESULT_START_Y - 2;
+        const uint8_t track_y = (RESULT_START_Y > 5) ? (RESULT_START_Y - 5) : 0;
 
         canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
 
-        size_t max_scroll = total_lines - RESULT_MAX_LINES;
+        size_t max_scroll = total_lines - visible_line_budget;
         uint8_t thumb_height =
-            (uint8_t)(((uint32_t)RESULT_MAX_LINES * track_height) / total_lines);
+            (uint8_t)(((uint32_t)visible_line_budget * track_height) / total_lines);
         if(thumb_height < 4) thumb_height = 4;
         if(thumb_height > track_height) thumb_height = track_height;
 
@@ -879,23 +1441,148 @@ static void simple_app_draw_results(SimpleApp* app, Canvas* canvas) {
     }
 
     char footer[48];
-    snprintf(footer, sizeof(footer), "[Resoults] Selected: %u", (unsigned)app->scan_selected_count);
+    snprintf(footer, sizeof(footer), "[Results] Selected: %u", (unsigned)app->scan_selected_count);
     simple_app_truncate_text(footer, SERIAL_LINE_CHAR_LIMIT);
+    canvas_set_font(canvas, FontSecondary);
     canvas_draw_str(canvas, 2, 62, footer);
     if(app->scan_selected_count > 0) {
         canvas_draw_str(canvas, DISPLAY_WIDTH - 10, 62, "->");
     }
 }
 
+static void simple_app_draw_setup_scanner(SimpleApp* app, Canvas* canvas) {
+    if(!app) return;
+
+    static const char* option_labels[] = {"SSID", "BSSID", "Channel", "Security", "Power", "Band"};
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 4, 12, "Scanner Filters");
+
+    canvas_set_font(canvas, FontSecondary);
+    size_t option_count = ScannerOptionCount;
+    if(app->scanner_view_offset >= option_count) {
+        app->scanner_view_offset = (option_count > 0 && option_count > SCANNER_FILTER_VISIBLE_COUNT)
+                                       ? option_count - SCANNER_FILTER_VISIBLE_COUNT
+                                       : 0;
+    }
+
+    uint8_t y = 26;
+    for(size_t i = 0; i < SCANNER_FILTER_VISIBLE_COUNT; i++) {
+        size_t option_index = app->scanner_view_offset + i;
+        if(option_index >= option_count) break;
+
+        char line[48];
+        memset(line, 0, sizeof(line));
+
+        if(option_index == ScannerOptionMinPower) {
+            const char* fmt =
+                (app->scanner_adjusting_power && app->scanner_setup_index == ScannerOptionMinPower)
+                    ? "Min power*: %d dBm"
+                    : "Min power: %d dBm";
+            snprintf(line, sizeof(line), fmt, (int)app->scanner_min_power);
+        } else {
+            bool enabled = false;
+            switch(option_index) {
+            case ScannerOptionShowSSID:
+                enabled = app->scanner_show_ssid;
+                break;
+            case ScannerOptionShowBSSID:
+                enabled = app->scanner_show_bssid;
+                break;
+            case ScannerOptionShowChannel:
+                enabled = app->scanner_show_channel;
+                break;
+            case ScannerOptionShowSecurity:
+                enabled = app->scanner_show_security;
+                break;
+            case ScannerOptionShowPower:
+                enabled = app->scanner_show_power;
+                break;
+            case ScannerOptionShowBand:
+                enabled = app->scanner_show_band;
+                break;
+            default:
+                break;
+            }
+            snprintf(line, sizeof(line), "[%c] %s", enabled ? 'x' : ' ', option_labels[option_index]);
+        }
+
+        simple_app_truncate_text(line, 20);
+
+        if(app->scanner_setup_index == option_index) {
+            canvas_draw_str(canvas, 2, y, ">");
+        }
+        canvas_draw_str(canvas, 12, y, line);
+        y += 10;
+    }
+
+    if(option_count > SCANNER_FILTER_VISIBLE_COUNT) {
+        const uint8_t track_width = 3;
+        const uint8_t track_height = (uint8_t)(SCANNER_FILTER_VISIBLE_COUNT * 10);
+        const uint8_t track_x = DISPLAY_WIDTH - track_width;
+        const uint8_t track_y = 24;
+
+        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
+
+        size_t max_offset = option_count - SCANNER_FILTER_VISIBLE_COUNT;
+        uint8_t thumb_height =
+            (uint8_t)(((uint32_t)SCANNER_FILTER_VISIBLE_COUNT * track_height) / option_count);
+        if(thumb_height < 4) thumb_height = 4;
+        if(thumb_height > track_height) thumb_height = track_height;
+
+        uint8_t max_thumb_offset =
+            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
+        uint8_t thumb_offset = 0;
+        if(max_offset > 0 && max_thumb_offset > 0) {
+            if(app->scanner_view_offset > max_offset) {
+                app->scanner_view_offset = max_offset;
+            }
+            thumb_offset =
+                (uint8_t)(((uint32_t)app->scanner_view_offset * max_thumb_offset) / max_offset);
+        }
+        uint8_t thumb_x = track_x + 1;
+        uint8_t thumb_y = track_y + 1 + thumb_offset;
+        uint8_t thumb_inner_height = (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
+        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
+        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
+        canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_inner_height);
+    }
+
+    const char* footer = "OK toggle, Back exit";
+    if(app->scanner_setup_index == ScannerOptionMinPower) {
+        footer = app->scanner_adjusting_power ? "Up/Down adjust, OK" : "OK edit, Back exit";
+    }
+    canvas_draw_str(canvas, 2, 62, footer);
+}
+
 static void simple_app_draw(Canvas* canvas, void* context) {
     SimpleApp* app = context;
     canvas_clear(canvas);
-    if(app->screen == ScreenMenu) {
+    bool status_active = simple_app_status_message_is_active(app);
+    if(status_active && app->status_message_fullscreen) {
+        canvas_set_color(canvas, ColorBlack);
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(
+            canvas, DISPLAY_WIDTH / 2, 32, AlignCenter, AlignCenter, app->status_message);
+        return;
+    }
+    switch(app->screen) {
+    case ScreenMenu:
         simple_app_draw_menu(app, canvas);
-    } else if(app->screen == ScreenSerial) {
+        break;
+    case ScreenSerial:
         simple_app_draw_serial(app, canvas);
-    } else {
+        break;
+    case ScreenResults:
         simple_app_draw_results(app, canvas);
+        break;
+    case ScreenSetupScanner:
+        simple_app_draw_setup_scanner(app, canvas);
+        break;
+    default:
+        simple_app_draw_results(app, canvas);
+        break;
     }
 }
 
@@ -956,6 +1643,13 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             if(entry->command && entry->command[0] != '\0') {
                 simple_app_send_command(app, entry->command, true);
             }
+        } else if(entry->action == MenuActionToggleBacklight) {
+            simple_app_toggle_backlight(app);
+        } else if(entry->action == MenuActionOpenScannerSetup) {
+            app->screen = ScreenSetupScanner;
+            app->scanner_setup_index = 0;
+            app->scanner_adjusting_power = false;
+            app->scanner_view_offset = 0;
         }
 
         view_port_update(app->viewport);
@@ -965,7 +1659,82 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->menu_state = MenuStateSections;
             view_port_update(app->viewport);
         } else {
+            simple_app_save_config_if_dirty(app, NULL, false);
             app->exit_app = true;
+        }
+    }
+}
+
+static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack) {
+        if(app->scanner_adjusting_power) {
+            app->scanner_adjusting_power = false;
+            view_port_update(app->viewport);
+        } else {
+            simple_app_save_config_if_dirty(app, "Config saved", true);
+            app->screen = ScreenMenu;
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->scanner_adjusting_power && app->scanner_setup_index == ScannerOptionMinPower) {
+        if(key == InputKeyUp || key == InputKeyRight) {
+            simple_app_modify_min_power(app, SCAN_POWER_STEP);
+            view_port_update(app->viewport);
+            return;
+        } else if(key == InputKeyDown || key == InputKeyLeft) {
+            simple_app_modify_min_power(app, -SCAN_POWER_STEP);
+            view_port_update(app->viewport);
+            return;
+        }
+    }
+
+    if(key == InputKeyUp) {
+        if(app->scanner_setup_index > 0) {
+            app->scanner_setup_index--;
+            if(app->scanner_setup_index != ScannerOptionMinPower) {
+                app->scanner_adjusting_power = false;
+            }
+            if(app->scanner_setup_index < app->scanner_view_offset) {
+                app->scanner_view_offset = app->scanner_setup_index;
+            }
+            view_port_update(app->viewport);
+        }
+    } else if(key == InputKeyDown) {
+        if(app->scanner_setup_index + 1 < ScannerOptionCount) {
+            app->scanner_setup_index++;
+            if(app->scanner_setup_index != ScannerOptionMinPower) {
+                app->scanner_adjusting_power = false;
+            }
+            if(app->scanner_setup_index >=
+               app->scanner_view_offset + SCANNER_FILTER_VISIBLE_COUNT) {
+                app->scanner_view_offset =
+                    app->scanner_setup_index - SCANNER_FILTER_VISIBLE_COUNT + 1;
+            }
+            view_port_update(app->viewport);
+        }
+    } else if(key == InputKeyOk) {
+        if(app->scanner_setup_index == ScannerOptionMinPower) {
+            app->scanner_adjusting_power = !app->scanner_adjusting_power;
+            view_port_update(app->viewport);
+        } else {
+            bool* flag =
+                simple_app_scanner_option_flag(app, (ScannerOption)app->scanner_setup_index);
+            if(flag) {
+                if(*flag && simple_app_enabled_field_count(app) <= 1) {
+                    view_port_update(app->viewport);
+                } else {
+                    *flag = !(*flag);
+                    simple_app_mark_config_dirty(app);
+                    simple_app_update_result_layout(app);
+                    simple_app_rebuild_visible_results(app);
+                    simple_app_adjust_result_offset(app);
+                    view_port_update(app->viewport);
+                }
+            }
         }
     }
 }
@@ -1033,7 +1802,7 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
         return;
     }
 
-    if(app->scan_result_count == 0) return;
+    if(app->visible_result_count == 0) return;
 
     if(key == InputKeyUp) {
         if(app->scan_result_index > 0) {
@@ -1042,17 +1811,19 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
             view_port_update(app->viewport);
         }
     } else if(key == InputKeyDown) {
-        if(app->scan_result_index + 1 < app->scan_result_count) {
+        if(app->scan_result_index + 1 < app->visible_result_count) {
             app->scan_result_index++;
             simple_app_adjust_result_offset(app);
             view_port_update(app->viewport);
         }
     } else if(key == InputKeyOk) {
-        if(app->scan_result_index < app->scan_result_count) {
-            ScanResult* result = &app->scan_results[app->scan_result_index];
-            simple_app_toggle_scan_selection(app, result);
-            simple_app_adjust_result_offset(app);
-            view_port_update(app->viewport);
+        if(app->scan_result_index < app->visible_result_count) {
+            ScanResult* result = simple_app_visible_result(app, app->scan_result_index);
+            if(result) {
+                simple_app_toggle_scan_selection(app, result);
+                simple_app_adjust_result_offset(app);
+                view_port_update(app->viewport);
+            }
         }
     } else if(key == InputKeyRight) {
         if(app->scan_selected_count > 0) {
@@ -1074,6 +1845,14 @@ static void simple_app_input(InputEvent* event, void* context) {
     SimpleApp* app = context;
     if(!app || !event) return;
 
+    if(simple_app_status_message_is_active(app) && app->status_message_fullscreen) {
+        if(event->type == InputTypeShort &&
+           (event->key == InputKeyOk || event->key == InputKeyBack)) {
+            simple_app_clear_status_message(app);
+        }
+        return;
+    }
+
     bool allow_event = false;
     if(event->type == InputTypeShort) {
         allow_event = true;
@@ -1084,12 +1863,22 @@ static void simple_app_input(InputEvent* event, void* context) {
 
     if(!allow_event) return;
 
-    if(app->screen == ScreenMenu) {
+    switch(app->screen) {
+    case ScreenMenu:
         simple_app_handle_menu_input(app, event->key);
-    } else if(app->screen == ScreenSerial) {
+        break;
+    case ScreenSerial:
         simple_app_handle_serial_input(app, event->key);
-    } else {
+        break;
+    case ScreenResults:
         simple_app_handle_results_input(app, event->key);
+        break;
+    case ScreenSetupScanner:
+        simple_app_handle_setup_scanner_input(app, event->key);
+        break;
+    default:
+        simple_app_handle_results_input(app, event->key);
+        break;
     }
 }
 
@@ -1129,6 +1918,23 @@ int32_t Lab_C5_app(void* p) {
         return 0;
     }
     memset(app, 0, sizeof(SimpleApp));
+    app->scanner_show_ssid = true;
+    app->scanner_show_bssid = true;
+    app->scanner_show_channel = true;
+    app->scanner_show_security = true;
+    app->scanner_show_power = true;
+    app->scanner_show_band = true;
+    app->scanner_min_power = SCAN_POWER_MIN_DBM;
+    app->scanner_setup_index = 0;
+    app->scanner_adjusting_power = false;
+    app->backlight_enabled = true;
+    app->scanner_view_offset = 0;
+    simple_app_update_result_layout(app);
+    simple_app_update_backlight_label(app);
+    app->notifications = furi_record_open(RECORD_NOTIFICATION);
+    simple_app_load_config(app);
+    simple_app_update_backlight_label(app);
+    simple_app_apply_backlight(app);
     app->menu_state = MenuStateSections;
     app->screen = ScreenMenu;
     app->serial_follow_tail = true;
@@ -1175,6 +1981,8 @@ int32_t Lab_C5_app(void* p) {
         furi_delay_ms(20);
     }
 
+    simple_app_save_config_if_dirty(app, NULL, false);
+
     gui_remove_view_port(app->gui, app->viewport);
     view_port_free(app->viewport);
     furi_record_close(RECORD_GUI);
@@ -1184,6 +1992,19 @@ int32_t Lab_C5_app(void* p) {
     furi_hal_serial_deinit(app->serial);
     furi_hal_serial_control_release(app->serial);
     furi_mutex_free(app->serial_mutex);
+    if(app->notifications) {
+        if(app->backlight_notification_enforced) {
+            notification_message(app->notifications, &sequence_display_backlight_enforce_auto);
+            app->backlight_notification_enforced = false;
+        }
+        furi_record_close(RECORD_NOTIFICATION);
+        app->notifications = NULL;
+    }
+    if(app->backlight_insomnia) {
+        furi_hal_power_insomnia_exit();
+        app->backlight_insomnia = false;
+    }
+    furi_hal_light_set(LightBacklight, BACKLIGHT_ON_LEVEL);
     free(app);
 
     return 0;
