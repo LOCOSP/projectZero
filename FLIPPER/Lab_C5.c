@@ -21,6 +21,7 @@ typedef enum {
     ScreenResults,
     ScreenSetupScanner,
     ScreenConsole,
+    ScreenConfirmBlackout,
 } AppScreen;
 
 typedef enum {
@@ -53,6 +54,7 @@ typedef enum {
 #define UART_STREAM_SIZE 1024
 #define MENU_VISIBLE_COUNT 6
 #define MENU_VISIBLE_COUNT_SNIFFERS 3
+#define MENU_VISIBLE_COUNT_ATTACKS 3
 #define SERIAL_VISIBLE_LINES 6
 #define SERIAL_LINE_CHAR_LIMIT 22
 #define SERIAL_TEXT_LINE_HEIGHT 10
@@ -85,6 +87,7 @@ typedef enum {
     MenuActionToggleBacklight,
     MenuActionOpenScannerSetup,
     MenuActionOpenConsole,
+    MenuActionConfirmBlackout,
 } MenuAction;
 
 typedef enum {
@@ -129,6 +132,7 @@ typedef struct {
     bool serial_follow_tail;
     bool serial_targets_hint;
     bool last_command_sent;
+    bool confirm_blackout_yes;
     ScanResult scan_results[MAX_SCAN_RESULTS];
     size_t scan_result_count;
     size_t scan_result_index;
@@ -197,6 +201,7 @@ typedef struct {
     const MenuEntry* entries;
     size_t entry_count;
     uint8_t display_y;
+    uint8_t display_height;
 } MenuSection;
 
 static const uint8_t image_icon_0_bits[] = {
@@ -212,10 +217,11 @@ static const MenuEntry menu_entries_sniffers[] = {
 };
 
 static const MenuEntry menu_entries_attacks[] = {
-    {"Start Deauth", "start_deauth", MenuActionCommandWithTargets},
-    {"Start Evil Twin", "start_evil_twin", MenuActionCommand},
+    {"Blackout", NULL, MenuActionConfirmBlackout},
+    {"Deauth", "start_deauth", MenuActionCommandWithTargets},
+    {"Evil Twin", "start_evil_twin", MenuActionCommand},
     {"SAE Overflow", "sae_overflow", MenuActionCommand},
-    {"Start Wardrive", "start_wardrive", MenuActionCommand},
+    {"Wardrive", "start_wardrive", MenuActionCommand},
 };
 
 static char menu_label_backlight[24] = "Backlight: On";
@@ -227,11 +233,11 @@ static const MenuEntry menu_entries_setup[] = {
 };
 
 static const MenuSection menu_sections[] = {
-    {"Scanner", NULL, 0, 12},
-    {"Sniffers", menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24},
-    {"Targets", NULL, 0, 36},
-    {"Attacks", menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48},
-    {"Setup", menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60},
+    {"Scanner", NULL, 0, 12, MENU_VISIBLE_COUNT * 12},
+    {"Sniffers", menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24, MENU_VISIBLE_COUNT_SNIFFERS * 12},
+    {"Targets", NULL, 0, 36, MENU_VISIBLE_COUNT * 12},
+    {"Attacks", menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48, MENU_VISIBLE_COUNT_ATTACKS * 12},
+    {"Setup", menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60, MENU_VISIBLE_COUNT * 12},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -241,7 +247,31 @@ static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t secti
     if(section_index == MENU_SECTION_SNIFFERS) {
         return MENU_VISIBLE_COUNT_SNIFFERS;
     }
+    if(section_index == MENU_SECTION_ATTACKS) {
+        return MENU_VISIBLE_COUNT_ATTACKS;
+    }
     return MENU_VISIBLE_COUNT;
+}
+
+static void simple_app_focus_attacks_menu(SimpleApp* app) {
+    if(!app) return;
+    app->screen = ScreenMenu;
+    app->menu_state = MenuStateItems;
+    app->section_index = MENU_SECTION_ATTACKS;
+    const MenuSection* section = &menu_sections[MENU_SECTION_ATTACKS];
+    if(section->entry_count == 0) {
+        app->item_index = 0;
+        app->item_offset = 0;
+        return;
+    }
+    app->item_index = section->entry_count - 1;
+    size_t visible_count = simple_app_menu_visible_count(app, MENU_SECTION_ATTACKS);
+    if(visible_count == 0) visible_count = 1;
+    if(section->entry_count > visible_count) {
+        app->item_offset = section->entry_count - visible_count;
+    } else {
+        app->item_offset = 0;
+    }
 }
 
 static void simple_app_truncate_text(char* text, size_t max_chars) {
@@ -1345,6 +1375,34 @@ static void simple_app_draw_console(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str(canvas, 2, 62, "Back=Exit  Up/Down scroll");
 }
 
+static void simple_app_draw_confirm_blackout(SimpleApp* app, Canvas* canvas) {
+    if(!app) return;
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(
+        canvas,
+        DISPLAY_WIDTH / 2,
+        12,
+        AlignCenter,
+        AlignCenter,
+        "Blackout will disconnect");
+    canvas_draw_str_aligned(
+        canvas,
+        DISPLAY_WIDTH / 2,
+        24,
+        AlignCenter,
+        AlignCenter,
+        "all clients on scanned APs");
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 38, AlignCenter, AlignCenter, "Confirm?");
+
+    canvas_set_font(canvas, FontSecondary);
+    const char* option_line = app->confirm_blackout_yes ? "> Yes        No" : "Yes        > No";
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, option_line);
+    canvas_draw_str(canvas, 2, 62, "Left/Right choose");
+}
+
 static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
     if(!app) return;
     if(key == InputKeyBack) {
@@ -1405,6 +1463,33 @@ static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
         view_port_update(app->viewport);
     }
 }
+
+static void simple_app_handle_confirm_blackout_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack) {
+        app->confirm_blackout_yes = false;
+        simple_app_focus_attacks_menu(app);
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyLeft || key == InputKeyRight) {
+        app->confirm_blackout_yes = !app->confirm_blackout_yes;
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyOk) {
+        if(app->confirm_blackout_yes) {
+            app->confirm_blackout_yes = false;
+            simple_app_send_command(app, "start_blackout", true);
+        } else {
+            simple_app_focus_attacks_menu(app);
+            view_port_update(app->viewport);
+        }
+    }
+}
+
 static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     canvas_set_color(canvas, ColorBlack);
 
@@ -1497,7 +1582,7 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
 
     if(section->entry_count > visible_count) {
         const uint8_t track_width = 3;
-        const uint8_t track_height = (uint8_t)(visible_count * 12);
+        uint8_t track_height = section->display_height ? section->display_height : (uint8_t)(visible_count * 12);
         const uint8_t track_x = DISPLAY_WIDTH - track_width;
         const uint8_t track_y = 18;
         canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
@@ -1511,12 +1596,21 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
         if(max_offset > 0 && max_thumb_offset > 0) {
             thumb_offset = (uint8_t)(((uint32_t)app->item_offset * max_thumb_offset) / max_offset);
         }
-        uint8_t thumb_x = track_x + ((track_width > 2) ? 1 : 0);
+        uint8_t thumb_x = (track_width > 2) ? (track_x + 1) : track_x;
         uint8_t thumb_y = track_y + 1 + thumb_offset;
-        uint8_t thumb_inner_height = (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
-        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
         uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
-        canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_inner_height);
+        if(track_width > 2) {
+            uint8_t draw_height = thumb_height;
+            uint8_t draw_y = thumb_y;
+            if(draw_height > 2) {
+                draw_height = (uint8_t)(draw_height - 2);
+                draw_y = thumb_y;
+            }
+            if(draw_height == 0) draw_height = 1;
+            canvas_draw_box(canvas, thumb_x, draw_y, thumb_width, draw_height);
+        } else {
+            canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_height);
+        }
     }
 }
 
@@ -1932,6 +2026,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenConsole:
         simple_app_draw_console(app, canvas);
         break;
+    case ScreenConfirmBlackout:
+        simple_app_draw_confirm_blackout(app, canvas);
+        break;
     default:
         simple_app_draw_results(app, canvas);
         break;
@@ -2024,6 +2121,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->scanner_view_offset = 0;
         } else if(entry->action == MenuActionOpenConsole) {
             simple_app_console_enter(app);
+        } else if(entry->action == MenuActionConfirmBlackout) {
+            app->confirm_blackout_yes = true;
+            app->screen = ScreenConfirmBlackout;
         }
 
         view_port_update(app->viewport);
@@ -2259,6 +2359,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         break;
     case ScreenConsole:
         simple_app_handle_console_input(app, event->key);
+        break;
+    case ScreenConfirmBlackout:
+        simple_app_handle_confirm_blackout_input(app, event->key);
         break;
     default:
         simple_app_handle_results_input(app, event->key);
