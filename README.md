@@ -128,49 +128,6 @@ Finally when you run Show Probes you can see report of probe requests:
 
 
 
-# Deployment to boards
-For Evil Twin - it's all about MACs! C5 needs to know ESP32 MAC and vice versa. At the moment you need to modify it straight in the code.
-
-All other attacks require just one board and you don't need to worry about it.
-
-## Initial deployment to ESP32
-Use Arduino IDE and open the EvilTwin_slave.ino file.
-
-Side note: When uploading code to ESP32C3 (or S3) remember to set USB CDC On Boot to Enabled - otherwise you will not see any serial:
-
-![alt text](Gfx/image-2.png)
-
-Next, after starting up it will print its MAC in the Serial Monitor:
-
-![alt text](Gfx/image-3.png)
-Note it down. 
-
-## Initial deployment to ESP32-C5
-Use ESP-IDF. Open the Folder ESP32C5 and then click Open:
-
-![alt text](Gfx/image-4.png) 
-
-
-Next, build, flash and monitor:
-
-![alt text](Gfx/image-5.png)
-
-After it starts, grab the MAC address of the C5 from the logs:
-
-![alt text](Gfx/image-6.png)
-
-## MAC code updates
-Now, in Arduino enter the C5 MAC address (in hex form of byte array):
-
-![alt text](Gfx/image-7.png)
-
-Next, in ESP-IDF in main.c on top enter the ESP32 MAC address:
-
-![alt text](Gfx/image-8.png)
-
-# Now recompile and flash both boards again.
-They should become aware of each other and be able to communicate over ESP-NOW.
-
 ## Flashing ESP32-C5 Board
 
 To flash the ESP32-C5 board, follow these steps:
