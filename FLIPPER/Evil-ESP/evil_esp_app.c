@@ -16,6 +16,7 @@ void (*const evil_esp_scene_on_enter_handlers[])(void*) = {
     evil_esp_scene_on_enter_config,
     evil_esp_scene_on_enter_device_info,
     evil_esp_scene_on_enter_uart_terminal,
+    evil_esp_scene_on_enter_list_portals,
 };
 
 bool (*const evil_esp_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
@@ -31,6 +32,7 @@ bool (*const evil_esp_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     evil_esp_scene_on_event_config,
     evil_esp_scene_on_event_device_info,
     evil_esp_scene_on_event_uart_terminal,
+    evil_esp_scene_on_event_list_portals,
 };
 
 void (*const evil_esp_scene_on_exit_handlers[])(void*) = {
@@ -46,6 +48,7 @@ void (*const evil_esp_scene_on_exit_handlers[])(void*) = {
     evil_esp_scene_on_exit_config,
     evil_esp_scene_on_exit_device_info,
     evil_esp_scene_on_exit_uart_terminal,
+    evil_esp_scene_on_exit_list_portals,
 };
 
 // Scene manager configuration

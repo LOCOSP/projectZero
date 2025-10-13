@@ -245,6 +245,7 @@ enum EvilEspMainMenuIndex {
     EvilEspMainMenuIndexSnifferMenu,
     EvilEspMainMenuIndexAttacks,
     EvilEspMainMenuIndexSniffer,
+    EvilEspMainMenuIndexListPortals,
     EvilEspMainMenuIndexConfig,
     EvilEspMainMenuIndexDeviceInfo,
     EvilEspMainMenuIndexUartTerminal,
@@ -265,6 +266,7 @@ void evil_esp_scene_on_enter_main_menu(void* context) {
     submenu_add_item(app->submenu, "Sniffer", EvilEspMainMenuIndexSnifferMenu, evil_esp_submenu_callback_main_menu, app);
     submenu_add_item(app->submenu, "Targets", EvilEspMainMenuIndexSniffer, evil_esp_submenu_callback_main_menu, app);
     submenu_add_item(app->submenu, "Attacks", EvilEspMainMenuIndexAttacks, evil_esp_submenu_callback_main_menu, app);
+    submenu_add_item(app->submenu, "List Portals", EvilEspMainMenuIndexListPortals, evil_esp_submenu_callback_main_menu, app);
 
     //submenu_add_item(app->submenu, "Configuration", EvilEspMainMenuIndexConfig, evil_esp_submenu_callback_main_menu, app);
     //submenu_add_item(app->submenu, "Help", EvilEspMainMenuIndexDeviceInfo, evil_esp_submenu_callback_main_menu, app);
@@ -306,6 +308,10 @@ bool evil_esp_scene_on_event_main_menu(void* context, SceneManagerEvent event) {
         case EvilEspMainMenuIndexSniffer:
             // Go to target selection scene (repurposed sniffer scene)
             scene_manager_next_scene(app->scene_manager, EvilEspSceneSniffer);
+            return true;
+        case EvilEspMainMenuIndexListPortals:
+            // Go to portal list scene
+            scene_manager_next_scene(app->scene_manager, EvilEspSceneListPortals);
             return true;
         case EvilEspMainMenuIndexConfig:
             // Go to proper configuration scene
@@ -1232,4 +1238,119 @@ bool evil_esp_scene_on_event_uart_terminal(void* context, SceneManagerEvent even
 void evil_esp_scene_on_exit_uart_terminal(void* context) {
     EvilEspApp* app = context;
     text_box_reset(app->text_box);
+}
+
+// Scene: List Portals
+static void evil_esp_submenu_callback_portals(void* context, uint32_t index) {
+    EvilEspApp* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, index);
+}
+
+void evil_esp_scene_on_enter_list_portals(void* context) {
+    EvilEspApp* app = context;
+
+    // Clear previous portal data
+    app->portal_count = 0;
+    memset(app->portals, 0, sizeof(app->portals));
+    app->portal_scan_in_progress = true;
+
+    FURI_LOG_I("EvilEsp", "Entering list portals scene, sending list_sd command");
+
+    // Send list_sd command to get HTML files
+    evil_esp_send_command(app, "list_sd");
+
+    // Show loading popup while waiting for response
+    evil_esp_show_loading(app, "Loading portals from SD...");
+    
+    // Store scene state to track timeout
+    scene_manager_set_scene_state(app->scene_manager, EvilEspSceneListPortals, furi_get_tick());
+}
+
+bool evil_esp_scene_on_event_list_portals(void* context, SceneManagerEvent event) {
+    EvilEspApp* app = context;
+    
+    // Log every event call for debugging
+    static uint32_t event_counter = 0;
+    event_counter++;
+    
+    uint32_t portal_scan_start = scene_manager_get_scene_state(app->scene_manager, EvilEspSceneListPortals);
+    uint32_t elapsed = furi_get_tick() - portal_scan_start;
+
+    // Log state every 10 events
+    if(event_counter % 10 == 0) {
+        FURI_LOG_I("EvilEsp", "[Portal Scene] Event #%lu: type=%u, event=%lu, scan_in_progress=%d, count=%u, elapsed=%lu ms",
+                   event_counter, (unsigned)event.type, event.event, 
+                   app->portal_scan_in_progress, app->portal_count, elapsed);
+    }
+
+    // Handle portal scan completion event
+    if(event.type == SceneManagerEventTypeCustom) {
+        FURI_LOG_I("EvilEsp", "[Portal Scene] Custom event: %lu (PortalScanComplete=%d)", 
+                   event.event, EvilEspEventPortalScanComplete);
+        
+        if(event.event == EvilEspEventPortalScanComplete) {
+            FURI_LOG_I("EvilEsp", "[Portal Scene] Portal scan complete! count=%u", app->portal_count);
+            // Portals loaded - show menu
+            evil_esp_hide_loading(app);
+            
+            if(app->portal_count == 0) {
+                // No portals found
+                FURI_LOG_W("EvilEsp", "[Portal Scene] No portals found, showing popup");
+                evil_esp_show_popup(app, "No Portals", "No HTML files found on SD card");
+                return true;
+            }
+            
+            submenu_reset(app->submenu);
+            submenu_set_header(app->submenu, "Select Portal");
+
+            // Add portal items to menu
+            for(uint8_t i = 0; i < app->portal_count; i++) {
+                char menu_text[80];
+                snprintf(menu_text, sizeof(menu_text), "%d. %s", 
+                         app->portals[i].index, 
+                         app->portals[i].filename);
+                submenu_add_item(app->submenu, menu_text, i, evil_esp_submenu_callback_portals, app);
+                FURI_LOG_I("EvilEsp", "[Portal Scene] Added menu item: %s", menu_text);
+            }
+
+            view_dispatcher_switch_to_view(app->view_dispatcher, EvilEspViewMainMenu);
+            return true;
+        }
+        
+        // Handle portal selection
+        if(event.event < 100 && event.event < app->portal_count) {
+            // Send select_html command with the portal index
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "select_html %d", app->portals[event.event].index);
+            evil_esp_send_command(app, cmd);
+            
+            FURI_LOG_I("EvilEsp", "[Portal Scene] Selected portal %lu, going to attacks", event.event);
+            // Go to attacks menu
+            scene_manager_next_scene(app->scene_manager, EvilEspSceneAttacks);
+            return true;
+        }
+    }
+
+    // Check timeout - this might not be called often when showing popup!
+    if(app->portal_scan_in_progress && elapsed > 10000) {
+        // Timeout - show error
+        FURI_LOG_W("EvilEsp", "[Portal Scene] TIMEOUT after %lu ms! scan_in_progress=%d, count=%u", 
+                   elapsed, app->portal_scan_in_progress, app->portal_count);
+        evil_esp_hide_loading(app);
+        evil_esp_show_popup(app, "Timeout", "No response from ESP32.\nCheck UART connection.");
+        app->portal_scan_in_progress = false;
+        return true;
+    }
+
+    return false;
+}
+
+void evil_esp_scene_on_exit_list_portals(void* context) {
+    EvilEspApp* app = context;
+    submenu_reset(app->submenu);
+    evil_esp_hide_loading(app);
+    
+    // Reset portal scan state
+    app->portal_scan_in_progress = false;
+    app->portal_count = 0;
 }

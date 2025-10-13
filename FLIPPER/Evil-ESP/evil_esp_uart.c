@@ -17,6 +17,7 @@ static void handle_data_response(EvilEspUartWorker* worker, const char* line);
 static void handle_hop_response(EvilEspUartWorker* worker, const char* line);
 static void handle_generic_response(EvilEspUartWorker* worker, const char* line);
 static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line);
+static void parse_portal_line(EvilEspUartWorker* worker, const char* line);
 static bool is_command_echo(EvilEspUartWorker* worker, const char* line);
 static void store_sent_command(EvilEspUartWorker* worker, const char* command);
 
@@ -31,6 +32,8 @@ struct EvilEspUartWorker {
     uint32_t command_timestamps[MAX_RECENT_COMMANDS];
     int recent_command_index;
     char* line_buffer; // Move line buffer to heap to reduce stack usage
+    bool portal_list_active; // Flag to indicate we're parsing portal list
+    uint32_t portal_list_last_line_time; // Timestamp of last line during portal parsing
 };
 
 static EvilEspUartWorker* uart_worker = NULL;
@@ -60,16 +63,47 @@ static int32_t uart_worker_thread(void* context) {
         uint8_t byte;
         size_t received = furi_stream_buffer_receive(worker->rx_stream, &byte, 1, 100);
 
+        // Check portal list timeout (2 seconds without new data)
+        if(worker->portal_list_active && worker->app) {
+            uint32_t elapsed = furi_get_tick() - worker->portal_list_last_line_time;
+            if(elapsed > 2000) {
+                FURI_LOG_W("EvilEsp", "[UART Parser] !!! PORTAL LIST TIMEOUT after %lu ms without new data !!!", elapsed);
+                FURI_LOG_I("EvilEsp", "[UART Parser] Auto-ending portal list with %u portals", worker->app->portal_count);
+                
+                worker->portal_list_active = false;
+                worker->app->portal_scan_in_progress = false;
+                
+                if(worker->app->portal_count > 0) {
+                    FURI_LOG_I("EvilEsp", "[UART Parser] Sending EvilEspEventPortalScanComplete (timeout, %u portals)", worker->app->portal_count);
+                    if(worker->app->view_dispatcher) {
+                        view_dispatcher_send_custom_event(worker->app->view_dispatcher, EvilEspEventPortalScanComplete);
+                    }
+                } else {
+                    FURI_LOG_W("EvilEsp", "[UART Parser] Timeout with 0 portals - sending completion anyway");
+                    if(worker->app->view_dispatcher) {
+                        view_dispatcher_send_custom_event(worker->app->view_dispatcher, EvilEspEventPortalScanComplete);
+                    }
+                }
+            }
+        }
+
         if(received > 0) {
             // Handle incoming byte
             if(byte == '\n' || byte == '\r') {
                 if(line_pos > 0) {
                     line_buffer[line_pos] = '\0';
 
-                    // Skip empty lines and filter WebUI spam
+                    // Skip empty lines UNLESS we're parsing portals (empty line = end marker)
                     if(strlen(line_buffer) == 0) {
-                        line_pos = 0;
-                        continue;
+                        if(worker->portal_list_active) {
+                            FURI_LOG_I("EvilEsp", "[UART Parser] !!!! EMPTY LINE while portal_list_active - this is END MARKER !!!!");
+                            // DON'T skip - let it be processed as end marker below
+                            // Fall through to portal list parsing code
+                        } else {
+                            // Normal case: skip empty lines
+                            line_pos = 0;
+                            continue;
+                        }
                     }
 
                     // Filter out WebUI spam patterns to reduce log noise
@@ -90,6 +124,84 @@ static int32_t uart_worker_thread(void* context) {
                     
                     // ALWAYS log to SD card for debugging
                     debug_write_to_sd(line_buffer);
+
+                    // Check for portal list start
+                    if(strstr(line_buffer, "HTML files found on SD card:") != NULL) {
+                        if(worker->app) {
+                            worker->app->portal_count = 0;
+                            memset(worker->app->portals, 0, sizeof(worker->app->portals));
+                            worker->portal_list_active = true;
+                            worker->portal_list_last_line_time = furi_get_tick();
+                            FURI_LOG_I("EvilEsp", "[UART Parser] *** PORTAL LIST START *** Line: '%s'", line_buffer);
+                            FURI_LOG_I("EvilEsp", "[UART Parser] portal_list_active=TRUE, waiting for portal entries...");
+                        }
+                    } else if(strstr(line_buffer, "list_sd") != NULL) {
+                        FURI_LOG_I("EvilEsp", "[UART Parser] Detected list_sd in line: '%s'", line_buffer);
+                    }
+                    
+                    // Handle portal list parsing
+                    if(worker->portal_list_active && worker->app) {
+                        // Update timestamp - we got a line
+                        worker->portal_list_last_line_time = furi_get_tick();
+                        
+                        FURI_LOG_D("EvilEsp", "[UART Parser] Portal list active, checking line: '%s'", line_buffer);
+                        
+                        // Skip the header line itself
+                        if(strstr(line_buffer, "HTML files found") != NULL) {
+                            // Just skip, keep portal_list_active true
+                            FURI_LOG_I("EvilEsp", "[UART Parser] Skipping header line");
+                        }
+                        // Check if this looks like a portal line (starts with digit)
+                        else if(line_buffer[0] >= '0' && line_buffer[0] <= '9') {
+                            // Only parse if there's actually content after the number
+                            const char* p = line_buffer;
+                            while(*p >= '0' && *p <= '9') p++;
+                            while(*p == ' ' || *p == '\t') p++;
+                            
+                            if(*p != '\0' && strlen(p) > 0) {
+                                FURI_LOG_I("EvilEsp", "[UART Parser] Parsing portal entry: '%s'", line_buffer);
+                                parse_portal_line(worker, line_buffer);
+                                FURI_LOG_I("EvilEsp", "[UART Parser] Total portals so far: %u", worker->app->portal_count);
+                            } else {
+                                FURI_LOG_W("EvilEsp", "[UART Parser] Portal line has no filename: '%s'", line_buffer);
+                            }
+                        } 
+                        // End of portal list if we get a non-portal line
+                        else if(strlen(line_buffer) == 0 || 
+                                line_buffer[0] == '>' || 
+                                line_buffer[0] == '\r' || 
+                                line_buffer[0] == '\n') {
+                            // Empty line or prompt = end of list
+                            FURI_LOG_I("EvilEsp", "[UART Parser] *** END MARKER DETECTED *** (empty/prompt line)");
+                            if(worker->app->portal_count > 0) {
+                                worker->portal_list_active = false;
+                                worker->app->portal_scan_in_progress = false;
+                                FURI_LOG_I("EvilEsp", "[UART Parser] *** PORTAL LIST END: %d portals found ***", worker->app->portal_count);
+                                FURI_LOG_I("EvilEsp", "[UART Parser] Sending EvilEspEventPortalScanComplete (value=%d)", EvilEspEventPortalScanComplete);
+                                // Send event to update portal list scene
+                                if(worker->app->view_dispatcher) {
+                                    view_dispatcher_send_custom_event(worker->app->view_dispatcher, EvilEspEventPortalScanComplete);
+                                    FURI_LOG_I("EvilEsp", "[UART Parser] Event sent successfully!");
+                                } else {
+                                    FURI_LOG_E("EvilEsp", "[UART Parser] ERROR: view_dispatcher is NULL!");
+                                }
+                            } else {
+                                // No portals found yet, but got empty line - might be end
+                                FURI_LOG_W("EvilEsp", "[UART Parser] Empty line but no portals found yet, ending anyway");
+                                // Send completion event anyway to show "no portals" message
+                                worker->portal_list_active = false;
+                                worker->app->portal_scan_in_progress = false;
+                                FURI_LOG_I("EvilEsp", "[UART Parser] Sending completion event (0 portals)");
+                                if(worker->app->view_dispatcher) {
+                                    view_dispatcher_send_custom_event(worker->app->view_dispatcher, EvilEspEventPortalScanComplete);
+                                }
+                            }
+                        }
+                        else {
+                            // Some other line that doesn't look like a portal
+                            FURI_LOG_W("EvilEsp", "[UART Parser] Unexpected line in portal mode: '%s'", line_buffer);
+                        }
+                    }
 
                     // Check for scan start/completion messages FIRST (before any other processing)
                     // Scan start: "WiFi scan completed", "Found X networks", "Retrieved X network records"
@@ -168,8 +280,9 @@ static int32_t uart_worker_thread(void* context) {
                     if(worker->app) {
                         evil_esp_append_log(worker->app, line_buffer);
 
-                        // Send immediate UI update for every line (no rate limiting for better responsiveness)
-                        if(worker->app->view_dispatcher) {
+                        // Send immediate UI update for every line UNLESS we're parsing portals
+                        // (to avoid flooding the portal scene with refresh events)
+                        if(worker->app->view_dispatcher && !worker->portal_list_active) {
                             // Simply send refresh event - the scene handler will ignore it if not in UART terminal
                             view_dispatcher_send_custom_event(worker->app->view_dispatcher, EvilEspEventUartTerminalRefresh);
                         }
@@ -451,6 +564,53 @@ static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line) 
         network->channel, network->auth, network->rssi,
         (network->band == EvilEspBand5GHz) ? "5GHz" : "2.4GHz");
 }
+
+// Parse portal line from list_sd output
+// Format: "1 1EXA~145.HTM" or "2 PortalX.HTM"
+static void parse_portal_line(EvilEspUartWorker* worker, const char* line) {
+    if(!worker || !worker->app) return;
+    if(worker->app->portal_count >= EVIL_ESP_MAX_PORTALS) return;
+
+    // Skip leading whitespace
+    const char* pos = line;
+    while(*pos == ' ' || *pos == '\t') pos++;
+
+    // Parse index number
+    char index_str[16];
+    int idx_len = 0;
+    while(*pos >= '0' && *pos <= '9' && idx_len < 15) {
+        index_str[idx_len++] = *pos++;
+    }
+    index_str[idx_len] = '\0';
+
+    if(idx_len == 0) {
+        FURI_LOG_W("EvilEsp", "Failed to parse portal index from: %s", line);
+        return;
+    }
+
+    int portal_index = atoi(index_str);
+
+    // Skip whitespace after index
+    while(*pos == ' ' || *pos == '\t') pos++;
+
+    // The rest is the filename
+    if(strlen(pos) == 0) {
+        FURI_LOG_W("EvilEsp", "No filename found in portal line: %s", line);
+        return;
+    }
+
+    // Store portal
+    EvilEspPortal* portal = &worker->app->portals[worker->app->portal_count];
+    portal->index = portal_index;
+    strncpy(portal->filename, pos, sizeof(portal->filename) - 1);
+    portal->filename[sizeof(portal->filename) - 1] = '\0';
+
+    worker->app->portal_count++;
+
+    FURI_LOG_I("EvilEsp", "Parsed portal[%d]: index=%d, filename='%s'",
+               worker->app->portal_count - 1, portal_index, portal->filename);
+}
+
 /*
 static void parse_scan_result_line(EvilEspUartWorker* worker, const char* line) {
     if(!worker || !worker->app) return;
@@ -555,6 +715,8 @@ EvilEspUartWorker* evil_esp_uart_init(EvilEspApp* app) {
     worker->recent_command_index = 0;
     memset(worker->recent_commands, 0, sizeof(worker->recent_commands));
     memset(worker->command_timestamps, 0, sizeof(worker->command_timestamps));
+    worker->portal_list_active = false;
+    worker->portal_list_last_line_time = 0;
 
     // Allocate line buffer on heap to reduce stack usage
     worker->line_buffer = malloc(4096); // Larger buffer for WebUI data
