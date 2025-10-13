@@ -27,8 +27,14 @@ typedef enum {
     MenuStateItems,
 } MenuState;
 #ifndef FAP_VERSION_TEXT
-#define FAP_VERSION_TEXT "01"
+#ifdef FAP_VERSION
+#define FAP_VERSION_TEXT FAP_VERSION
+#else
+#define FAP_VERSION_TEXT "0.1"
 #endif
+#endif
+
+#define LAB_C5_VERSION_TEXT FAP_VERSION_TEXT
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -58,13 +64,20 @@ typedef enum {
 #define RESULT_TEXT_X 9
 #define RESULT_SCROLL_WIDTH 3
 #define RESULT_SCROLL_GAP 1
+#define MENU_SECTION_SCANNER 0
+#define MENU_SECTION_SNIFFERS 1
+#define MENU_SECTION_TARGETS 2
 #define MENU_SECTION_ATTACKS 3
+#define MENU_SECTION_SETUP 4
 #define SCANNER_FILTER_VISIBLE_COUNT 3
+#define SCANNER_SCAN_COMMAND "scan_networks"
+#define TARGETS_RESULTS_COMMAND "show_scan_results"
 #define LAB_C5_CONFIG_DIR_PATH "apps_assets/labC5"
 #define LAB_C5_CONFIG_FILE_PATH LAB_C5_CONFIG_DIR_PATH "/config.txt"
 
 typedef enum {
     MenuActionCommand,
+    MenuActionCommandWithTargets,
     MenuActionResults,
     MenuActionToggleBacklight,
     MenuActionOpenScannerSetup,
@@ -160,6 +173,7 @@ static void simple_app_load_config(SimpleApp* app);
 static void simple_app_show_status_message(SimpleApp* app, const char* message, uint32_t duration_ms, bool fullscreen);
 static void simple_app_clear_status_message(SimpleApp* app);
 static bool simple_app_status_message_is_active(SimpleApp* app);
+static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command);
 
 typedef struct {
     const char* label;
@@ -179,11 +193,6 @@ static const uint8_t image_icon_0_bits[] = {
     0x1d, 0x03, 0x71, 0x03, 0x1f, 0x03, 0xff, 0x03, 0xff, 0x03,
 };
 
-static const MenuEntry menu_entries_scanners[] = {
-    {"Scan Networks", "scan_networks", MenuActionCommand},
-    {"Results", "show_scan_results", MenuActionResults},
-};
-
 static const MenuEntry menu_entries_sniffers[] = {
     {"Start Sniffer", "start_sniffer", MenuActionCommand},
     {"Show Sniffer Results", "show_sniffer_results", MenuActionCommand},
@@ -191,12 +200,8 @@ static const MenuEntry menu_entries_sniffers[] = {
     {"Sniffer Debug", "sniffer_debug 1", MenuActionCommand},
 };
 
-static const MenuEntry menu_entries_targets[] = {
-    {"Select Networks", "select_networks 0 1", MenuActionCommand},
-};
-
 static const MenuEntry menu_entries_attacks[] = {
-    {"Start Deauth", "start_deauth", MenuActionCommand},
+    {"Start Deauth", "start_deauth", MenuActionCommandWithTargets},
     {"Start Evil Twin", "start_evil_twin", MenuActionCommand},
     {"SAE Overflow", "sae_overflow", MenuActionCommand},
     {"Start Wardrive", "start_wardrive", MenuActionCommand},
@@ -210,9 +215,9 @@ static const MenuEntry menu_entries_setup[] = {
 };
 
 static const MenuSection menu_sections[] = {
-    {"Scanner", menu_entries_scanners, sizeof(menu_entries_scanners) / sizeof(menu_entries_scanners[0]), 12},
+    {"Scanner", NULL, 0, 12},
     {"Sniffers", menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24},
-    {"Targets", menu_entries_targets, sizeof(menu_entries_targets) / sizeof(menu_entries_targets[0]), 36},
+    {"Targets", NULL, 0, 36},
     {"Attacks", menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48},
     {"Setup", menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60},
 };
@@ -1112,6 +1117,43 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     }
 }
 
+static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command) {
+    if(!app || !base_command || base_command[0] == '\0') return;
+    if(app->scan_selected_count == 0) {
+        simple_app_show_status_message(app, "Select targets first", 1500, false);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    char command[96];
+    size_t written = snprintf(command, sizeof(command), "%s", base_command);
+    if(written >= sizeof(command)) {
+        command[sizeof(command) - 1] = '\0';
+        written = strlen(command);
+    }
+
+    for(size_t i = 0; i < app->scan_selected_count && written < sizeof(command) - 1; i++) {
+        int added = snprintf(
+            command + written,
+            sizeof(command) - written,
+            " %u",
+            (unsigned)app->scan_selected_numbers[i]);
+        if(added < 0) {
+            break;
+        }
+        written += (size_t)added;
+        if(written >= sizeof(command)) {
+            written = sizeof(command) - 1;
+            command[written] = '\0';
+            break;
+        }
+    }
+
+    simple_app_send_command(app, command, true);
+}
+
 static void simple_app_send_stop_if_needed(SimpleApp* app) {
     if(!app || !app->last_command_sent) return;
     simple_app_send_command(app, "stop", false);
@@ -1139,13 +1181,9 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     if(simple_app_status_message_is_active(app) && !app->status_message_fullscreen) {
         canvas_draw_str(canvas, 2, 52, app->status_message);
     }
-    char version_text[16];
-    snprintf(version_text, sizeof(version_text), "v.%s", FAP_VERSION_TEXT);
-    size_t version_len = strlen(version_text);
-    uint8_t version_width = (version_len < 21) ? (uint8_t)(version_len * 6) : DISPLAY_WIDTH;
-    uint8_t version_x =
-        (version_width < DISPLAY_WIDTH) ? (uint8_t)(DISPLAY_WIDTH - version_width - 2) : 0;
-    canvas_draw_str(canvas, version_x, 62, version_text);
+    char version_text[24];
+    snprintf(version_text, sizeof(version_text), "v.%s", LAB_C5_VERSION_TEXT);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 1, 63, AlignRight, AlignBottom, version_text);
 
     if(app->section_index >= menu_section_count) {
         app->section_index = 0;
@@ -1177,7 +1215,13 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     canvas_set_font(canvas, FontSecondary);
 
     if(section->entry_count == 0) {
-        canvas_draw_str(canvas, 3, 30, "Coming soon");
+        const char* hint = "No options";
+        if(app->section_index == MENU_SECTION_SCANNER) {
+            hint = "OK: Scan networks";
+        } else if(app->section_index == MENU_SECTION_TARGETS) {
+            hint = "OK: Show results";
+        }
+        canvas_draw_str(canvas, 3, 30, hint);
         return;
     }
 
@@ -1623,6 +1667,14 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         }
     } else if(key == InputKeyOk) {
         if(app->menu_state == MenuStateSections) {
+            if(app->section_index == MENU_SECTION_SCANNER) {
+                simple_app_send_command(app, SCANNER_SCAN_COMMAND, true);
+                view_port_update(app->viewport);
+                return;
+            } else if(app->section_index == MENU_SECTION_TARGETS) {
+                simple_app_request_scan_results(app, TARGETS_RESULTS_COMMAND);
+                return;
+            }
             app->menu_state = MenuStateItems;
             app->item_index = 0;
             app->item_offset = 0;
@@ -1639,6 +1691,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         const MenuEntry* entry = &section->entries[app->item_index];
         if(entry->action == MenuActionResults) {
             simple_app_request_scan_results(app, entry->command);
+        } else if(entry->action == MenuActionCommandWithTargets) {
+            simple_app_send_command_with_targets(app, entry->command);
         } else if(entry->action == MenuActionCommand) {
             if(entry->command && entry->command[0] != '\0') {
                 simple_app_send_command(app, entry->command, true);
