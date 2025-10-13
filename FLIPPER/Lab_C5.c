@@ -20,6 +20,7 @@ typedef enum {
     ScreenSerial,
     ScreenResults,
     ScreenSetupScanner,
+    ScreenConsole,
 } AppScreen;
 
 typedef enum {
@@ -51,6 +52,7 @@ typedef enum {
 #define SERIAL_BUFFER_SIZE 4096
 #define UART_STREAM_SIZE 1024
 #define MENU_VISIBLE_COUNT 6
+#define MENU_VISIBLE_COUNT_SNIFFERS 3
 #define SERIAL_VISIBLE_LINES 6
 #define SERIAL_LINE_CHAR_LIMIT 22
 #define SERIAL_TEXT_LINE_HEIGHT 10
@@ -64,6 +66,7 @@ typedef enum {
 #define RESULT_TEXT_X 9
 #define RESULT_SCROLL_WIDTH 3
 #define RESULT_SCROLL_GAP 1
+#define CONSOLE_VISIBLE_LINES 4
 #define MENU_SECTION_SCANNER 0
 #define MENU_SECTION_SNIFFERS 1
 #define MENU_SECTION_TARGETS 2
@@ -81,6 +84,7 @@ typedef enum {
     MenuActionResults,
     MenuActionToggleBacklight,
     MenuActionOpenScannerSetup,
+    MenuActionOpenConsole,
 } MenuAction;
 
 typedef enum {
@@ -123,6 +127,7 @@ typedef struct {
     size_t serial_len;
     size_t serial_scroll;
     bool serial_follow_tail;
+    bool serial_targets_hint;
     bool last_command_sent;
     ScanResult scan_results[MAX_SCAN_RESULTS];
     size_t scan_result_count;
@@ -174,6 +179,12 @@ static void simple_app_show_status_message(SimpleApp* app, const char* message, 
 static void simple_app_clear_status_message(SimpleApp* app);
 static bool simple_app_status_message_is_active(SimpleApp* app);
 static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command);
+static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t section_index);
+static size_t simple_app_render_display_lines(
+    SimpleApp* app,
+    size_t skip_lines,
+    char dest[][64],
+    size_t max_lines);
 
 typedef struct {
     const char* label;
@@ -212,6 +223,7 @@ static char menu_label_backlight[24] = "Backlight: On";
 static const MenuEntry menu_entries_setup[] = {
     {menu_label_backlight, NULL, MenuActionToggleBacklight},
     {"Scanner Filters", NULL, MenuActionOpenScannerSetup},
+    {"Console", NULL, MenuActionOpenConsole},
 };
 
 static const MenuSection menu_sections[] = {
@@ -223,6 +235,14 @@ static const MenuSection menu_sections[] = {
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
+
+static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t section_index) {
+    UNUSED(app);
+    if(section_index == MENU_SECTION_SNIFFERS) {
+        return MENU_VISIBLE_COUNT_SNIFFERS;
+    }
+    return MENU_VISIBLE_COUNT;
+}
 
 static void simple_app_truncate_text(char* text, size_t max_chars) {
     if(!text || max_chars == 0) return;
@@ -1059,6 +1079,7 @@ static void simple_app_reset_serial_log(SimpleApp* app, const char* status) {
     furi_mutex_release(app->serial_mutex);
     app->serial_scroll = 0;
     app->serial_follow_tail = true;
+    app->serial_targets_hint = false;
     simple_app_update_scroll(app);
 }
 
@@ -1075,6 +1096,22 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         app->serial_buffer[app->serial_len++] = (char)data[i];
     }
     app->serial_buffer[app->serial_len] = '\0';
+
+    if(!app->serial_targets_hint) {
+        static const char hint_phrase[] = "Scan results printed.";
+        size_t phrase_len = strlen(hint_phrase);
+        if(app->serial_len >= phrase_len) {
+            size_t search_window = phrase_len + 64;
+            if(search_window > app->serial_len) {
+                search_window = app->serial_len;
+            }
+            const char* start = app->serial_buffer + (app->serial_len - search_window);
+            if(strstr(start, hint_phrase) != NULL) {
+                app->serial_targets_hint = true;
+            }
+        }
+    }
+
     furi_mutex_release(app->serial_mutex);
 
     for(size_t i = 0; i < length; i++) {
@@ -1093,6 +1130,8 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
 
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial) {
     if(!app || !command || command[0] == '\0') return;
+
+    app->serial_targets_hint = false;
 
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "%s\n", command);
@@ -1120,9 +1159,48 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
 static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command) {
     if(!app || !base_command || base_command[0] == '\0') return;
     if(app->scan_selected_count == 0) {
-        simple_app_show_status_message(app, "Select targets first", 1500, false);
+        simple_app_show_status_message(app, "Please select\nnetwork first", 1500, true);
         if(app->viewport) {
             view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(strcmp(base_command, "start_deauth") == 0) {
+        char select_command[160];
+        size_t written = snprintf(select_command, sizeof(select_command), "select_networks");
+        if(written >= sizeof(select_command)) {
+            select_command[sizeof(select_command) - 1] = '\0';
+            written = strlen(select_command);
+        }
+
+        for(size_t i = 0; i < app->scan_selected_count && written < sizeof(select_command) - 1; i++) {
+            int added = snprintf(
+                select_command + written,
+                sizeof(select_command) - written,
+                " %u",
+                (unsigned)app->scan_selected_numbers[i]);
+            if(added < 0) {
+                break;
+            }
+            written += (size_t)added;
+            if(written >= sizeof(select_command)) {
+                written = sizeof(select_command) - 1;
+                select_command[written] = '\0';
+                break;
+            }
+        }
+
+        char combined_command[256];
+        int combined_written =
+            snprintf(combined_command, sizeof(combined_command), "%s\n%s", select_command, base_command);
+        if(combined_written < 0) {
+            simple_app_send_command(app, base_command, true);
+        } else {
+            if((size_t)combined_written >= sizeof(combined_command)) {
+                combined_command[sizeof(combined_command) - 1] = '\0';
+            }
+            simple_app_send_command(app, combined_command, true);
         }
         return;
     }
@@ -1164,11 +1242,168 @@ static void simple_app_request_scan_results(SimpleApp* app, const char* command)
     if(!app) return;
     simple_app_reset_scan_results(app);
     app->scan_results_loading = true;
+    app->serial_targets_hint = false;
     if(command && command[0] != '\0') {
         simple_app_send_command(app, command, false);
     }
     app->screen = ScreenResults;
     view_port_update(app->viewport);
+}
+
+static void simple_app_console_enter(SimpleApp* app) {
+    if(!app) return;
+    app->screen = ScreenConsole;
+    app->serial_follow_tail = true;
+    simple_app_update_scroll(app);
+    view_port_update(app->viewport);
+}
+
+static void simple_app_console_leave(SimpleApp* app) {
+    if(!app) return;
+    app->screen = ScreenMenu;
+    app->menu_state = MenuStateItems;
+    app->section_index = MENU_SECTION_SETUP;
+    app->item_index = menu_sections[MENU_SECTION_SETUP].entry_count - 1;
+    size_t visible_count = simple_app_menu_visible_count(app, MENU_SECTION_SETUP);
+    if(visible_count == 0) visible_count = 1;
+    if(menu_sections[MENU_SECTION_SETUP].entry_count > visible_count) {
+        size_t max_offset = menu_sections[MENU_SECTION_SETUP].entry_count - visible_count;
+        app->item_offset = max_offset;
+    } else {
+        app->item_offset = 0;
+    }
+    app->serial_follow_tail = true;
+    simple_app_update_scroll(app);
+    view_port_update(app->viewport);
+}
+
+static void simple_app_draw_console(SimpleApp* app, Canvas* canvas) {
+    if(!app) return;
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    char display_lines[CONSOLE_VISIBLE_LINES][64];
+    size_t lines_filled =
+        simple_app_render_display_lines(app, app->serial_scroll, display_lines, CONSOLE_VISIBLE_LINES);
+    uint8_t y = 8;
+    for(size_t i = 0; i < CONSOLE_VISIBLE_LINES; i++) {
+        const char* line = (i < lines_filled) ? display_lines[i] : "";
+        if(lines_filled == 0 && i == 0) {
+            canvas_draw_str(canvas, 2, y, "No UART data");
+        } else {
+            canvas_draw_str(canvas, 2, y, line[0] ? line : " ");
+        }
+        y += SERIAL_TEXT_LINE_HEIGHT;
+    }
+
+    size_t total_lines = simple_app_total_display_lines(app);
+    if(total_lines > CONSOLE_VISIBLE_LINES) {
+        const uint8_t track_width = 3;
+        const uint8_t track_x = DISPLAY_WIDTH - track_width;
+        const uint8_t track_y = 4;
+        const uint8_t track_height = 56;
+
+        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
+        canvas_draw_box(canvas, track_x + 1, track_y + 1, 1, 1);
+        canvas_draw_box(canvas, track_x + 1, track_y + track_height - 2, 1, 1);
+
+        size_t max_scroll = simple_app_max_scroll(app);
+        uint8_t thumb_height =
+            (uint8_t)(((uint32_t)CONSOLE_VISIBLE_LINES * track_height) / total_lines);
+        if(thumb_height < 4) thumb_height = 4;
+        if(thumb_height > track_height) thumb_height = track_height;
+
+        uint8_t thumb_track_top = track_y;
+        uint8_t thumb_track_height = track_height;
+        uint8_t thumb_width = (track_width > 2) ? (track_width - 2) : 1;
+        uint8_t thumb_x = (track_width > 2) ? (track_x + 1) : track_x;
+
+        if(track_width > 2 && track_height > 2) {
+            thumb_track_top = track_y + 1;
+            thumb_track_height = track_height - 2;
+        }
+
+        if(thumb_height > thumb_track_height) {
+            thumb_height = thumb_track_height;
+        }
+
+        uint8_t max_thumb_offset =
+            (thumb_track_height > thumb_height) ? (thumb_track_height - thumb_height) : 0;
+        uint8_t thumb_offset = 0;
+        if(max_scroll > 0 && max_thumb_offset > 0) {
+            thumb_offset = (uint8_t)(((uint32_t)app->serial_scroll * max_thumb_offset) / max_scroll);
+        }
+
+        uint8_t thumb_y = thumb_track_top + thumb_offset;
+        canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_height);
+    }
+
+    if(simple_app_status_message_is_active(app) && !app->status_message_fullscreen) {
+        canvas_draw_str(canvas, 2, 52, app->status_message);
+    }
+
+    canvas_draw_str(canvas, 2, 62, "Back=Exit  Up/Down scroll");
+}
+
+static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack) {
+        simple_app_send_stop_if_needed(app);
+        simple_app_console_leave(app);
+        return;
+    }
+
+    if(key == InputKeyUp) {
+        if(app->serial_scroll > 0) {
+            app->serial_scroll--;
+            app->serial_follow_tail = false;
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyLeft) {
+        size_t step = CONSOLE_VISIBLE_LINES;
+        if(app->serial_scroll > 0) {
+            if(app->serial_scroll > step) {
+                app->serial_scroll -= step;
+            } else {
+                app->serial_scroll = 0;
+            }
+            app->serial_follow_tail = false;
+        }
+        view_port_update(app->viewport);
+        return;
+    } else if(key == InputKeyRight) {
+        size_t step = CONSOLE_VISIBLE_LINES;
+        size_t max_scroll = simple_app_max_scroll(app);
+        if(app->serial_scroll < max_scroll) {
+            app->serial_scroll =
+                (app->serial_scroll + step < max_scroll) ? app->serial_scroll + step : max_scroll;
+            app->serial_follow_tail = (app->serial_scroll == max_scroll);
+        } else {
+            app->serial_follow_tail = true;
+            simple_app_update_scroll(app);
+        }
+        view_port_update(app->viewport);
+        return;
+    } else if(key == InputKeyDown) {
+        size_t max_scroll = simple_app_max_scroll(app);
+        if(app->serial_scroll < max_scroll) {
+            app->serial_scroll++;
+            app->serial_follow_tail = (app->serial_scroll == max_scroll);
+            view_port_update(app->viewport);
+        } else {
+            app->serial_follow_tail = true;
+            simple_app_update_scroll(app);
+            view_port_update(app->viewport);
+        }
+        return;
+    } else if(key == InputKeyOk) {
+        app->serial_follow_tail = true;
+        simple_app_update_scroll(app);
+        view_port_update(app->viewport);
+    }
 }
 static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     canvas_set_color(canvas, ColorBlack);
@@ -1214,6 +1449,11 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
 
     canvas_set_font(canvas, FontSecondary);
 
+    size_t visible_count = simple_app_menu_visible_count(app, app->section_index);
+    if(visible_count == 0) {
+        visible_count = 1;
+    }
+
     if(section->entry_count == 0) {
         const char* hint = "No options";
         if(app->section_index == MENU_SECTION_SCANNER) {
@@ -1229,13 +1469,20 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
         app->item_index = section->entry_count - 1;
     }
 
+    size_t max_offset = 0;
+    if(section->entry_count > visible_count) {
+        max_offset = section->entry_count - visible_count;
+    }
+    if(app->item_offset > max_offset) {
+        app->item_offset = max_offset;
+    }
     if(app->item_index < app->item_offset) {
         app->item_offset = app->item_index;
-    } else if(app->item_index >= app->item_offset + MENU_VISIBLE_COUNT) {
-        app->item_offset = app->item_index - MENU_VISIBLE_COUNT + 1;
+    } else if(app->item_index >= app->item_offset + visible_count) {
+        app->item_offset = app->item_index - visible_count + 1;
     }
 
-    for(uint32_t i = 0; i < MENU_VISIBLE_COUNT; i++) {
+    for(uint32_t i = 0; i < visible_count; i++) {
         uint32_t idx = app->item_offset + i;
         if(idx >= section->entry_count) break;
         uint8_t y = 28 + i * 12;
@@ -1246,6 +1493,30 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
         } else {
             canvas_draw_str(canvas, 8, y, section->entries[idx].label);
         }
+    }
+
+    if(section->entry_count > visible_count) {
+        const uint8_t track_width = 3;
+        const uint8_t track_height = (uint8_t)(visible_count * 12);
+        const uint8_t track_x = DISPLAY_WIDTH - track_width;
+        const uint8_t track_y = 18;
+        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
+        uint8_t thumb_height =
+            (uint8_t)(((uint32_t)visible_count * track_height) / section->entry_count);
+        if(thumb_height < 4) thumb_height = 4;
+        if(thumb_height > track_height) thumb_height = track_height;
+        uint8_t max_thumb_offset =
+            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
+        uint8_t thumb_offset = 0;
+        if(max_offset > 0 && max_thumb_offset > 0) {
+            thumb_offset = (uint8_t)(((uint32_t)app->item_offset * max_thumb_offset) / max_offset);
+        }
+        uint8_t thumb_x = track_x + ((track_width > 2) ? 1 : 0);
+        uint8_t thumb_y = track_y + 1 + thumb_offset;
+        uint8_t thumb_inner_height = (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
+        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
+        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
+        canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_inner_height);
     }
 }
 
@@ -1361,6 +1632,10 @@ static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
 
         uint8_t thumb_y = thumb_track_top + thumb_offset;
         canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_height);
+    }
+
+    if(app->serial_targets_hint) {
+        canvas_draw_str(canvas, DISPLAY_WIDTH - 14, 62, "->");
     }
 }
 
@@ -1607,8 +1882,38 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     if(status_active && app->status_message_fullscreen) {
         canvas_set_color(canvas, ColorBlack);
         canvas_set_font(canvas, FontPrimary);
-        canvas_draw_str_aligned(
-            canvas, DISPLAY_WIDTH / 2, 32, AlignCenter, AlignCenter, app->status_message);
+        const char* message = app->status_message;
+        size_t line_count = 1;
+        for(const char* ptr = message; *ptr; ptr++) {
+            if(*ptr == '\n') {
+                line_count++;
+            }
+        }
+        const uint8_t line_height = 16;
+        int16_t first_line_y = 32;
+        if(line_count > 1) {
+            first_line_y -= (int16_t)((line_count - 1) * line_height) / 2;
+        }
+        const char* line_ptr = message;
+        char line_buffer[64];
+        for(size_t line_index = 0; line_index < line_count; line_index++) {
+            const char* next_break = strchr(line_ptr, '\n');
+            size_t line_length = next_break ? (size_t)(next_break - line_ptr) : strlen(line_ptr);
+            if(line_length >= sizeof(line_buffer)) {
+                line_length = sizeof(line_buffer) - 1;
+            }
+            memcpy(line_buffer, line_ptr, line_length);
+            line_buffer[line_length] = '\0';
+            canvas_draw_str_aligned(
+                canvas,
+                DISPLAY_WIDTH / 2,
+                first_line_y + (int16_t)(line_index * line_height),
+                AlignCenter,
+                AlignCenter,
+                line_buffer);
+            if(!next_break) break;
+            line_ptr = next_break + 1;
+        }
         return;
     }
     switch(app->screen) {
@@ -1623,6 +1928,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         break;
     case ScreenSetupScanner:
         simple_app_draw_setup_scanner(app, canvas);
+        break;
+    case ScreenConsole:
+        simple_app_draw_console(app, canvas);
         break;
     default:
         simple_app_draw_results(app, canvas);
@@ -1659,8 +1967,10 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             if(section->entry_count == 0) return;
             if(app->item_index + 1 < section->entry_count) {
                 app->item_index++;
-                if(app->item_index >= app->item_offset + MENU_VISIBLE_COUNT) {
-                    app->item_offset = app->item_index - MENU_VISIBLE_COUNT + 1;
+                size_t visible_count = simple_app_menu_visible_count(app, app->section_index);
+                if(visible_count == 0) visible_count = 1;
+                if(app->item_index >= app->item_offset + visible_count) {
+                    app->item_offset = app->item_index - visible_count + 1;
                 }
                 view_port_update(app->viewport);
             }
@@ -1678,6 +1988,14 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->menu_state = MenuStateItems;
             app->item_index = 0;
             app->item_offset = 0;
+            size_t visible_count = simple_app_menu_visible_count(app, app->section_index);
+            if(visible_count == 0) visible_count = 1;
+            if(menu_sections[app->section_index].entry_count > visible_count) {
+                size_t max_offset = menu_sections[app->section_index].entry_count - visible_count;
+                if(app->item_offset > max_offset) {
+                    app->item_offset = max_offset;
+                }
+            }
             view_port_update(app->viewport);
             return;
         }
@@ -1704,6 +2022,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->scanner_setup_index = 0;
             app->scanner_adjusting_power = false;
             app->scanner_view_offset = 0;
+        } else if(entry->action == MenuActionOpenConsole) {
+            simple_app_console_enter(app);
         }
 
         view_port_update(app->viewport);
@@ -1796,6 +2116,7 @@ static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) 
 static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
     if(key == InputKeyBack) {
         simple_app_send_stop_if_needed(app);
+        app->serial_targets_hint = false;
         app->screen = ScreenMenu;
         app->serial_follow_tail = true;
         simple_app_update_scroll(app);
@@ -1829,6 +2150,12 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
             view_port_update(app->viewport);
         }
     } else if(key == InputKeyRight) {
+        if(app->serial_targets_hint) {
+            app->serial_targets_hint = false;
+            simple_app_request_scan_results(app, TARGETS_RESULTS_COMMAND);
+            return;
+        }
+
         size_t step = SERIAL_VISIBLE_LINES;
         size_t max_scroll = simple_app_max_scroll(app);
         if(app->serial_scroll < max_scroll) {
@@ -1930,6 +2257,9 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenSetupScanner:
         simple_app_handle_setup_scanner_input(app, event->key);
         break;
+    case ScreenConsole:
+        simple_app_handle_console_input(app, event->key);
+        break;
     default:
         simple_app_handle_results_input(app, event->key);
         break;
@@ -1949,7 +2279,7 @@ static void simple_app_process_stream(SimpleApp* app) {
         updated = true;
     }
 
-    if(updated && app->screen == ScreenSerial) {
+    if(updated && (app->screen == ScreenSerial || app->screen == ScreenConsole)) {
         view_port_update(app->viewport);
     }
 }
