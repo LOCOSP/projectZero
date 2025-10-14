@@ -164,6 +164,7 @@ static target_bssid_t target_bssids[MAX_TARGET_BSSIDS];
 static int target_bssid_count = 0;
 static uint32_t last_channel_check_time = 0;
 static const uint32_t CHANNEL_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+static volatile bool periodic_rescan_in_progress = false; // Flag to suppress logs during periodic re-scans
 
 // SAE Overflow attack task
 static TaskHandle_t sae_attack_task_handle = NULL;
@@ -552,19 +553,27 @@ static void wifi_event_handler(void *event_handler_arg,
         }
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *e = (const wifi_event_sta_scan_done_t *)event_data;
-            MY_LOG_INFO(TAG, "WiFi scan completed. Found %u networks, status: %" PRIu32, e->number, e->status);
+            
+            if (!periodic_rescan_in_progress) {
+                MY_LOG_INFO(TAG, "WiFi scan completed. Found %u networks, status: %" PRIu32, e->number, e->status);
+            }
             
             if (e->status == 0) { // Success
                 g_scan_count = MAX_AP_CNT;
                 esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results);
-                MY_LOG_INFO(TAG, "Retrieved %u network records", g_scan_count);
                 
-                // Automatically display scan results after completion
-                if (g_scan_count > 0 && !sniffer_active) {
-                    print_scan_results();
+                if (!periodic_rescan_in_progress) {
+                    MY_LOG_INFO(TAG, "Retrieved %u network records", g_scan_count);
+                    
+                    // Automatically display scan results after completion
+                    if (g_scan_count > 0 && !sniffer_active) {
+                        print_scan_results();
+                    }
                 }
             } else {
-                MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
+                if (!periodic_rescan_in_progress) {
+                    MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
+                }
                 g_scan_count = 0;
             }
             
@@ -835,8 +844,6 @@ static void save_target_bssids(void) {
         target_bssid_count++;
     }
     
-    MY_LOG_INFO(TAG, "Saved %d target BSSIDs for channel monitoring", target_bssid_count);
-    
     // Debug: Print saved target BSSIDs
     for (int i = 0; i < target_bssid_count; ++i) {
         MY_LOG_INFO(TAG, "Target BSSID[%d]: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X, Channel: %d", 
@@ -853,12 +860,16 @@ static wifi_ap_record_t quick_scan_results[QUICK_SCAN_MAX_APS];
 
 // Quick channel scan for target BSSIDs
 static esp_err_t quick_channel_scan(void) {
-    MY_LOG_INFO(TAG, "Starting quick channel scan for target BSSIDs...");
+    if (!periodic_rescan_in_progress) {
+        MY_LOG_INFO(TAG, "Starting quick channel scan for target BSSIDs...");
+    }
     
     // Use the main scanning function instead of quick scan
     esp_err_t err = start_background_scan();
     if (err != ESP_OK) {
-        MY_LOG_INFO(TAG, "Quick scan failed: %s", esp_err_to_name(err));
+        if (!periodic_rescan_in_progress) {
+            MY_LOG_INFO(TAG, "Quick scan failed: %s", esp_err_to_name(err));
+        }
         return err;
     }
     
@@ -870,16 +881,22 @@ static esp_err_t quick_channel_scan(void) {
     }
     
     if (g_scan_in_progress) {
-        MY_LOG_INFO(TAG, "Quick scan timeout");
+        if (!periodic_rescan_in_progress) {
+            MY_LOG_INFO(TAG, "Quick scan timeout");
+        }
         return ESP_ERR_TIMEOUT;
     }
     
     if (!g_scan_done || g_scan_count == 0) {
-        MY_LOG_INFO(TAG, "No scan results available");
+        if (!periodic_rescan_in_progress) {
+            MY_LOG_INFO(TAG, "No scan results available");
+        }
         return ESP_ERR_NOT_FOUND;
     }
     
-    MY_LOG_INFO(TAG, "Successfully retrieved %d scan records", g_scan_count);
+    if (!periodic_rescan_in_progress) {
+        MY_LOG_INFO(TAG, "Successfully retrieved %d scan records", g_scan_count);
+    }
     
     // Copy scan results to our buffer
     uint16_t copy_count = (g_scan_count < QUICK_SCAN_MAX_APS) ? g_scan_count : QUICK_SCAN_MAX_APS;
@@ -888,7 +905,9 @@ static esp_err_t quick_channel_scan(void) {
     // Update target channels based on scan results
     update_target_channels(quick_scan_results, copy_count);
     
-    MY_LOG_INFO(TAG, "Quick channel scan completed");
+    if (!periodic_rescan_in_progress) {
+        MY_LOG_INFO(TAG, "Quick channel scan completed");
+    }
     return ESP_OK;
 }
 
@@ -896,32 +915,36 @@ static esp_err_t quick_channel_scan(void) {
 static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan_count) {
     bool channel_changed = false;
     
-    MY_LOG_INFO(TAG, "Updating target channels with %d scan results", scan_count);
-    
-    // Log current g_selected_indices and their corresponding BSSIDs
-    MY_LOG_INFO(TAG, "Current g_selected_indices and BSSIDs:");
-    for (int i = 0; i < g_selected_count; ++i) {
-        int idx = g_selected_indices[i];
-        MY_LOG_INFO(TAG, "  g_selected_indices[%d] = %d -> BSSID: %02X:%02X:%02X:%02X:%02X:%02X, SSID: %s", 
-                   i, idx, g_scan_results[idx].bssid[0], g_scan_results[idx].bssid[1], g_scan_results[idx].bssid[2],
-                   g_scan_results[idx].bssid[3], g_scan_results[idx].bssid[4], g_scan_results[idx].bssid[5],
-                   g_scan_results[idx].ssid);
-    }
-    
-    // Debug: Print all scan results
-    for (int i = 0; i < scan_count; ++i) {
-        MY_LOG_INFO(TAG, "Scan result[%d]: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X, Channel: %d", 
-                   i, scan_results[i].ssid,
-                   scan_results[i].bssid[0], scan_results[i].bssid[1], scan_results[i].bssid[2],
-                   scan_results[i].bssid[3], scan_results[i].bssid[4], scan_results[i].bssid[5],
-                   scan_results[i].primary);
+    if (!periodic_rescan_in_progress) {
+        MY_LOG_INFO(TAG, "Updating target channels with %d scan results", scan_count);
+        
+        // Log current g_selected_indices and their corresponding BSSIDs
+        MY_LOG_INFO(TAG, "Current g_selected_indices and BSSIDs:");
+        for (int i = 0; i < g_selected_count; ++i) {
+            int idx = g_selected_indices[i];
+            MY_LOG_INFO(TAG, "  g_selected_indices[%d] = %d -> BSSID: %02X:%02X:%02X:%02X:%02X:%02X, SSID: %s", 
+                       i, idx, g_scan_results[idx].bssid[0], g_scan_results[idx].bssid[1], g_scan_results[idx].bssid[2],
+                       g_scan_results[idx].bssid[3], g_scan_results[idx].bssid[4], g_scan_results[idx].bssid[5],
+                       g_scan_results[idx].ssid);
+        }
+        
+        // Debug: Print all scan results
+        for (int i = 0; i < scan_count; ++i) {
+            MY_LOG_INFO(TAG, "Scan result[%d]: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X, Channel: %d", 
+                       i, scan_results[i].ssid,
+                       scan_results[i].bssid[0], scan_results[i].bssid[1], scan_results[i].bssid[2],
+                       scan_results[i].bssid[3], scan_results[i].bssid[4], scan_results[i].bssid[5],
+                       scan_results[i].primary);
+        }
     }
     
     for (int i = 0; i < target_bssid_count; ++i) {
         if (!target_bssids[i].active) continue;
         
-        MY_LOG_INFO(TAG, "Checking target BSSID %s (current channel: %d)", 
-                   target_bssids[i].ssid, target_bssids[i].channel);
+        if (!periodic_rescan_in_progress) {
+            MY_LOG_INFO(TAG, "Checking target BSSID %s (current channel: %d)", 
+                       target_bssids[i].ssid, target_bssids[i].channel);
+        }
         
         // Find matching BSSID in scan results
         bool found = false;
@@ -932,11 +955,14 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
                 target_bssids[i].last_seen = esp_timer_get_time() / 1000;
                 found = true;
                 
-                MY_LOG_INFO(TAG, "FOUND: Target BSSID %s (%02X:%02X:%02X:%02X:%02X:%02X) found in scan results at index %d, channel: %d", 
-                           target_bssids[i].ssid, target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
-                           target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5], j, scan_results[j].primary);
+                if (!periodic_rescan_in_progress) {
+                    MY_LOG_INFO(TAG, "FOUND: Target BSSID %s (%02X:%02X:%02X:%02X:%02X:%02X) found in scan results at index %d, channel: %d", 
+                               target_bssids[i].ssid, target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
+                               target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5], j, scan_results[j].primary);
+                }
                 
                 if (old_channel != target_bssids[i].channel) {
+                    // ALWAYS log channel changes, even during periodic re-scan
                     MY_LOG_INFO(TAG, "Channel change detected for %s: %d -> %d", 
                                target_bssids[i].ssid, old_channel, target_bssids[i].channel);
                     channel_changed = true;
@@ -945,12 +971,12 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
             }
         }
         
-        if (!found) {
+        if (!found && !periodic_rescan_in_progress) {
             MY_LOG_INFO(TAG, "Target BSSID %s not found in scan results", target_bssids[i].ssid);
         }
     }
     
-    if (channel_changed) {
+    if (channel_changed && !periodic_rescan_in_progress) {
         MY_LOG_INFO(TAG, "Channel changes detected, will resume deauth on new channels");
         MY_LOG_INFO(TAG, "Note: Using target_bssids[] directly for deauth attack to avoid index confusion");
     }
@@ -1164,8 +1190,6 @@ int onlyDeauth = 0;
 static void deauth_attack_task(void *pvParameters) {
     (void)pvParameters;
     
-    MY_LOG_INFO(TAG,"Deauth attack task started.");
-    
     //Main loop of deauth frames sending:
     while (deauth_attack_active && 
            ((applicationState == DEAUTH) || (applicationState == DEAUTH_EVIL_TWIN) || (applicationState == EVIL_TWIN_PASS_CHECK))) {
@@ -1188,7 +1212,8 @@ static void deauth_attack_task(void *pvParameters) {
         // Check if it's time for channel monitoring (every 5 minutes)
         // Only perform periodic re-scan during active deauth attacks (DEAUTH and DEAUTH_EVIL_TWIN)
         if ((applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) && check_channel_changes()) {
-            MY_LOG_INFO(TAG, "Performing periodic channel check...");
+            // Set flag to suppress logs during periodic re-scan
+            periodic_rescan_in_progress = true;
             
             // Set LED to yellow during re-scan
             esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 255, 0); // Yellow
@@ -1198,17 +1223,15 @@ static void deauth_attack_task(void *pvParameters) {
             
             // Temporarily pause deauth for scanning
             esp_err_t scan_result = quick_channel_scan();
-            if (scan_result == ESP_OK) {
-                MY_LOG_INFO(TAG, "Channel check completed, resuming deauth");
-            } else {
-                MY_LOG_INFO(TAG, "Channel check failed, continuing with current channels");
-            }
             
             // Clear LED after re-scan (ignore errors if LED is in invalid state)
             led_err = led_strip_clear(strip);
             if (led_err == ESP_OK) {
                 led_strip_refresh(strip);
             }
+            
+            // Clear flag after re-scan completes
+            periodic_rescan_in_progress = false;
         }
         
         if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
@@ -1531,14 +1554,12 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
             ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
             
-            esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+            esp_err_t             ret = esp_netif_set_ip_info(ap_netif, &ip_info);
             if (ret != ESP_OK) {
                 MY_LOG_INFO(TAG, "Failed to set AP IP: %s", esp_err_to_name(ret));
                 applicationState = IDLE;
                 return 1;
             }
-            
-            MY_LOG_INFO(TAG, "AP IP set to 172.0.0.1");
             
             // Configure AP with Evil Twin SSID
             wifi_config_t ap_config = {
@@ -1578,8 +1599,6 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 return 1;
             }
             
-            MY_LOG_INFO(TAG, "AP configuration updated with Evil Twin SSID (with Zero Width Space)");
-            
             // Start DHCP server
             ret = esp_netif_dhcps_start(ap_netif);
             if (ret != ESP_OK) {
@@ -1587,8 +1606,6 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 applicationState = IDLE;
                 return 1;
             }
-            
-            MY_LOG_INFO(TAG, "DHCP server started - clients will get IPs in 172.0.0.x range");
             
             // Wait a bit for AP to fully start
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1607,8 +1624,6 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 applicationState = IDLE;
                 return 1;
             }
-            
-            MY_LOG_INFO(TAG, "HTTP server started successfully on port 80");
             
             // Register URI handlers
             httpd_uri_t root_uri = {
@@ -1675,8 +1690,6 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             };
             httpd_register_uri_handler(portal_server, &windows_captive_uri);
             
-            MY_LOG_INFO(TAG, "All URI handlers registered");
-            
             // Set portal_active flag BEFORE starting DNS task
             // (DNS task checks this flag in its loop)
             portal_active = true;
@@ -1704,11 +1717,6 @@ static int cmd_start_evil_twin(int argc, char **argv) {
         }
 
         MY_LOG_INFO(TAG,"Attacking %d network(s):", g_selected_count);
-        for (int i = 0; i < g_selected_count; ++i) {
-            int idx = g_selected_indices[i];
-            wifi_ap_record_t *ap = &g_scan_results[idx];
-            MY_LOG_INFO(TAG,"  [%d] SSID='%s' Ch=%d RSSI=%d", idx, (const char*)ap->ssid, ap->primary, ap->rssi);
-        }
         
         // Save target BSSIDs for channel monitoring
         save_target_bssids();
@@ -2805,8 +2813,6 @@ static void dns_server_task(void *pvParameters) {
     char rx_buffer[DNS_MAX_PACKET_SIZE];
     char tx_buffer[DNS_MAX_PACKET_SIZE];
     
-    MY_LOG_INFO(TAG, "DNS server task starting...");
-    
     // Create UDP socket
     dns_server_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (dns_server_socket < 0) {
@@ -2837,8 +2843,6 @@ static void dns_server_task(void *pvParameters) {
     timeout.tv_sec = 1;
     timeout.tv_usec = 0;
     setsockopt(dns_server_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    
-    MY_LOG_INFO(TAG, "DNS server listening on port %d", DNS_PORT);
     
     // Main DNS server loop
     while (portal_active) {
