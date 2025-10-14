@@ -20,6 +20,7 @@
 #define EVIL_ESP_UART_RX_BUF_SIZE (4096)
 #define EVIL_ESP_MAX_NETWORKS (200)
 #define EVIL_ESP_MAX_TARGETS (200)
+#define EVIL_ESP_MAX_PORTALS (50)
 
 // Scene definitions
 typedef enum {
@@ -35,6 +36,7 @@ typedef enum {
     EvilEspSceneConfig,
     EvilEspSceneDeviceInfo,
     EvilEspSceneUartTerminal,
+    EvilEspSceneListPortals,
     EvilEspSceneNum,
 } EvilEspScene;
 
@@ -125,6 +127,12 @@ typedef struct {
     bool selected;
 } EvilEspNetwork;
 
+// Portal structure
+typedef struct {
+    uint8_t index; // 1-based index from SD card
+    char filename[64]; // HTML filename
+} EvilEspPortal;
+
 // Configuration structure
 typedef struct {
     uint32_t cycle_delay;
@@ -188,6 +196,11 @@ typedef struct {
     uint8_t network_count;
     bool scan_in_progress;
 
+    // Portal data
+    EvilEspPortal portals[EVIL_ESP_MAX_PORTALS];
+    uint8_t portal_count;
+    bool portal_scan_in_progress;
+
     EvilEspConfig config;
     EvilEspAttackState attack_state;
     EvilEspSnifferState sniffer_state;
@@ -209,6 +222,7 @@ typedef struct {
 typedef enum {
     EvilEspEventStartScan,
     EvilEspEventScanComplete,
+    EvilEspEventPortalScanComplete,
     EvilEspEventStartAttack,
     EvilEspEventStopAttack,
     EvilEspEventStartSniffer,
@@ -242,6 +256,7 @@ void evil_esp_scene_on_enter_sniffer_results(void* context);
 void evil_esp_scene_on_enter_config(void* context);
 void evil_esp_scene_on_enter_device_info(void* context);
 void evil_esp_scene_on_enter_uart_terminal(void* context);
+void evil_esp_scene_on_enter_list_portals(void* context);
 
 bool evil_esp_scene_on_event_start(void* context, SceneManagerEvent event);
 bool evil_esp_scene_on_event_main_menu(void* context, SceneManagerEvent event);
@@ -255,6 +270,7 @@ bool evil_esp_scene_on_event_sniffer_results(void* context, SceneManagerEvent ev
 bool evil_esp_scene_on_event_config(void* context, SceneManagerEvent event);
 bool evil_esp_scene_on_event_device_info(void* context, SceneManagerEvent event);
 bool evil_esp_scene_on_event_uart_terminal(void* context, SceneManagerEvent event);
+bool evil_esp_scene_on_event_list_portals(void* context, SceneManagerEvent event);
 
 void evil_esp_scene_on_exit_start(void* context);
 void evil_esp_scene_on_exit_main_menu(void* context);
@@ -268,6 +284,7 @@ void evil_esp_scene_on_exit_sniffer_results(void* context);
 void evil_esp_scene_on_exit_config(void* context);
 void evil_esp_scene_on_exit_device_info(void* context);
 void evil_esp_scene_on_exit_uart_terminal(void* context);
+void evil_esp_scene_on_exit_list_portals(void* context);
 
 // UART Worker Functions
 EvilEspUartWorker* evil_esp_uart_init(EvilEspApp* app);
