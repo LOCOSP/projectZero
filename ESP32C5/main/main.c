@@ -55,6 +55,7 @@
 //Version number
 #define JANOS_VERSION "0.1.0"
 
+
 #define NEOPIXEL_GPIO      27
 #define LED_COUNT          1
 #define RMT_RES_HZ         (10 * 1000 * 1000)  // 10 MHz
