@@ -2241,7 +2241,7 @@ static int cmd_select_html(int argc, char **argv)
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     
-    if (fsize <= 0 || fsize > 500000) { // Limit to 500KB
+    if (fsize <= 0 || fsize > 800000) { // Limit to 800KB
         MY_LOG_INFO(TAG, "File size invalid or too large: %ld bytes", fsize);
         fclose(f);
         return 1;
