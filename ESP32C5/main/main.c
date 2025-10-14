@@ -8,6 +8,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
+#include "esp_psram.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -2238,7 +2241,7 @@ static int cmd_select_html(int argc, char **argv)
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     
-    if (fsize <= 0 || fsize > 100000) { // Limit to 100KB
+    if (fsize <= 0 || fsize > 500000) { // Limit to 500KB
         MY_LOG_INFO(TAG, "File size invalid or too large: %ld bytes", fsize);
         fclose(f);
         return 1;
@@ -3347,6 +3350,22 @@ void app_main(void) {
 
 
     //MY_LOG_INFO(TAG, "Application starts (ESP32-C5)");
+
+    esp_err_t ret1 = esp_psram_init();
+    if (ret1 == ESP_OK) {
+        size_t psram_size = esp_psram_get_size();
+        MY_LOG_INFO(TAG, "PSRAM size: %d bytes\n", psram_size);
+    } else {
+        MY_LOG_INFO(TAG, "PSRAM not detected\n");
+    }
+
+    void* ptr = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+    if (ptr != NULL) {
+        MY_LOG_INFO(TAG, "Malloc from PSRAM succeeded\n");
+        heap_caps_free(ptr);
+    } else {
+        MY_LOG_INFO(TAG, "Malloc from PSRAM failed\n");
+    }
 
     // 1. LED strip configuration
     led_strip_config_t strip_cfg = {
