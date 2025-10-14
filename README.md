@@ -58,14 +58,131 @@ Additionally you can inspect probe requests captured during the scan.
 # CLI Usage
 The board, when connected to USB, offers a CLI interface. 
 The CLI supports up/down arrows and TAB autocompletion. 
-Typical usage would be:
+
+## Deauth
+
+Typical usage for deauth attack would be:
+
 scan_networks
+
 select_networks 1 4
-start_evil_twin
-sae_overflow
+
+start_deauth
 
 Please note that the order of selected networks is important. While all of them will be deauthed, the first one will additionally give its name to an evil twin.
 
+## Evil Twin
+
+Evil Twin workflow in CLI 
+
+First, find all the networks around:
+
+> scan_networks
+
+Starting background WiFi scan...
+
+Background scan started. Wait approx 15s..
+
+> WiFi scan completed. Found 21 networks, status: 0
+
+Retrieved 21 network records
+
+"1","AX3_2.4","30:AA:E4:3C:3F:64","1","WPA2/WPA3 Mixed","-59","2.4GHz"
+
+"2","","30:AA:E4:3C:3F:69","1","WPA2","-60","2.4GHz"
+
+...
+
+Scan results printed.
+
+
+Next, decide which networks would be attacked. You can provide many indexes (space separated).
+
+The first index will be not only deauthed, but will also give its name to the Evil twin network. 
+
+> select_networks 1 2
+
+Selected Networks:
+
+AX3_2.4, 30:aa:e4:3c:3f:64, Ch1, WPA2/WPA3 Mixed
+
+, 30:aa:e4:3c:3f:69, Ch1, WPA2
+
+
+Next, verify what html files are present on SD card:
+
+> list_sd
+
+SD card mounted successfully
+
+[...]
+
+HTML files found on SD card:
+
+1 1EXA~145.HTM
+
+Here we have only one file, now we need to select it by providing its index:
+
+> select_html 1
+
+Loaded HTML file: 1EXA~145.HTM (1668 bytes)
+
+Portal will now use this custom HTML.
+
+Now, we're ready to start the attack:
+
+> start_evil_twin
+
+Starting captive portal for Evil Twin attack on: AX3_2.4
+
+Captive portal started successfully
+
+Attacking 2 network(s):
+
+Target BSSID[0]: AX3_2.4, BSSID: 30:AA:E4:3C:3F:64, Channel: 1
+
+Target BSSID[1]: , BSSID: 30:AA:E4:3C:3F:69, Channel: 1
+
+Deauth attack started. Use 'stop' to stop.
+
+## SAE Overflow
+After scan, first run select_networks with only one index:
+
+select_networks 1
+
+Next, run: 
+
+sae_overflow
+
+## Sniffer
+
+First, start sniffing process for as long as you wish:
+
+start_sniffer
+
+next, terminate it with stop:
+
+stop
+
+
+Now, you can see Networks and their associated clients:
+
+show_sniffer_results
+
+Alternatively you can see probe requests:
+
+show_probes
+
+
+## Blackout
+
+Just run: start_blackout
+
+## Wardrive
+
+Just run: start_wardrive
+
+First you need to patiently wait for gps fix to be obtained! Only then wardrive will start and networks would be started.
 
 # Flipper application screens and user journey
 Run the app:
@@ -125,6 +242,10 @@ When you run Show Clients you can see report for each client:
 Finally when you run Show Probes you can see report of probe requests:
 
 ![alt text](Gfx/probes.png)
+
+Select portal option presents portals found on the SD card:
+
+![alt text](Gfx/portals.png)
 
 
 
