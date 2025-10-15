@@ -145,6 +145,8 @@ Target BSSID[1]: , BSSID: 30:AA:E4:3C:3F:69, Channel: 1
 
 Deauth attack started. Use 'stop' to stop.
 
+All entered credentials will be stored in EVILTWIN.TXT file on SD card.
+
 ## SAE Overflow
 After scan, first run select_networks with only one index:
 
@@ -183,6 +185,36 @@ Just run: start_blackout
 Just run: start_wardrive
 
 First you need to patiently wait for gps fix to be obtained! Only then wardrive will start and networks would be started.
+
+
+## Portal
+
+verify what html files are present on SD card:
+
+> list_sd
+
+SD card mounted successfully
+
+[...]
+
+HTML files found on SD card:
+
+1 1EXA~145.HTM
+
+Here we have only one file, now we need to select it by providing its index:
+
+> select_html 1
+
+Loaded HTML file: 1EXA~145.HTM (1668 bytes)
+
+Portal will now use this custom HTML.
+
+Now, we're ready to start the attack:
+
+start_portal MySSID
+
+Network named MySSID will be created. All entered credentials will be stored in PORTAL.TXT file on SD card.
+
 
 # Flipper application screens and user journey
 Run the app:
