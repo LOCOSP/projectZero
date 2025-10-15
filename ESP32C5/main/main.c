@@ -1227,6 +1227,9 @@ static void deauth_attack_task(void *pvParameters) {
             
             // Temporarily pause deauth for scanning
             esp_err_t scan_result = quick_channel_scan();
+            if (scan_result != ESP_OK) {
+                MY_LOG_INFO(TAG, "Quick channel re-scan failed: %s", esp_err_to_name(scan_result));
+            }
             
             // Clear LED after re-scan (ignore errors if LED is in invalid state)
             led_err = led_strip_clear(strip);
