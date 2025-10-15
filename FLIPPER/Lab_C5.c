@@ -85,6 +85,7 @@ typedef enum {
     MenuActionCommandWithTargets,
     MenuActionResults,
     MenuActionToggleBacklight,
+    MenuActionToggleOtgPower,
     MenuActionOpenScannerSetup,
     MenuActionOpenConsole,
     MenuActionConfirmBlackout,
@@ -153,6 +154,8 @@ typedef struct {
     int16_t scanner_min_power;
     size_t scanner_setup_index;
     bool scanner_adjusting_power;
+    bool otg_power_enabled;
+    bool otg_power_initial_state;
     bool backlight_enabled;
     bool backlight_insomnia;
     size_t scanner_view_offset;
@@ -175,6 +178,9 @@ static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, s
 static void simple_app_update_result_layout(SimpleApp* app);
 static void simple_app_apply_backlight(SimpleApp* app);
 static void simple_app_toggle_backlight(SimpleApp* app);
+static void simple_app_update_otg_label(SimpleApp* app);
+static void simple_app_apply_otg_power(SimpleApp* app);
+static void simple_app_toggle_otg_power(SimpleApp* app);
 static void simple_app_mark_config_dirty(SimpleApp* app);
 static void simple_app_save_config_if_dirty(SimpleApp* app, const char* message, bool fullscreen);
 static bool simple_app_save_config(SimpleApp* app, const char* success_message, bool fullscreen);
@@ -225,9 +231,11 @@ static const MenuEntry menu_entries_attacks[] = {
 };
 
 static char menu_label_backlight[24] = "Backlight: On";
+static char menu_label_otg_power[24] = "5V Power: On";
 
 static const MenuEntry menu_entries_setup[] = {
     {menu_label_backlight, NULL, MenuActionToggleBacklight},
+    {menu_label_otg_power, NULL, MenuActionToggleOtgPower},
     {"Scanner Filters", NULL, MenuActionOpenScannerSetup},
     {"Console", NULL, MenuActionOpenConsole},
 };
@@ -414,6 +422,40 @@ static void simple_app_update_backlight_label(SimpleApp* app) {
         app->backlight_enabled ? "On" : "Off");
 }
 
+static void simple_app_update_otg_label(SimpleApp* app) {
+    if(!app) return;
+    snprintf(
+        menu_label_otg_power,
+        sizeof(menu_label_otg_power),
+        "5V Power: %s",
+        app->otg_power_enabled ? "On" : "Off");
+}
+
+static void simple_app_apply_otg_power(SimpleApp* app) {
+    if(!app) return;
+    bool currently_enabled = furi_hal_power_is_otg_enabled();
+    if(app->otg_power_enabled) {
+        if(!currently_enabled) {
+            if(!furi_hal_power_enable_otg()) {
+                app->otg_power_enabled = false;
+                simple_app_update_otg_label(app);
+                simple_app_show_status_message(app, "5V enable failed", 2000, false);
+                return;
+            }
+        }
+    } else if(currently_enabled) {
+        furi_hal_power_disable_otg();
+    }
+    simple_app_update_otg_label(app);
+}
+
+static void simple_app_toggle_otg_power(SimpleApp* app) {
+    if(!app) return;
+    app->otg_power_enabled = !app->otg_power_enabled;
+    simple_app_apply_otg_power(app);
+    simple_app_mark_config_dirty(app);
+}
+
 static void simple_app_update_result_layout(SimpleApp* app) {
     if(!app) return;
     size_t enabled_fields = simple_app_enabled_field_count(app);
@@ -589,6 +631,8 @@ static void simple_app_parse_config_line(SimpleApp* app, char* line) {
         app->scanner_min_power = (int16_t)strtol(value, NULL, 10);
     } else if(strcmp(key, "backlight_enabled") == 0) {
         app->backlight_enabled = simple_app_parse_bool_value(value, app->backlight_enabled);
+    } else if(strcmp(key, "otg_power_enabled") == 0) {
+        app->otg_power_enabled = simple_app_parse_bool_value(value, app->otg_power_enabled);
     }
 }
 
@@ -612,7 +656,8 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             "show_power=%d\n"
             "show_band=%d\n"
             "min_power=%d\n"
-            "backlight_enabled=%d\n",
+            "backlight_enabled=%d\n"
+            "otg_power_enabled=%d\n",
             app->scanner_show_ssid ? 1 : 0,
             app->scanner_show_bssid ? 1 : 0,
             app->scanner_show_channel ? 1 : 0,
@@ -620,7 +665,8 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             app->scanner_show_power ? 1 : 0,
             app->scanner_show_band ? 1 : 0,
             (int)app->scanner_min_power,
-            app->backlight_enabled ? 1 : 0);
+            app->backlight_enabled ? 1 : 0,
+            app->otg_power_enabled ? 1 : 0);
         if(len > 0 && len < (int)sizeof(buffer)) {
             size_t written = storage_file_write(file, buffer, (size_t)len);
             if(written == (size_t)len) {
@@ -2114,6 +2160,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             }
         } else if(entry->action == MenuActionToggleBacklight) {
             simple_app_toggle_backlight(app);
+        } else if(entry->action == MenuActionToggleOtgPower) {
+            simple_app_toggle_otg_power(app);
         } else if(entry->action == MenuActionOpenScannerSetup) {
             app->screen = ScreenSetupScanner;
             app->scanner_setup_index = 0;
@@ -2414,14 +2462,20 @@ int32_t Lab_C5_app(void* p) {
     app->scanner_min_power = SCAN_POWER_MIN_DBM;
     app->scanner_setup_index = 0;
     app->scanner_adjusting_power = false;
+    app->otg_power_initial_state = furi_hal_power_is_otg_enabled();
+    app->otg_power_enabled = true;
     app->backlight_enabled = true;
     app->scanner_view_offset = 0;
     simple_app_update_result_layout(app);
     simple_app_update_backlight_label(app);
+    simple_app_update_otg_label(app);
+    simple_app_apply_otg_power(app);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
     simple_app_load_config(app);
     simple_app_update_backlight_label(app);
     simple_app_apply_backlight(app);
+    simple_app_update_otg_label(app);
+    simple_app_apply_otg_power(app);
     app->menu_state = MenuStateSections;
     app->screen = ScreenMenu;
     app->serial_follow_tail = true;
@@ -2490,6 +2544,14 @@ int32_t Lab_C5_app(void* p) {
     if(app->backlight_insomnia) {
         furi_hal_power_insomnia_exit();
         app->backlight_insomnia = false;
+    }
+    bool current_otg_state = furi_hal_power_is_otg_enabled();
+    if(current_otg_state != app->otg_power_initial_state) {
+        if(app->otg_power_initial_state) {
+            furi_hal_power_enable_otg();
+        } else {
+            furi_hal_power_disable_otg();
+        }
     }
     furi_hal_light_set(LightBacklight, BACKLIGHT_ON_LEVEL);
     free(app);
