@@ -80,6 +80,12 @@ typedef enum {
 #define LAB_C5_CONFIG_DIR_PATH "apps_assets/labC5"
 #define LAB_C5_CONFIG_FILE_PATH LAB_C5_CONFIG_DIR_PATH "/config.txt"
 
+#define HINT_MAX_LINES 16
+#define HINT_VISIBLE_LINES 3
+#define HINT_LINE_CHAR_LIMIT 48
+#define HINT_WRAP_LIMIT 21
+#define HINT_LINE_HEIGHT 12
+
 typedef enum {
     MenuActionCommand,
     MenuActionCommandWithTargets,
@@ -163,6 +169,11 @@ typedef struct {
     uint8_t result_char_limit;
     uint8_t result_max_lines;
     Font result_font;
+    bool hint_active;
+    char hint_title[24];
+    char hint_lines[HINT_MAX_LINES][HINT_LINE_CHAR_LIMIT];
+    size_t hint_line_count;
+    size_t hint_scroll;
     NotificationApp* notifications;
     bool backlight_notification_enforced;
     bool config_dirty;
@@ -182,6 +193,14 @@ static void simple_app_update_otg_label(SimpleApp* app);
 static void simple_app_apply_otg_power(SimpleApp* app);
 static void simple_app_toggle_otg_power(SimpleApp* app);
 static void simple_app_mark_config_dirty(SimpleApp* app);
+static void simple_app_show_hint(SimpleApp* app, const char* title, const char* text);
+static void simple_app_hide_hint(SimpleApp* app);
+static void simple_app_handle_hint_event(SimpleApp* app, const InputEvent* event);
+static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas);
+static void simple_app_prepare_hint_lines(SimpleApp* app, const char* text);
+static void simple_app_hint_scroll(SimpleApp* app, int delta);
+static size_t simple_app_hint_max_scroll(const SimpleApp* app);
+static bool simple_app_try_show_hint(SimpleApp* app);
 static void simple_app_save_config_if_dirty(SimpleApp* app, const char* message, bool fullscreen);
 static bool simple_app_save_config(SimpleApp* app, const char* success_message, bool fullscreen);
 static void simple_app_load_config(SimpleApp* app);
@@ -200,10 +219,12 @@ typedef struct {
     const char* label;
     const char* command;
     MenuAction action;
+    const char* hint;
 } MenuEntry;
 
 typedef struct {
     const char* title;
+    const char* hint;
     const MenuEntry* entries;
     size_t entry_count;
     uint8_t display_y;
@@ -215,37 +236,77 @@ static const uint8_t image_icon_0_bits[] = {
     0x1d, 0x03, 0x71, 0x03, 0x1f, 0x03, 0xff, 0x03, 0xff, 0x03,
 };
 
+static const char hint_section_scanner[] =
+    "Run a Wi-Fi scan\nCollect network list\nResults appear under\nTargets for selection\nUse them for actions.";
+static const char hint_section_sniffers[] =
+    "Passive Wi-Fi tools\nMonitor live clients\nAuto channel hopping\nReview captured data\nFrom the results tab.";
+static const char hint_section_targets[] =
+    "Shows scan results\nOK toggles selection\nChoose multiple nets\nFeed attack modules\nBack returns to menu.";
+static const char hint_section_attacks[] =
+    "Test features here\nUse only on own lab\nTargets come from\nSelected networks\nFollow local laws.";
+static const char hint_section_setup[] =
+    "General settings\nBacklight and OTG\nAdjust scanner view\nConsole with logs\nUseful for debug.";
+
+static const char hint_sniffer_start[] =
+    "Start passive sniffer\nCaptures frames live\nHops 2.4 and 5 GHz\nWatch status in log\nStop with Back/Stop.";
+static const char hint_sniffer_results[] =
+    "Display sniffer list\nAccess points sorted\nBy client activity\nUse to inspect who\nWas seen on air.";
+static const char hint_sniffer_probes[] =
+    "View probe requests\nSee devices searching\nFor nearby SSIDs\nGreat for finding\nHidden networks.";
+static const char hint_sniffer_debug[] =
+    "Enable verbose logs\nPrints frame details\nDecision reasoning\nHelpful diagnostics\nBut very noisy.";
+
+static const char hint_attack_blackout[] =
+    "Prepare blackout test\nRequires confirmation\nFor controlled labs\nUse responsibly\nAvoid live systems.";
+static const char hint_attack_deauth[] =
+    "Launch deauth waves\nTargets chosen Wi-Fi\nDisrupts client links\nUse only with rights\nMonitor via console.";
+static const char hint_attack_evil_twin[] =
+    "Clone selected SSID\nNotify ESP module\nAwait credentials\nPair with deauth\nFor phishing demos.";
+static const char hint_attack_sae_overflow[] =
+    "Craft SAE traffic\nExercise WPA3 APs\nWatch retry counts\nObserve UART log\nStop when done.";
+static const char hint_attack_wardrive[] =
+    "Wardrive logger mode\nWrites data to SD\nAdds GPS context\nMap wireless areas\nReview later.";
+
+static const char hint_setup_backlight[] =
+    "Toggle screen light\nKeep brightness high\nOr allow auto dim\nGreat for console\nLong sessions.";
+static const char hint_setup_otg[] =
+    "Control USB OTG 5V\nPower external gear\nDisable to save\nBattery capacity\nWhen unused.";
+static const char hint_setup_filters[] =
+    "Choose visible fields\nSimplify result list\nHide unused data\nTailor display\nOK flips options.";
+static const char hint_setup_console[] =
+    "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
+
 static const MenuEntry menu_entries_sniffers[] = {
-    {"Start Sniffer", "start_sniffer", MenuActionCommand},
-    {"Show Sniffer Results", "show_sniffer_results", MenuActionCommand},
-    {"Show Probes", "show_probes", MenuActionCommand},
-    {"Sniffer Debug", "sniffer_debug 1", MenuActionCommand},
+    {"Start Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
+    {"Show Sniffer Results", "show_sniffer_results", MenuActionCommand, hint_sniffer_results},
+    {"Show Probes", "show_probes", MenuActionCommand, hint_sniffer_probes},
+    {"Sniffer Debug", "sniffer_debug 1", MenuActionCommand, hint_sniffer_debug},
 };
 
 static const MenuEntry menu_entries_attacks[] = {
-    {"Blackout", NULL, MenuActionConfirmBlackout},
-    {"Deauth", "start_deauth", MenuActionCommandWithTargets},
-    {"Evil Twin", "start_evil_twin", MenuActionCommand},
-    {"SAE Overflow", "sae_overflow", MenuActionCommand},
-    {"Wardrive", "start_wardrive", MenuActionCommand},
+    {"Blackout", NULL, MenuActionConfirmBlackout, hint_attack_blackout},
+    {"Deauth", "start_deauth", MenuActionCommandWithTargets, hint_attack_deauth},
+    {"Evil Twin", "start_evil_twin", MenuActionCommand, hint_attack_evil_twin},
+    {"SAE Overflow", "sae_overflow", MenuActionCommand, hint_attack_sae_overflow},
+    {"Wardrive", "start_wardrive", MenuActionCommand, hint_attack_wardrive},
 };
 
 static char menu_label_backlight[24] = "Backlight: On";
 static char menu_label_otg_power[24] = "5V Power: On";
 
 static const MenuEntry menu_entries_setup[] = {
-    {menu_label_backlight, NULL, MenuActionToggleBacklight},
-    {menu_label_otg_power, NULL, MenuActionToggleOtgPower},
-    {"Scanner Filters", NULL, MenuActionOpenScannerSetup},
-    {"Console", NULL, MenuActionOpenConsole},
+    {menu_label_backlight, NULL, MenuActionToggleBacklight, hint_setup_backlight},
+    {menu_label_otg_power, NULL, MenuActionToggleOtgPower, hint_setup_otg},
+    {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
+    {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
 };
 
 static const MenuSection menu_sections[] = {
-    {"Scanner", NULL, 0, 12, MENU_VISIBLE_COUNT * 12},
-    {"Sniffers", menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24, MENU_VISIBLE_COUNT_SNIFFERS * 12},
-    {"Targets", NULL, 0, 36, MENU_VISIBLE_COUNT * 12},
-    {"Attacks", menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48, MENU_VISIBLE_COUNT_ATTACKS * 12},
-    {"Setup", menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60, MENU_VISIBLE_COUNT * 12},
+    {"Scanner", hint_section_scanner, NULL, 0, 12, MENU_VISIBLE_COUNT * 12},
+    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24, MENU_VISIBLE_COUNT_SNIFFERS * 12},
+    {"Targets", hint_section_targets, NULL, 0, 36, MENU_VISIBLE_COUNT * 12},
+    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48, MENU_VISIBLE_COUNT_ATTACKS * 12},
+    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60, MENU_VISIBLE_COUNT * 12},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -436,12 +497,19 @@ static void simple_app_apply_otg_power(SimpleApp* app) {
     bool currently_enabled = furi_hal_power_is_otg_enabled();
     if(app->otg_power_enabled) {
         if(!currently_enabled) {
-            if(!furi_hal_power_enable_otg()) {
+            bool enabled = furi_hal_power_enable_otg();
+            currently_enabled = furi_hal_power_is_otg_enabled();
+            if(!enabled && !currently_enabled) {
+                float usb_voltage = furi_hal_power_get_usb_voltage();
                 app->otg_power_enabled = false;
                 simple_app_update_otg_label(app);
-                simple_app_show_status_message(app, "5V enable failed", 2000, false);
+                if(usb_voltage < 1.0f) {
+                    simple_app_show_status_message(app, "5V enable failed", 2000, false);
+                }
                 return;
             }
+        } else {
+            app->otg_power_enabled = true;
         }
     } else if(currently_enabled) {
         furi_hal_power_disable_otg();
@@ -530,6 +598,9 @@ static void simple_app_show_status_message(
     uint32_t duration_ms,
     bool fullscreen) {
     if(!app) return;
+    if(app->hint_active) {
+        simple_app_hide_hint(app);
+    }
     if(message && message[0] != '\0') {
         strncpy(app->status_message, message, sizeof(app->status_message) - 1);
         app->status_message[sizeof(app->status_message) - 1] = '\0';
@@ -718,11 +789,11 @@ static void simple_app_load_config(SimpleApp* app) {
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
     if(loaded) {
-        simple_app_show_status_message(app, "Config loaded", 2000, true);
+        simple_app_show_status_message(app, "Config loaded", 1000, true);
         app->config_dirty = false;
     } else {
         simple_app_save_config(app, NULL, false);
-        simple_app_show_status_message(app, "Config created", 2000, true);
+        simple_app_show_status_message(app, "Config created", 1000, true);
     }
     if(app->scanner_min_power > SCAN_POWER_MAX_DBM) {
         app->scanner_min_power = SCAN_POWER_MAX_DBM;
@@ -1536,6 +1607,255 @@ static void simple_app_handle_confirm_blackout_input(SimpleApp* app, InputKey ke
     }
 }
 
+static size_t simple_app_hint_max_scroll(const SimpleApp* app) {
+    if(!app || app->hint_line_count <= HINT_VISIBLE_LINES) {
+        return 0;
+    }
+    return app->hint_line_count - HINT_VISIBLE_LINES;
+}
+
+static void simple_app_prepare_hint_lines(SimpleApp* app, const char* text) {
+    if(!app) return;
+    app->hint_line_count = 0;
+    if(!text) return;
+
+    const char* ptr = text;
+    while(*ptr && app->hint_line_count < HINT_MAX_LINES) {
+        if(*ptr == '\n') {
+            app->hint_lines[app->hint_line_count][0] = '\0';
+            app->hint_line_count++;
+            ptr++;
+            continue;
+        }
+
+        size_t line_len = 0;
+        while(ptr[line_len] && ptr[line_len] != '\n') {
+            line_len++;
+        }
+
+        size_t consumed = 0;
+        while(consumed < line_len && app->hint_line_count < HINT_MAX_LINES) {
+            size_t remaining = line_len - consumed;
+            size_t block = remaining > HINT_WRAP_LIMIT ? HINT_WRAP_LIMIT : remaining;
+
+            size_t copy_len = block;
+            if(block == HINT_WRAP_LIMIT && consumed + block < line_len) {
+                size_t adjust = block;
+                while(adjust > 0 &&
+                      ptr[consumed + adjust - 1] != ' ' &&
+                      ptr[consumed + adjust - 1] != '-') {
+                    adjust--;
+                }
+                if(adjust > 0) {
+                    copy_len = adjust;
+                }
+            }
+
+            if(copy_len == 0) {
+                copy_len = block;
+            }
+            if(copy_len >= HINT_LINE_CHAR_LIMIT) {
+                copy_len = HINT_LINE_CHAR_LIMIT - 1;
+            }
+
+            memcpy(app->hint_lines[app->hint_line_count], ptr + consumed, copy_len);
+            app->hint_lines[app->hint_line_count][copy_len] = '\0';
+
+            size_t trim = copy_len;
+            while(trim > 0 && app->hint_lines[app->hint_line_count][trim - 1] == ' ') {
+                app->hint_lines[app->hint_line_count][--trim] = '\0';
+            }
+
+            app->hint_line_count++;
+            if(app->hint_line_count >= HINT_MAX_LINES) {
+                break;
+            }
+
+            consumed += copy_len;
+            while(consumed < line_len && ptr[consumed] == ' ') {
+                consumed++;
+            }
+        }
+
+        ptr += line_len;
+        if(*ptr == '\n') {
+            ptr++;
+        }
+    }
+}
+
+static void simple_app_show_hint(SimpleApp* app, const char* title, const char* text) {
+    if(!app || !title || !text) return;
+
+    memset(app->hint_title, 0, sizeof(app->hint_title));
+    strncpy(app->hint_title, title, sizeof(app->hint_title) - 1);
+    simple_app_prepare_hint_lines(app, text);
+
+    if(app->hint_line_count == 0) {
+        strncpy(app->hint_lines[0], text, HINT_LINE_CHAR_LIMIT - 1);
+        app->hint_lines[0][HINT_LINE_CHAR_LIMIT - 1] = '\0';
+        app->hint_line_count = 1;
+    }
+
+    app->hint_scroll = 0;
+    app->hint_active = true;
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_hide_hint(SimpleApp* app) {
+    if(!app || !app->hint_active) return;
+    app->hint_active = false;
+    app->hint_line_count = 0;
+    app->hint_scroll = 0;
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_hint_scroll(SimpleApp* app, int delta) {
+    if(!app || !app->hint_active || delta == 0) return;
+    size_t max_scroll = simple_app_hint_max_scroll(app);
+    int32_t new_value = (int32_t)app->hint_scroll + delta;
+    if(new_value < 0) {
+        new_value = 0;
+    }
+    if(new_value > (int32_t)max_scroll) {
+        new_value = (int32_t)max_scroll;
+    }
+    if((size_t)new_value != app->hint_scroll) {
+        app->hint_scroll = (size_t)new_value;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+    }
+}
+
+static void simple_app_handle_hint_event(SimpleApp* app, const InputEvent* event) {
+    if(!app || !event) return;
+
+    if(event->type == InputTypeShort && event->key == InputKeyBack) {
+        simple_app_hide_hint(app);
+        return;
+    }
+
+    if((event->type == InputTypeShort || event->type == InputTypeRepeat)) {
+        if(event->key == InputKeyUp) {
+            simple_app_hint_scroll(app, -1);
+        } else if(event->key == InputKeyDown) {
+            simple_app_hint_scroll(app, 1);
+        }
+    }
+}
+
+static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas || !app->hint_active) return;
+
+    const uint8_t bubble_x = 6;
+    const uint8_t bubble_y = 6;
+    const uint8_t bubble_w = DISPLAY_WIDTH - (bubble_x * 2);
+    const uint8_t bubble_h = 56;
+    const uint8_t radius = 8;
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_rbox(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_rframe(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, bubble_x + 7, bubble_y + 16, app->hint_title);
+
+    canvas_set_font(canvas, FontSecondary);
+    uint8_t text_x = bubble_x + 7;
+    uint8_t text_y = bubble_y + 30;
+
+    if(app->hint_line_count > 0) {
+        size_t visible = app->hint_line_count - app->hint_scroll;
+        if(visible > HINT_VISIBLE_LINES) {
+            visible = HINT_VISIBLE_LINES;
+        }
+        for(size_t i = 0; i < visible; i++) {
+            size_t line_index = app->hint_scroll + i;
+            if(line_index >= app->hint_line_count) break;
+            canvas_draw_str(
+                canvas, text_x, (uint8_t)(text_y + i * HINT_LINE_HEIGHT), app->hint_lines[line_index]);
+        }
+    }
+
+    if(app->hint_line_count > HINT_VISIBLE_LINES) {
+        const uint8_t track_width = 5;
+        const uint8_t track_height = (uint8_t)(HINT_VISIBLE_LINES * HINT_LINE_HEIGHT);
+        const uint8_t track_x = bubble_x + bubble_w - track_width - 4;
+        const uint8_t track_y = text_y - (HINT_LINE_HEIGHT - 2);
+
+        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
+
+        size_t max_scroll = simple_app_hint_max_scroll(app);
+        uint8_t thumb_height =
+            (uint8_t)(((uint32_t)HINT_VISIBLE_LINES * track_height) / app->hint_line_count);
+        if(thumb_height < 4) thumb_height = 4;
+        if(thumb_height > track_height) thumb_height = track_height;
+
+        uint8_t max_thumb_offset =
+            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
+        uint8_t thumb_offset = 0;
+        if(max_scroll > 0 && max_thumb_offset > 0) {
+            thumb_offset =
+                (uint8_t)(((uint32_t)app->hint_scroll * max_thumb_offset) / max_scroll);
+        }
+        uint8_t thumb_x = track_x + 1;
+        uint8_t thumb_y = track_y + 1 + thumb_offset;
+        uint8_t thumb_inner_height = (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
+        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
+        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
+        canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_inner_height);
+
+        uint8_t arrow_top_center = track_y + 2;
+        canvas_draw_line(canvas, track_x + track_width / 2, arrow_top_center - 2, track_x + 1, arrow_top_center);
+        canvas_draw_line(
+            canvas, track_x + track_width / 2, arrow_top_center - 2, track_x + track_width - 2, arrow_top_center);
+
+        uint8_t arrow_bottom_center = track_y + track_height - 3;
+        canvas_draw_line(canvas, track_x + 1, arrow_bottom_center, track_x + track_width / 2, arrow_bottom_center + 2);
+        canvas_draw_line(
+            canvas,
+            track_x + track_width - 2,
+            arrow_bottom_center,
+            track_x + track_width / 2,
+            arrow_bottom_center + 2);
+    }
+}
+
+static bool simple_app_try_show_hint(SimpleApp* app) {
+    if(!app) return false;
+    if(app->screen != ScreenMenu) return false;
+    if(app->section_index >= menu_section_count) return false;
+
+    const MenuSection* section = &menu_sections[app->section_index];
+
+    if(app->menu_state == MenuStateSections) {
+        if(!section->hint) return false;
+        simple_app_show_hint(app, section->title, section->hint);
+        return true;
+    }
+
+    if(section->entry_count == 0) {
+        if(!section->hint) return false;
+        simple_app_show_hint(app, section->title, section->hint);
+        return true;
+    }
+
+    if(app->item_index >= section->entry_count) return false;
+
+    const MenuEntry* entry = &section->entries[app->item_index];
+    const char* hint_text = entry->hint ? entry->hint : section->hint;
+    if(!hint_text) return false;
+
+    simple_app_show_hint(app, entry->label, hint_text);
+    return true;
+}
+
 static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     canvas_set_color(canvas, ColorBlack);
 
@@ -1544,6 +1864,14 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     canvas_set_bitmap_mode(canvas, false);
 
     canvas_set_font(canvas, FontSecondary);
+
+    if(app->menu_state == MenuStateSections) {
+        const uint8_t help_text_x = DISPLAY_WIDTH - 2;
+        const uint8_t help_text_y = 28;
+        canvas_draw_str_aligned(canvas, help_text_x, help_text_y, AlignRight, AlignTop, "Hold OK");
+        canvas_draw_str_aligned(canvas, help_text_x, help_text_y + 8, AlignRight, AlignTop, "for Help");
+    }
+
     if(simple_app_status_message_is_active(app) && !app->status_message_fullscreen) {
         canvas_draw_str(canvas, 2, 52, app->status_message);
     }
@@ -2079,6 +2407,10 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         simple_app_draw_results(app, canvas);
         break;
     }
+
+    if(app->hint_active) {
+        simple_app_draw_hint(app, canvas);
+    }
 }
 
 static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
@@ -2382,6 +2714,17 @@ static void simple_app_input(InputEvent* event, void* context) {
         return;
     }
 
+    if(app->hint_active) {
+        simple_app_handle_hint_event(app, event);
+        return;
+    }
+
+    if(event->type == InputTypeLong && event->key == InputKeyOk) {
+        if(simple_app_try_show_hint(app)) {
+            return;
+        }
+    }
+
     bool allow_event = false;
     if(event->type == InputTypeShort) {
         allow_event = true;
@@ -2463,7 +2806,7 @@ int32_t Lab_C5_app(void* p) {
     app->scanner_setup_index = 0;
     app->scanner_adjusting_power = false;
     app->otg_power_initial_state = furi_hal_power_is_otg_enabled();
-    app->otg_power_enabled = true;
+    app->otg_power_enabled = app->otg_power_initial_state;
     app->backlight_enabled = true;
     app->scanner_view_offset = 0;
     simple_app_update_result_layout(app);
