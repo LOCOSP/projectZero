@@ -234,7 +234,16 @@ int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
 
 void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
     ESP_LOG_BUFFER_HEXDUMP(TAG, frame_buffer, size, ESP_LOG_DEBUG);
-    ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false));
+
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false);
+    if (err == ESP_ERR_NO_MEM) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        MY_LOG_INFO(TAG, "esp_wifi_80211_tx returned ESP_ERR_NO_MEM: %d", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        return; // lub ponów próbę później
+    }
+
+    //ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false));
 }
 
 
@@ -4916,6 +4925,7 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
 
     for (int i = 0; i < 5; i++) {
         wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
     deauth_sent_count++;
     
