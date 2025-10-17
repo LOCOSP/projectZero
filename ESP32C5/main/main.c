@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.2.0"
+#define JANOS_VERSION "0.3.0"
 
 
 #define NEOPIXEL_GPIO      27
@@ -4843,7 +4843,7 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     // Extract addresses
     uint8_t *addr1 = (uint8_t *)&frame[4];   // Address 1
     uint8_t *addr2 = (uint8_t *)&frame[10];  // Address 2  
-    uint8_t *addr3 = (uint8_t *)&frame[16];  // Address 3
+    //uint8_t *addr3 = (uint8_t *)&frame[16];  // Address 3
     
     uint8_t *ap_mac = NULL;
     uint8_t *sta_mac = NULL;
