@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.4.0"
+#define JANOS_VERSION "0.4.1"
 
 
 #define NEOPIXEL_GPIO      27
