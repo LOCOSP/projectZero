@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.4.1"
+#define JANOS_VERSION "0.4.2"
 
 
 #define NEOPIXEL_GPIO      27
@@ -3868,7 +3868,7 @@ void app_main(void) {
     
     // Load BSSID whitelist from SD card
     load_whitelist_from_sd();
-    
+    vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
     vTaskDelay(pdMS_TO_TICKS(100));
     
