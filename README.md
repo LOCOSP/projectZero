@@ -54,6 +54,11 @@ Sniffer is able to passively listen for traffic between AP and Clients. After yo
 
 Additionally you can inspect probe requests captured during the scan.
 
+## Blackout and Sniffer Dog
+
+Blackout scans networks around every 5 minutes and then deauths them all (broadcast).
+
+Sniffer Dog listens to traffic between AP and STA and deauths every station it sniffs.
 
 # CLI Usage
 The board, when connected to USB, offers a CLI interface. 
@@ -180,6 +185,9 @@ show_probes
 
 Just run: start_blackout
 
+## Sniffer dog
+Just run: start_sniffer_dog
+
 ## Wardrive
 
 Just run: start_wardrive
@@ -279,6 +287,14 @@ Select portal option presents portals found on the SD card:
 
 ![alt text](Gfx/portals.png)
 
+
+Blackout attack
+
+![alt text](Gfx/blackout.png)
+
+Sniffer dog attack
+
+![alt text](Gfx/sniffer.png)
 
 
 ## Flashing ESP32-C5 Board
