@@ -1997,9 +1997,18 @@ static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
 
     if(app->evil_twin_html_count > EVIL_TWIN_POPUP_VISIBLE_LINES) {
         const uint8_t track_width = 3;
-        const uint8_t track_height = (uint8_t)(EVIL_TWIN_POPUP_VISIBLE_LINES * HINT_LINE_HEIGHT);
+        uint8_t track_height = (uint8_t)(EVIL_TWIN_POPUP_VISIBLE_LINES * HINT_LINE_HEIGHT);
         const uint8_t track_x = bubble_x + bubble_w - track_width - 6;
-        const uint8_t track_y = list_y;
+        uint8_t track_y = list_y;
+
+        uint8_t track_bottom_limit = (uint8_t)(bubble_y + bubble_h - 6);
+        if((uint8_t)(track_y + track_height) > track_bottom_limit) {
+            if(track_bottom_limit > track_height) {
+                track_y = (uint8_t)(track_bottom_limit - track_height);
+            } else {
+                track_y = (uint8_t)(bubble_y + 2);
+            }
+        }
 
         canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
 
