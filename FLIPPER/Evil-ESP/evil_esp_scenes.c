@@ -276,7 +276,7 @@ void evil_esp_scene_on_enter_main_menu(void* context) {
     }
 
     submenu_reset(app->submenu);
-    submenu_set_header(app->submenu, "C5 Lab 1.4");
+    submenu_set_header(app->submenu, "C5 Lab 1.5");
 
     submenu_add_item(app->submenu, "Scanner", EvilEspMainMenuIndexScanner, evil_esp_submenu_callback_main_menu, app);
     submenu_add_item(app->submenu, "Sniffer", EvilEspMainMenuIndexSnifferMenu, evil_esp_submenu_callback_main_menu, app);
@@ -546,6 +546,7 @@ enum EvilEspAttacksMenuIndex {
     EvilEspAttacksMenuIndexRandom,
     EvilEspAttacksMenuIndexWardrive,
     EvilEspAttacksMenuIndexBlackout,
+    EvilEspAttacksMenuIndexSnifferDog,
     EvilEspAttacksMenuIndexPortal,
     EvilEspAttacksMenuIndexStop,
 };
@@ -561,6 +562,7 @@ void evil_esp_scene_on_enter_attacks(void* context) {
     submenu_add_item(app->submenu, "WPA3 SAE Overflow", EvilEspAttacksMenuIndexRandom, evil_esp_submenu_callback_attacks, app);
     submenu_add_item(app->submenu, "Wardrive", EvilEspAttacksMenuIndexWardrive, evil_esp_submenu_callback_attacks, app);
     submenu_add_item(app->submenu, "Blackout", EvilEspAttacksMenuIndexBlackout, evil_esp_submenu_callback_attacks, app);
+    submenu_add_item(app->submenu, "SnifferDog", EvilEspAttacksMenuIndexSnifferDog, evil_esp_submenu_callback_attacks, app);
     submenu_add_item(app->submenu, "Portal", EvilEspAttacksMenuIndexPortal, evil_esp_submenu_callback_attacks, app);
     //submenu_add_item(app->submenu, "Stop Attack", EvilEspAttacksMenuIndexStop, evil_esp_submenu_callback_attacks, app);
 
@@ -611,6 +613,14 @@ bool evil_esp_scene_on_event_attacks(void* context, SceneManagerEvent event) {
             evil_esp_send_command(app, "start_blackout");
             app->attack_state.active = true;
             app->attack_state.mode = EvilEspAttackModeRandom; // Use existing mode for blackout
+            scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
+            scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
+            return true;
+
+        case EvilEspAttacksMenuIndexSnifferDog:
+            evil_esp_send_command(app, "start_sniffer_dog");
+            app->attack_state.active = true;
+            app->attack_state.mode = EvilEspAttackModeRandom; // Use existing mode for sniffer dog
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
             scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
             return true;
