@@ -60,6 +60,17 @@ Blackout scans networks around every 5 minutes and then deauths them all (broadc
 
 Sniffer Dog listens to traffic between AP and STA and deauths every station it sniffs.
 
+## Whitelist
+Allows to skip some networks in Sniffer Dog and Blackout attacks. Add networks BSSIDs into white.txt file on your SD card, each in new line:
+
+AA:BB:CC:DD:EE:FF
+
+AA:BB:CC:DD:EE:FF
+
+AA:BB:CC:DD:EE:FF
+
+Please note start_deauth command does not respect whitelist - it attacks all selected networks. 
+
 # CLI Usage
 The board, when connected to USB, offers a CLI interface. 
 The CLI supports up/down arrows and TAB autocompletion. 

@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.3.0"
+#define JANOS_VERSION "0.4.0"
 
 
 #define NEOPIXEL_GPIO      27
@@ -282,6 +282,14 @@ static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
 static bool sd_card_mounted = false;
 
+// Whitelist for BSSID protection
+#define MAX_WHITELISTED_BSSIDS 150
+typedef struct {
+    uint8_t bssid[6];
+} whitelisted_bssid_t;
+static whitelisted_bssid_t whiteListedBssids[MAX_WHITELISTED_BSSIDS];
+static int whitelistedBssidsCount = 0;
+
 
 // Methods forward declarations
 static int cmd_scan_networks(int argc, char **argv);
@@ -347,6 +355,9 @@ static int find_next_wardrive_file_number(void);
 // Portal data logging functions
 static void save_evil_twin_password(const char* ssid, const char* password);
 static void save_portal_data(const char* ssid, const char* form_data);
+// Whitelist functions
+static void load_whitelist_from_sd(void);
+static bool is_bssid_whitelisted(const uint8_t *bssid);
 // SAE WPA3 attack methods forward declarations:
 //add methods declarations below:
 static void inject_sae_commit_frame();
@@ -1380,7 +1391,7 @@ static void blackout_attack_task(void *pvParameters) {
         // Save target BSSIDs for deauth attack
         save_target_bssids();
         
-        MY_LOG_INFO(TAG, "Starting deauth attack on all %d networks for 100 cycles...", g_selected_count);
+        MY_LOG_INFO(TAG, "Starting deauth attack on  %d networks (except whitelist) for 100 cycles...", g_selected_count);
         
         // Attack all networks for exactly 3 minutes (1800 cycles at 100ms each)
         int attack_cycles = 0;
@@ -3854,6 +3865,10 @@ void app_main(void) {
  
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Load BSSID whitelist from SD card
+    load_whitelist_from_sd();
+    
     MY_LOG_INFO(TAG,"BOARD READY");
     vTaskDelay(pdMS_TO_TICKS(100));
     
@@ -3880,6 +3895,14 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         }
 
         if (!target_bssids[i].active) continue;
+        
+        // Check if BSSID is whitelisted - but ONLY during blackout attack, not during regular deauth
+        if (blackout_attack_active && is_bssid_whitelisted(target_bssids[i].bssid)) {
+            // MY_LOG_INFO(TAG, "Skipping whitelisted BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
+            //            target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
+            //            target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5]);
+            continue;
+        }
         
         // Enhanced logging to debug BSSID mismatch issue
         // MY_LOG_INFO(TAG, "DEAUTH: Sending to SSID: %s, CH: %d, BSSID: %02X:%02X:%02X:%02X:%02X:%02X (target_bssids[%d])",
@@ -4906,6 +4929,11 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
         return;
     }
     
+    // Check if AP BSSID is whitelisted - skip if it is
+    if (is_bssid_whitelisted(ap_mac)) {
+        return; // Silently skip whitelisted networks
+    }
+    
     // We have a valid AP-STA pair! Send 5 deauth packets
     // Create deauth frame from AP to STA (not broadcast!)
     uint8_t deauth_frame[sizeof(deauth_frame_default)];
@@ -5365,6 +5393,98 @@ static void save_portal_data(const char* ssid, const char* form_data) {
     free(data_copy);
     
     MY_LOG_INFO(TAG, "Portal data saved to portals.txt");
+}
+
+// Load whitelist from SD card
+static void load_whitelist_from_sd(void) {
+    whitelistedBssidsCount = 0; // Reset count
+    
+    MY_LOG_INFO(TAG, "Checking for whitelist file (white.txt) on SD card...");
+    
+    // Try to initialize SD card (silently fail if not available)
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "SD card not available - whitelist will be empty");
+        return;
+    }
+    
+    // Try to open white.txt file
+    FILE *file = fopen("/sdcard/white.txt", "r");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "white.txt not found on SD card - whitelist will be empty");
+        return;
+    }
+    
+    MY_LOG_INFO(TAG, "Found white.txt, loading whitelisted BSSIDs...");
+    
+    char line[128];
+    int line_number = 0;
+    int loaded_count = 0;
+    
+    while (fgets(line, sizeof(line), file) != NULL && whitelistedBssidsCount < MAX_WHITELISTED_BSSIDS) {
+        line_number++;
+        
+        // Remove trailing newline/whitespace
+        line[strcspn(line, "\r\n")] = '\0';
+        
+        // Skip empty lines
+        if (strlen(line) == 0) {
+            continue;
+        }
+        
+        // Parse BSSID in format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX
+        uint8_t bssid[6];
+        int matches = 0;
+        
+        // Try with colon separator
+        matches = sscanf(line, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                        &bssid[0], &bssid[1], &bssid[2],
+                        &bssid[3], &bssid[4], &bssid[5]);
+        
+        // If that didn't work, try with dash separator
+        if (matches != 6) {
+            matches = sscanf(line, "%hhx-%hhx-%hhx-%hhx-%hhx-%hhx",
+                            &bssid[0], &bssid[1], &bssid[2],
+                            &bssid[3], &bssid[4], &bssid[5]);
+        }
+        
+        if (matches == 6) {
+            // Valid BSSID found, add to whitelist
+            memcpy(whiteListedBssids[whitelistedBssidsCount].bssid, bssid, 6);
+            whitelistedBssidsCount++;
+            loaded_count++;
+            
+            MY_LOG_INFO(TAG, "  [%d] Loaded: %02X:%02X:%02X:%02X:%02X:%02X",
+                       loaded_count,
+                       bssid[0], bssid[1], bssid[2],
+                       bssid[3], bssid[4], bssid[5]);
+        } else {
+            MY_LOG_INFO(TAG, "  Line %d: Invalid BSSID format, ignoring: %s", line_number, line);
+        }
+    }
+    
+    fclose(file);
+    
+    if (whitelistedBssidsCount > 0) {
+        MY_LOG_INFO(TAG, "Successfully loaded %d whitelisted BSSID(s)", whitelistedBssidsCount);
+    } else {
+        MY_LOG_INFO(TAG, "No valid BSSIDs found in white.txt");
+    }
+}
+
+// Check if a BSSID is in the whitelist
+static bool is_bssid_whitelisted(const uint8_t *bssid) {
+    if (bssid == NULL || whitelistedBssidsCount == 0) {
+        return false;
+    }
+    
+    for (int i = 0; i < whitelistedBssidsCount; i++) {
+        if (memcmp(bssid, whiteListedBssids[i].bssid, 6) == 0) {
+            return true;
+        }
+    }
+    
+    return false;
 }
 
 
