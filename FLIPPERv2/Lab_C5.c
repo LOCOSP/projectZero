@@ -22,6 +22,7 @@ typedef enum {
     ScreenSetupScanner,
     ScreenConsole,
     ScreenConfirmBlackout,
+    ScreenEvilTwinMenu,
 } AppScreen;
 
 typedef enum {
@@ -85,6 +86,10 @@ typedef enum {
 #define HINT_LINE_CHAR_LIMIT 48
 #define HINT_WRAP_LIMIT 21
 #define HINT_LINE_HEIGHT 12
+#define EVIL_TWIN_MAX_HTML_FILES 16
+#define EVIL_TWIN_HTML_NAME_MAX 32
+#define EVIL_TWIN_POPUP_VISIBLE_LINES 3
+#define EVIL_TWIN_MENU_OPTION_COUNT 2
 
 typedef enum {
     MenuActionCommand,
@@ -95,6 +100,7 @@ typedef enum {
     MenuActionOpenScannerSetup,
     MenuActionOpenConsole,
     MenuActionConfirmBlackout,
+    MenuActionOpenEvilTwinMenu,
 } MenuAction;
 
 typedef enum {
@@ -122,6 +128,11 @@ typedef struct {
 } ScanResult;
 
 typedef struct {
+    uint8_t id;
+    char name[EVIL_TWIN_HTML_NAME_MAX];
+} EvilTwinHtmlEntry;
+
+typedef struct {
     bool exit_app;
     MenuState menu_state;
     uint32_t section_index;
@@ -140,6 +151,19 @@ typedef struct {
     bool serial_targets_hint;
     bool last_command_sent;
     bool confirm_blackout_yes;
+    uint32_t last_attack_index;
+    size_t evil_twin_menu_index;
+    EvilTwinHtmlEntry evil_twin_html_entries[EVIL_TWIN_MAX_HTML_FILES];
+    size_t evil_twin_html_count;
+    size_t evil_twin_html_popup_index;
+    size_t evil_twin_html_popup_offset;
+    bool evil_twin_popup_active;
+    bool evil_twin_listing_active;
+    bool evil_twin_list_header_seen;
+    char evil_twin_list_buffer[64];
+    size_t evil_twin_list_length;
+    uint8_t evil_twin_selected_html_id;
+    char evil_twin_selected_html_name[EVIL_TWIN_HTML_NAME_MAX];
     ScanResult scan_results[MAX_SCAN_RESULTS];
     size_t scan_result_count;
     size_t scan_result_index;
@@ -201,6 +225,17 @@ static void simple_app_prepare_hint_lines(SimpleApp* app, const char* text);
 static void simple_app_hint_scroll(SimpleApp* app, int delta);
 static size_t simple_app_hint_max_scroll(const SimpleApp* app);
 static bool simple_app_try_show_hint(SimpleApp* app);
+static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key);
+static void simple_app_request_evil_twin_html_list(SimpleApp* app);
+static void simple_app_start_evil_portal(SimpleApp* app);
+static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputEvent* event);
+static void simple_app_close_evil_twin_popup(SimpleApp* app);
+static void simple_app_reset_evil_twin_listing(SimpleApp* app);
+static void simple_app_finish_evil_twin_listing(SimpleApp* app);
+static void simple_app_process_evil_twin_line(SimpleApp* app, const char* line);
+static void simple_app_evil_twin_feed(SimpleApp* app, char ch);
 static void simple_app_save_config_if_dirty(SimpleApp* app, const char* message, bool fullscreen);
 static bool simple_app_save_config(SimpleApp* app, const char* success_message, bool fullscreen);
 static void simple_app_load_config(SimpleApp* app);
@@ -261,9 +296,11 @@ static const char hint_attack_blackout[] =
 static const char hint_attack_deauth[] =
     "Launch deauth waves\nTargets chosen Wi-Fi\nDisrupts client links\nUse only with rights\nMonitor via console.";
 static const char hint_attack_evil_twin[] =
-    "Clone selected SSID\nNotify ESP module\nAwait credentials\nPair with deauth\nFor phishing demos.";
+    "Clone selected SSID\nRequire selected net\nNotify ESP module\nAwait credentials\nPair with deauth.";
 static const char hint_attack_sae_overflow[] =
-    "Craft SAE traffic\nExercise WPA3 APs\nWatch retry counts\nObserve UART log\nStop when done.";
+    "Craft SAE traffic\nRequire selected net\nExercise WPA3 APs\nWatch retry counts\nStop when done.";
+static const char hint_attack_sniffer_dog[] =
+    "Sniff AP-client chat\nListen for traffic\nCatch handshake peaks\nSend deauth frames\nUse in lab only.";
 static const char hint_attack_wardrive[] =
     "Wardrive logger mode\nWrites data to SD\nAdds GPS context\nMap wireless areas\nReview later.";
 
@@ -286,8 +323,9 @@ static const MenuEntry menu_entries_sniffers[] = {
 static const MenuEntry menu_entries_attacks[] = {
     {"Blackout", NULL, MenuActionConfirmBlackout, hint_attack_blackout},
     {"Deauth", "start_deauth", MenuActionCommandWithTargets, hint_attack_deauth},
-    {"Evil Twin", "start_evil_twin", MenuActionCommand, hint_attack_evil_twin},
-    {"SAE Overflow", "sae_overflow", MenuActionCommand, hint_attack_sae_overflow},
+    {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu, hint_attack_evil_twin},
+    {"SAE Overflow", "sae_overflow", MenuActionCommandWithTargets, hint_attack_sae_overflow},
+    {"Sniffer Dog", "start_sniffer_dog", MenuActionCommand, hint_attack_sniffer_dog},
     {"Wardrive", "start_wardrive", MenuActionCommand, hint_attack_wardrive},
 };
 
@@ -333,13 +371,26 @@ static void simple_app_focus_attacks_menu(SimpleApp* app) {
         app->item_offset = 0;
         return;
     }
-    app->item_index = section->entry_count - 1;
+    size_t entry_count = section->entry_count;
+    if(app->last_attack_index >= entry_count) {
+        app->last_attack_index = entry_count - 1;
+    }
+    app->item_index = app->last_attack_index;
     size_t visible_count = simple_app_menu_visible_count(app, MENU_SECTION_ATTACKS);
     if(visible_count == 0) visible_count = 1;
-    if(section->entry_count > visible_count) {
-        app->item_offset = section->entry_count - visible_count;
-    } else {
+    if(app->item_index >= entry_count) {
+        app->item_index = entry_count - 1;
+    }
+    if(entry_count <= visible_count) {
         app->item_offset = 0;
+    } else {
+        size_t max_offset = entry_count - visible_count;
+        size_t desired_offset =
+            (app->item_index >= visible_count) ? (app->item_index - visible_count + 1) : 0;
+        if(desired_offset > max_offset) {
+            desired_offset = max_offset;
+        }
+        app->item_offset = desired_offset;
     }
 }
 
@@ -1262,7 +1313,9 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
     furi_mutex_release(app->serial_mutex);
 
     for(size_t i = 0; i < length; i++) {
-        simple_app_scan_feed(app, (char)data[i]);
+        char ch = (char)data[i];
+        simple_app_scan_feed(app, ch);
+        simple_app_evil_twin_feed(app, ch);
     }
 
     if(trimmed_any && !app->serial_follow_tail) {
@@ -1313,7 +1366,7 @@ static void simple_app_send_command_with_targets(SimpleApp* app, const char* bas
         return;
     }
 
-    if(strcmp(base_command, "start_deauth") == 0) {
+    if(strcmp(base_command, "start_deauth") == 0 || strcmp(base_command, "start_evil_twin") == 0) {
         char select_command[160];
         size_t written = snprintf(select_command, sizeof(select_command), "select_networks");
         if(written >= sizeof(select_command)) {
@@ -1584,6 +1637,7 @@ static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
 static void simple_app_handle_confirm_blackout_input(SimpleApp* app, InputKey key) {
     if(!app) return;
     if(key == InputKeyBack) {
+        simple_app_send_stop_if_needed(app);
         app->confirm_blackout_yes = false;
         simple_app_focus_attacks_menu(app);
         view_port_update(app->viewport);
@@ -1736,6 +1790,7 @@ static void simple_app_handle_hint_event(SimpleApp* app, const InputEvent* event
     if(!app || !event) return;
 
     if(event->type == InputTypeShort && event->key == InputKeyBack) {
+        simple_app_send_stop_if_needed(app);
         simple_app_hide_hint(app);
         return;
     }
@@ -1854,6 +1909,136 @@ static bool simple_app_try_show_hint(SimpleApp* app) {
 
     simple_app_show_hint(app, entry->label, hint_text);
     return true;
+}
+
+static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 4, 14, "Evil Twin");
+
+    canvas_set_font(canvas, FontSecondary);
+    uint8_t y = 30;
+
+    for(size_t idx = 0; idx < EVIL_TWIN_MENU_OPTION_COUNT; idx++) {
+        const char* label = (idx == 0) ? "Select HTML" : "Start Evil Twin";
+        if(app->evil_twin_menu_index == idx) {
+            canvas_draw_str(canvas, 2, y, ">");
+        }
+        canvas_draw_str(canvas, 14, y, label);
+        if(idx == 0) {
+            char status[48];
+            if(app->evil_twin_selected_html_id > 0 &&
+               app->evil_twin_selected_html_name[0] != '\0') {
+                snprintf(status, sizeof(status), "Current: %s", app->evil_twin_selected_html_name);
+            } else {
+                snprintf(status, sizeof(status), "Current: <none>");
+            }
+            simple_app_truncate_text(status, 26);
+            canvas_draw_str(canvas, 14, y + 10, status);
+            y += 10;
+        }
+        y += 12;
+    }
+
+    canvas_draw_str(canvas, 2, 62, "OK choose, Back menu");
+}
+
+static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas || !app->evil_twin_popup_active) return;
+
+    const uint8_t bubble_x = 4;
+    const uint8_t bubble_y = 4;
+    const uint8_t bubble_w = DISPLAY_WIDTH - (bubble_x * 2);
+    const uint8_t bubble_h = 56;
+    const uint8_t radius = 9;
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_rbox(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_rframe(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, bubble_x + 8, bubble_y + 16, "Select HTML");
+
+    canvas_set_font(canvas, FontSecondary);
+    uint8_t list_y = bubble_y + 30;
+
+    if(app->evil_twin_html_count == 0) {
+        canvas_draw_str(canvas, bubble_x + 10, list_y, "No HTML files");
+        canvas_draw_str(canvas, bubble_x + 10, (uint8_t)(list_y + HINT_LINE_HEIGHT), "Back returns to menu");
+        return;
+    }
+
+    size_t visible = app->evil_twin_html_count;
+    if(visible > EVIL_TWIN_POPUP_VISIBLE_LINES) {
+        visible = EVIL_TWIN_POPUP_VISIBLE_LINES;
+    }
+
+    if(app->evil_twin_html_popup_offset >= app->evil_twin_html_count) {
+        app->evil_twin_html_popup_offset =
+            (app->evil_twin_html_count > visible) ? (app->evil_twin_html_count - visible) : 0;
+    }
+
+    for(size_t i = 0; i < visible; i++) {
+        size_t idx = app->evil_twin_html_popup_offset + i;
+        if(idx >= app->evil_twin_html_count) break;
+        const EvilTwinHtmlEntry* entry = &app->evil_twin_html_entries[idx];
+        char line[48];
+        snprintf(line, sizeof(line), "%u %s", (unsigned)entry->id, entry->name);
+        simple_app_truncate_text(line, 28);
+        uint8_t line_y = (uint8_t)(list_y + i * HINT_LINE_HEIGHT);
+        if(idx == app->evil_twin_html_popup_index) {
+            canvas_draw_str(canvas, bubble_x + 4, line_y, ">");
+        }
+        canvas_draw_str(canvas, bubble_x + 8, line_y, line);
+    }
+
+    if(app->evil_twin_html_count > EVIL_TWIN_POPUP_VISIBLE_LINES) {
+        const uint8_t track_width = 3;
+        uint8_t track_height = (uint8_t)(EVIL_TWIN_POPUP_VISIBLE_LINES * HINT_LINE_HEIGHT);
+        const uint8_t track_x = bubble_x + bubble_w - track_width - 6;
+        uint8_t track_y = list_y;
+
+        uint8_t track_bottom_limit = (uint8_t)(bubble_y + bubble_h - 6);
+        if((uint8_t)(track_y + track_height) > track_bottom_limit) {
+            if(track_bottom_limit > track_height) {
+                track_y = (uint8_t)(track_bottom_limit - track_height);
+            } else {
+                track_y = (uint8_t)(bubble_y + 2);
+            }
+        }
+
+        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
+
+        size_t max_offset = app->evil_twin_html_count - EVIL_TWIN_POPUP_VISIBLE_LINES;
+        uint8_t thumb_height =
+            (uint8_t)(((uint32_t)EVIL_TWIN_POPUP_VISIBLE_LINES * track_height) / app->evil_twin_html_count);
+        if(thumb_height < 4) thumb_height = 4;
+        if(thumb_height > track_height) thumb_height = track_height;
+
+        uint8_t max_thumb_offset =
+            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
+        uint8_t thumb_offset = 0;
+        if(max_offset > 0 && max_thumb_offset > 0) {
+            size_t offset = app->evil_twin_html_popup_offset;
+            if(offset > max_offset) offset = max_offset;
+            thumb_offset = (uint8_t)(((uint32_t)offset * max_thumb_offset) / max_offset);
+        }
+
+        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
+        uint8_t thumb_inner_height =
+            (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
+        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
+
+        canvas_draw_box(
+            canvas,
+            (track_width > 2) ? (uint8_t)(track_x + 1) : track_x,
+            (uint8_t)(track_y + 1 + thumb_offset),
+            thumb_width,
+            thumb_inner_height);
+    }
 }
 
 static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
@@ -2403,12 +2588,17 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenConfirmBlackout:
         simple_app_draw_confirm_blackout(app, canvas);
         break;
+    case ScreenEvilTwinMenu:
+        simple_app_draw_evil_twin_menu(app, canvas);
+        break;
     default:
         simple_app_draw_results(app, canvas);
         break;
     }
 
-    if(app->hint_active) {
+    if(app->evil_twin_popup_active) {
+        simple_app_draw_evil_twin_popup(app, canvas);
+    } else if(app->hint_active) {
         simple_app_draw_hint(app, canvas);
     }
 }
@@ -2425,6 +2615,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             if(section->entry_count == 0) return;
             if(app->item_index > 0) {
                 app->item_index--;
+                if(app->section_index == MENU_SECTION_ATTACKS) {
+                    app->last_attack_index = app->item_index;
+                }
                 if(app->item_index < app->item_offset) {
                     app->item_offset = app->item_index;
                 }
@@ -2442,6 +2635,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             if(section->entry_count == 0) return;
             if(app->item_index + 1 < section->entry_count) {
                 app->item_index++;
+                if(app->section_index == MENU_SECTION_ATTACKS) {
+                    app->last_attack_index = app->item_index;
+                }
                 size_t visible_count = simple_app_menu_visible_count(app, app->section_index);
                 if(visible_count == 0) visible_count = 1;
                 if(app->item_index >= app->item_offset + visible_count) {
@@ -2461,6 +2657,12 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
                 return;
             }
             app->menu_state = MenuStateItems;
+            if(app->section_index == MENU_SECTION_ATTACKS) {
+                simple_app_focus_attacks_menu(app);
+                app->last_attack_index = app->item_index;
+                view_port_update(app->viewport);
+                return;
+            }
             app->item_index = 0;
             app->item_offset = 0;
             size_t visible_count = simple_app_menu_visible_count(app, app->section_index);
@@ -2480,6 +2682,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         if(app->item_index >= section->entry_count) {
             app->item_index = section->entry_count - 1;
         }
+        if(app->section_index == MENU_SECTION_ATTACKS) {
+            app->last_attack_index = app->item_index;
+        }
 
         const MenuEntry* entry = &section->entries[app->item_index];
         if(entry->action == MenuActionResults) {
@@ -2490,6 +2695,10 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             if(entry->command && entry->command[0] != '\0') {
                 simple_app_send_command(app, entry->command, true);
             }
+        } else if(entry->action == MenuActionOpenEvilTwinMenu) {
+            app->screen = ScreenEvilTwinMenu;
+            app->evil_twin_menu_index = 0;
+            view_port_update(app->viewport);
         } else if(entry->action == MenuActionToggleBacklight) {
             simple_app_toggle_backlight(app);
         } else if(entry->action == MenuActionToggleOtgPower) {
@@ -2519,10 +2728,337 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
     }
 }
 
+static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack || key == InputKeyLeft) {
+        if(app->evil_twin_listing_active) {
+            simple_app_send_stop_if_needed(app);
+            simple_app_reset_evil_twin_listing(app);
+            simple_app_clear_status_message(app);
+        }
+        simple_app_close_evil_twin_popup(app);
+        simple_app_focus_attacks_menu(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyUp) {
+        if(app->evil_twin_menu_index > 0) {
+            app->evil_twin_menu_index--;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyDown) {
+        if(app->evil_twin_menu_index + 1 < EVIL_TWIN_MENU_OPTION_COUNT) {
+            app->evil_twin_menu_index++;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyOk) {
+        if(app->evil_twin_menu_index == 0) {
+            if(app->evil_twin_listing_active) {
+                simple_app_show_status_message(app, "Listing already\nin progress", 1200, true);
+                return;
+            }
+            simple_app_request_evil_twin_html_list(app);
+        } else {
+            simple_app_start_evil_portal(app);
+        }
+    }
+}
+
+static void simple_app_request_evil_twin_html_list(SimpleApp* app) {
+    if(!app) return;
+    simple_app_close_evil_twin_popup(app);
+    simple_app_reset_evil_twin_listing(app);
+    app->evil_twin_listing_active = true;
+    simple_app_show_status_message(app, "Listing HTML...", 0, false);
+    simple_app_send_command(app, "list_sd", true);
+}
+
+static void simple_app_start_evil_portal(SimpleApp* app) {
+    if(!app) return;
+    if(app->evil_twin_listing_active) {
+        simple_app_show_status_message(app, "Wait for list\ncompletion", 1200, true);
+        return;
+    }
+    if(app->evil_twin_selected_html_id == 0) {
+        simple_app_show_status_message(app, "Select HTML file\nbefore starting", 1500, true);
+        return;
+    }
+    char select_command[48];
+    snprintf(
+        select_command,
+        sizeof(select_command),
+        "select_html %u",
+        (unsigned)app->evil_twin_selected_html_id);
+    simple_app_send_command(app, select_command, false);
+    app->last_command_sent = false;
+    simple_app_send_command_with_targets(app, "start_evil_twin");
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_close_evil_twin_popup(SimpleApp* app) {
+    if(!app) return;
+    app->evil_twin_popup_active = false;
+}
+
+static void simple_app_reset_evil_twin_listing(SimpleApp* app) {
+    if(!app) return;
+    app->evil_twin_listing_active = false;
+    app->evil_twin_list_header_seen = false;
+    app->evil_twin_list_length = 0;
+    app->evil_twin_html_count = 0;
+    app->evil_twin_html_popup_index = 0;
+    app->evil_twin_html_popup_offset = 0;
+}
+
+static void simple_app_finish_evil_twin_listing(SimpleApp* app) {
+    if(!app || !app->evil_twin_listing_active) return;
+    app->evil_twin_listing_active = false;
+    app->evil_twin_list_length = 0;
+    app->evil_twin_list_header_seen = false;
+    app->evil_twin_popup_active = false;
+    app->last_command_sent = false;
+    app->screen = ScreenEvilTwinMenu;
+    simple_app_clear_status_message(app);
+
+    if(app->evil_twin_html_count == 0) {
+        simple_app_show_status_message(app, "No HTML files\nfound on SD", 1500, true);
+        return;
+    }
+
+    size_t target_index = 0;
+    if(app->evil_twin_selected_html_id != 0) {
+        for(size_t i = 0; i < app->evil_twin_html_count; i++) {
+            if(app->evil_twin_html_entries[i].id == app->evil_twin_selected_html_id) {
+                target_index = i;
+                break;
+            }
+        }
+        if(target_index >= app->evil_twin_html_count) {
+            target_index = 0;
+        }
+    }
+
+    app->evil_twin_html_popup_index = target_index;
+    size_t visible = (app->evil_twin_html_count > EVIL_TWIN_POPUP_VISIBLE_LINES)
+                         ? EVIL_TWIN_POPUP_VISIBLE_LINES
+                         : app->evil_twin_html_count;
+    if(visible == 0) visible = 1;
+    if(app->evil_twin_html_count <= visible ||
+       app->evil_twin_html_popup_index < visible) {
+        app->evil_twin_html_popup_offset = 0;
+    } else {
+        app->evil_twin_html_popup_offset =
+            app->evil_twin_html_popup_index - visible + 1;
+    }
+    size_t max_offset =
+        (app->evil_twin_html_count > visible) ? (app->evil_twin_html_count - visible) : 0;
+    if(app->evil_twin_html_popup_offset > max_offset) {
+        app->evil_twin_html_popup_offset = max_offset;
+    }
+
+    app->evil_twin_popup_active = true;
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_process_evil_twin_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->evil_twin_listing_active) return;
+
+    const char* cursor = line;
+    while(*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+    if(*cursor == '\0') {
+        if(app->evil_twin_html_count > 0) {
+            simple_app_finish_evil_twin_listing(app);
+        }
+        return;
+    }
+
+    if(strncmp(cursor, "HTML files", 10) == 0) {
+        app->evil_twin_list_header_seen = true;
+        return;
+    }
+
+    if(strncmp(cursor, "No HTML", 7) == 0 || strncmp(cursor, "No html", 7) == 0) {
+        app->evil_twin_html_count = 0;
+        simple_app_finish_evil_twin_listing(app);
+        return;
+    }
+
+    if(!isdigit((unsigned char)cursor[0])) {
+        if(app->evil_twin_html_count > 0) {
+            simple_app_finish_evil_twin_listing(app);
+        }
+        return;
+    }
+
+    char* endptr = NULL;
+    long id = strtol(cursor, &endptr, 10);
+    if(id <= 0 || id > 255 || !endptr) {
+        return;
+    }
+    while(*endptr == ' ' || *endptr == '\t') {
+        endptr++;
+    }
+    if(*endptr == '\0') {
+        return;
+    }
+
+    if(app->evil_twin_html_count >= EVIL_TWIN_MAX_HTML_FILES) {
+        return;
+    }
+
+    EvilTwinHtmlEntry* entry = &app->evil_twin_html_entries[app->evil_twin_html_count++];
+    entry->id = (uint8_t)id;
+    strncpy(entry->name, endptr, EVIL_TWIN_HTML_NAME_MAX - 1);
+    entry->name[EVIL_TWIN_HTML_NAME_MAX - 1] = '\0';
+    app->evil_twin_list_header_seen = true;
+
+    size_t len = strlen(entry->name);
+    while(len > 0 &&
+          (entry->name[len - 1] == '\r' || entry->name[len - 1] == '\n' ||
+           entry->name[len - 1] == ' ')) {
+        entry->name[--len] = '\0';
+    }
+}
+
+static void simple_app_evil_twin_feed(SimpleApp* app, char ch) {
+    if(!app || !app->evil_twin_listing_active) return;
+    if(ch == '\r') return;
+
+    if(ch == '>') {
+        if(app->evil_twin_list_length > 0) {
+            app->evil_twin_list_buffer[app->evil_twin_list_length] = '\0';
+            simple_app_process_evil_twin_line(app, app->evil_twin_list_buffer);
+            app->evil_twin_list_length = 0;
+        }
+        if(app->evil_twin_html_count > 0 || app->evil_twin_list_header_seen) {
+            simple_app_finish_evil_twin_listing(app);
+        }
+        return;
+    }
+
+    if(ch == '\n') {
+        if(app->evil_twin_list_length > 0) {
+            app->evil_twin_list_buffer[app->evil_twin_list_length] = '\0';
+            simple_app_process_evil_twin_line(app, app->evil_twin_list_buffer);
+        } else if(app->evil_twin_list_header_seen) {
+            simple_app_finish_evil_twin_listing(app);
+        }
+        app->evil_twin_list_length = 0;
+        return;
+    }
+
+    if(app->evil_twin_list_length + 1 >= sizeof(app->evil_twin_list_buffer)) {
+        app->evil_twin_list_length = 0;
+        return;
+    }
+
+    app->evil_twin_list_buffer[app->evil_twin_list_length++] = ch;
+}
+
+static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputEvent* event) {
+    if(!app || !event || !app->evil_twin_popup_active) return;
+
+    if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
+
+    InputKey key = event->key;
+    if(event->type == InputTypeShort && key == InputKeyBack) {
+        simple_app_close_evil_twin_popup(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->evil_twin_html_count == 0) {
+        if(event->type == InputTypeShort && key == InputKeyOk) {
+            simple_app_close_evil_twin_popup(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    size_t visible = (app->evil_twin_html_count > EVIL_TWIN_POPUP_VISIBLE_LINES)
+                         ? EVIL_TWIN_POPUP_VISIBLE_LINES
+                         : app->evil_twin_html_count;
+    if(visible == 0) visible = 1;
+
+    if(key == InputKeyUp) {
+        if(app->evil_twin_html_popup_index > 0) {
+            app->evil_twin_html_popup_index--;
+            if(app->evil_twin_html_popup_index < app->evil_twin_html_popup_offset) {
+                app->evil_twin_html_popup_offset = app->evil_twin_html_popup_index;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyDown) {
+        if(app->evil_twin_html_popup_index + 1 < app->evil_twin_html_count) {
+            app->evil_twin_html_popup_index++;
+            if(app->evil_twin_html_count > visible &&
+               app->evil_twin_html_popup_index >=
+                   app->evil_twin_html_popup_offset + visible) {
+                app->evil_twin_html_popup_offset =
+                    app->evil_twin_html_popup_index - visible + 1;
+            }
+            size_t max_offset =
+                (app->evil_twin_html_count > visible) ? (app->evil_twin_html_count - visible) : 0;
+            if(app->evil_twin_html_popup_offset > max_offset) {
+                app->evil_twin_html_popup_offset = max_offset;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(event->type == InputTypeShort && key == InputKeyOk) {
+        if(app->evil_twin_html_popup_index < app->evil_twin_html_count) {
+            const EvilTwinHtmlEntry* entry =
+                &app->evil_twin_html_entries[app->evil_twin_html_popup_index];
+            app->evil_twin_selected_html_id = entry->id;
+            strncpy(
+                app->evil_twin_selected_html_name,
+                entry->name,
+                EVIL_TWIN_HTML_NAME_MAX - 1);
+            app->evil_twin_selected_html_name[EVIL_TWIN_HTML_NAME_MAX - 1] = '\0';
+
+            char command[48];
+            snprintf(command, sizeof(command), "select_html %u", (unsigned)entry->id);
+            simple_app_send_command(app, command, false);
+            app->last_command_sent = false;
+
+            char message[64];
+            snprintf(message, sizeof(message), "HTML set:\n%s", entry->name);
+            simple_app_show_status_message(app, message, 1500, true);
+
+            simple_app_close_evil_twin_popup(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    }
+}
+
 static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) {
     if(!app) return;
 
     if(key == InputKeyBack) {
+        simple_app_send_stop_if_needed(app);
         if(app->scanner_adjusting_power) {
             app->scanner_adjusting_power = false;
             view_port_update(app->viewport);
@@ -2693,6 +3229,7 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
             app->section_index = MENU_SECTION_ATTACKS;
             app->item_index = 0;
             app->item_offset = 0;
+            app->last_attack_index = 0;
             view_port_update(app->viewport);
         }
     }
@@ -2709,8 +3246,16 @@ static void simple_app_input(InputEvent* event, void* context) {
     if(simple_app_status_message_is_active(app) && app->status_message_fullscreen) {
         if(event->type == InputTypeShort &&
            (event->key == InputKeyOk || event->key == InputKeyBack)) {
+            if(event->key == InputKeyBack) {
+                simple_app_send_stop_if_needed(app);
+            }
             simple_app_clear_status_message(app);
         }
+        return;
+    }
+
+    if(app->evil_twin_popup_active) {
+        simple_app_handle_evil_twin_popup_event(app, event);
         return;
     }
 
@@ -2753,6 +3298,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         break;
     case ScreenConfirmBlackout:
         simple_app_handle_confirm_blackout_input(app, event->key);
+        break;
+    case ScreenEvilTwinMenu:
+        simple_app_handle_evil_twin_menu_input(app, event->key);
         break;
     default:
         simple_app_handle_results_input(app, event->key);
