@@ -71,6 +71,10 @@ AA:BB:CC:DD:EE:FF
 
 Please note start_deauth command does not respect whitelist - it attacks all selected networks. 
 
+## Karma attack
+This attack relies on sniffing of probe requests sent by phones around you. Next, it will start a captive portal network where SSID is based on the sniffed probe.
+Example: Sniffer shows a phone around you looks for 'Starbucks' network. Karma will start a new network named 'Starbucks' using your html file. When user connects, will be redirected to your captive portal asking for Instagram credentials to log in.
+
 # CLI Usage
 The board, when connected to USB, offers a CLI interface. 
 The CLI supports up/down arrows and TAB autocompletion. 
@@ -234,6 +238,30 @@ start_portal MySSID
 
 Network named MySSID will be created. All entered credentials will be stored in PORTAL.TXT file on SD card.
 
+## Karma
+First, run:
+
+> start_sniffer
+
+When collected enough packets, stop it: 
+
+> stop
+
+Next, show probe requests:
+
+> list_probes
+
+And you will see output with sequential numbers:
+
+1 Starbucks
+
+2 McDonalds
+
+Next, load your target HTML portal file using commands list_sd and select_html. When done, start karma atatck:
+
+start_karma 2
+
+This will start 'McDonalds' network which opens your captive portal.
 
 # Flipper application screens and user journey
 Run the app:
