@@ -63,9 +63,9 @@ typedef enum {
 #define RESULT_START_Y 12
 #define RESULT_ENTRY_SPACING 0
 #define RESULT_PREFIX_X 2
-#define RESULT_TEXT_X 9
+#define RESULT_TEXT_X 5
 #define RESULT_SCROLL_WIDTH 3
-#define RESULT_SCROLL_GAP 1
+#define RESULT_SCROLL_GAP 0
 #define CONSOLE_VISIBLE_LINES 4
 #define MENU_SECTION_SCANNER 0
 #define MENU_SECTION_SNIFFERS 1
@@ -609,40 +609,200 @@ static void simple_app_update_result_layout(SimpleApp* app) {
     }
 }
 
-static void simple_app_append_field(
-    char* buffer,
-    size_t buffer_size,
-    size_t* offset,
-    bool* first_field,
-    const char* prefix,
-    const char* value,
-    const char* suffix) {
-    if(!buffer || buffer_size == 0 || !offset || !first_field || !value || value[0] == '\0') {
-        return;
-    }
-
-    size_t remaining = (buffer_size > *offset) ? (buffer_size - *offset) : 0;
+static void simple_app_line_append_token(
+    char* line,
+    size_t line_size,
+    const char* label,
+    const char* value) {
+    if(!line || line_size == 0 || !value || value[0] == '\0') return;
+    size_t current_len = strlen(line);
+    if(current_len >= line_size - 1) return;
+    size_t remaining = (line_size > current_len) ? (line_size - current_len - 1) : 0;
     if(remaining == 0) return;
 
-    const char* separator = *first_field ? " " : " | ";
-    int written = snprintf(
-        buffer + *offset,
-        remaining,
-        "%s%s%s%s",
-        separator,
-        prefix ? prefix : "",
-        value,
-        suffix ? suffix : "");
-
-    if(written < 0) return;
-    size_t consumed = (size_t)written;
-    if(consumed >= remaining) {
-        *offset = buffer_size - 1;
-        buffer[buffer_size - 1] = '\0';
-    } else {
-        *offset += consumed;
+    const char* separator = (current_len > 0) ? "  " : "";
+    size_t sep_len = strlen(separator);
+    if(sep_len > remaining) sep_len = remaining;
+    if(sep_len > 0) {
+        memcpy(line + current_len, separator, sep_len);
+        current_len += sep_len;
+        remaining -= sep_len;
     }
-    *first_field = false;
+
+    if(label && label[0] != '\0' && remaining > 0) {
+        size_t label_len = strlen(label);
+        if(label_len > remaining) label_len = remaining;
+        memcpy(line + current_len, label, label_len);
+        current_len += label_len;
+        remaining -= label_len;
+    }
+
+    if(remaining > 0) {
+        size_t value_len = strlen(value);
+        if(value_len > remaining) value_len = remaining;
+        memcpy(line + current_len, value, value_len);
+        current_len += value_len;
+    }
+
+    if(current_len < line_size) {
+        line[current_len] = '\0';
+    } else {
+        line[line_size - 1] = '\0';
+    }
+}
+
+static size_t simple_app_build_result_lines(
+    const SimpleApp* app,
+    const ScanResult* result,
+    char lines[][64],
+    size_t max_lines) {
+    if(!app || !result || max_lines == 0) return 0;
+
+    size_t char_limit = (app->result_char_limit > 0) ? app->result_char_limit : RESULT_DEFAULT_CHAR_LIMIT;
+    if(char_limit == 0) char_limit = RESULT_DEFAULT_CHAR_LIMIT;
+    if(char_limit >= 63) char_limit = 63;
+
+    bool store_lines = (lines != NULL);
+    if(max_lines > RESULT_DEFAULT_MAX_LINES) {
+        max_lines = RESULT_DEFAULT_MAX_LINES;
+    }
+
+    size_t emitted = 0;
+    const size_t line_cap = 64;
+    size_t truncate_limit = (char_limit < (line_cap - 1)) ? char_limit : (line_cap - 1);
+    if(truncate_limit < 1) truncate_limit = 1;
+
+#define SIMPLE_APP_EMIT_LINE(buffer) \
+    do { \
+        if(emitted < max_lines) { \
+            if(store_lines) { \
+                strncpy(lines[emitted], buffer, line_cap - 1); \
+                lines[emitted][line_cap - 1] = '\0'; \
+                simple_app_truncate_text(lines[emitted], truncate_limit); \
+            } \
+            emitted++; \
+        } \
+    } while(0)
+
+    char first_line[line_cap];
+    memset(first_line, 0, sizeof(first_line));
+    snprintf(first_line, sizeof(first_line), "%u%s", (unsigned)result->number, result->selected ? "*" : "");
+
+    bool ssid_visible = app->scanner_show_ssid && result->ssid[0] != '\0';
+    if(ssid_visible) {
+        size_t len = strlen(first_line);
+        if(len < sizeof(first_line) - 1) {
+            size_t remaining = sizeof(first_line) - len - 1;
+            if(remaining > 0) {
+                first_line[len++] = ' ';
+                size_t ssid_len = strlen(result->ssid);
+                if(ssid_len > remaining) ssid_len = remaining;
+                memcpy(first_line + len, result->ssid, ssid_len);
+                len += ssid_len;
+                first_line[len] = '\0';
+            }
+        }
+    }
+
+    bool bssid_in_first_line = false;
+    if(!ssid_visible && app->scanner_show_bssid && result->bssid[0] != '\0') {
+        size_t len = strlen(first_line);
+        if(len < sizeof(first_line) - 1) {
+            size_t remaining = sizeof(first_line) - len - 1;
+            if(remaining > 0) {
+                first_line[len++] = ' ';
+                size_t bssid_len = strlen(result->bssid);
+                if(bssid_len > remaining) bssid_len = remaining;
+                memcpy(first_line + len, result->bssid, bssid_len);
+                len += bssid_len;
+                first_line[len] = '\0';
+                bssid_in_first_line = true;
+            }
+        }
+    }
+
+    SIMPLE_APP_EMIT_LINE(first_line);
+
+    if(emitted < max_lines && app->scanner_show_bssid && !bssid_in_first_line &&
+       result->bssid[0] != '\0') {
+        char bssid_line[line_cap];
+        memset(bssid_line, 0, sizeof(bssid_line));
+        size_t len = 0;
+        bssid_line[len++] = ' ';
+        if(len < sizeof(bssid_line) - 1) {
+            size_t remaining = sizeof(bssid_line) - len - 1;
+            size_t bssid_len = strlen(result->bssid);
+            if(bssid_len > remaining) bssid_len = remaining;
+            memcpy(bssid_line + len, result->bssid, bssid_len);
+            len += bssid_len;
+            bssid_line[len] = '\0';
+        } else {
+            bssid_line[sizeof(bssid_line) - 1] = '\0';
+        }
+        SIMPLE_APP_EMIT_LINE(bssid_line);
+    }
+
+    if(emitted < max_lines) {
+        char info_line[line_cap];
+        memset(info_line, 0, sizeof(info_line));
+        if(app->scanner_show_channel && result->channel[0] != '\0') {
+            simple_app_line_append_token(info_line, sizeof(info_line), NULL, result->channel);
+        }
+        if(app->scanner_show_band && result->band[0] != '\0') {
+            simple_app_line_append_token(info_line, sizeof(info_line), NULL, result->band);
+        }
+        if(info_line[0] != '\0') {
+            SIMPLE_APP_EMIT_LINE(info_line);
+        }
+    }
+
+    if(emitted < max_lines) {
+        char info_line[line_cap];
+        memset(info_line, 0, sizeof(info_line));
+        if(app->scanner_show_security && result->security[0] != '\0') {
+            char security_value[SCAN_FIELD_BUFFER_LEN];
+            memset(security_value, 0, sizeof(security_value));
+            strncpy(security_value, result->security, sizeof(security_value) - 1);
+            char* mixed_suffix = strstr(security_value, " Mixed");
+            if(mixed_suffix) {
+                *mixed_suffix = '\0';
+                size_t trimmed_len = strlen(security_value);
+                while(trimmed_len > 0 &&
+                      (security_value[trimmed_len - 1] == ' ' || security_value[trimmed_len - 1] == '/')) {
+                    security_value[trimmed_len - 1] = '\0';
+                    trimmed_len--;
+                }
+            }
+            simple_app_line_append_token(info_line, sizeof(info_line), NULL, security_value);
+        }
+        if(app->scanner_show_power && result->power_display[0] != '\0') {
+            char power_value[SCAN_FIELD_BUFFER_LEN];
+            memset(power_value, 0, sizeof(power_value));
+            strncpy(power_value, result->power_display, sizeof(power_value) - 1);
+            if(strstr(power_value, "dBm") == NULL) {
+                size_t len = strlen(power_value);
+                if(len < sizeof(power_value) - 4) {
+                    strncpy(power_value + len, " dBm", sizeof(power_value) - len - 1);
+                    power_value[sizeof(power_value) - 1] = '\0';
+                }
+            }
+            simple_app_line_append_token(info_line, sizeof(info_line), NULL, power_value);
+        }
+        if(info_line[0] != '\0') {
+            SIMPLE_APP_EMIT_LINE(info_line);
+        }
+    }
+
+    if(emitted == 0) {
+        char fallback_line[line_cap];
+        strncpy(fallback_line, "-", sizeof(fallback_line) - 1);
+        fallback_line[sizeof(fallback_line) - 1] = '\0';
+        SIMPLE_APP_EMIT_LINE(fallback_line);
+    }
+
+#undef SIMPLE_APP_EMIT_LINE
+
+    return emitted;
 }
 
 static void simple_app_show_status_message(
@@ -994,68 +1154,16 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     }
 }
 
-static size_t simple_app_format_result_line(
-    const SimpleApp* app,
-    const ScanResult* result,
-    char* buffer,
-    size_t buffer_size) {
-    if(!app || !result || !buffer || buffer_size == 0) {
-        return 0;
-    }
-
-    const char* selection_marker = result->selected ? "*" : "";
-    int written = snprintf(buffer, buffer_size, "%u%s", (unsigned)result->number, selection_marker);
-    if(written < 0) {
-        buffer[0] = '\0';
-        return 0;
-    }
-
-    size_t offset = (written < (int)buffer_size) ? (size_t)written : buffer_size - 1;
-    bool first_field = true;
-
-    if(app->scanner_show_ssid) {
-        simple_app_append_field(buffer, buffer_size, &offset, &first_field, NULL, result->ssid, NULL);
-    }
-    if(app->scanner_show_bssid) {
-        simple_app_append_field(
-            buffer, buffer_size, &offset, &first_field, NULL, result->bssid, NULL);
-    }
-    if(app->scanner_show_channel) {
-        simple_app_append_field(buffer, buffer_size, &offset, &first_field, NULL, result->channel, NULL);
-    }
-    if(app->scanner_show_security) {
-        simple_app_append_field(
-            buffer, buffer_size, &offset, &first_field, NULL, result->security, NULL);
-    }
-    if(app->scanner_show_power) {
-        const char* suffix =
-            (strstr(result->power_display, "dBm") != NULL) ? NULL : " dBm";
-        simple_app_append_field(
-            buffer, buffer_size, &offset, &first_field, NULL, result->power_display, suffix);
-    }
-    if(app->scanner_show_band) {
-        simple_app_append_field(
-            buffer, buffer_size, &offset, &first_field, NULL, result->band, NULL);
-    }
-
-    size_t length = (offset < buffer_size) ? offset : buffer_size - 1;
-    if(buffer[length] != '\0') {
-        buffer[length] = '\0';
-    }
-    return length;
-}
-
 static uint8_t simple_app_result_line_count(const SimpleApp* app, const ScanResult* result) {
     if(!app || !result) return 1;
-    if(app->result_char_limit == 0) return 1;
-    char buffer[96];
-    size_t len = simple_app_format_result_line(app, result, buffer, sizeof(buffer));
-    size_t lines = (len + app->result_char_limit - 1) / app->result_char_limit;
-    if(lines == 0) lines = 1;
-    if(app->result_max_lines > 0 && lines > app->result_max_lines) {
-        lines = app->result_max_lines;
+    size_t max_lines = (app->result_max_lines > 0) ? app->result_max_lines : RESULT_DEFAULT_MAX_LINES;
+    if(max_lines == 0) max_lines = RESULT_DEFAULT_MAX_LINES;
+    if(max_lines > RESULT_DEFAULT_MAX_LINES) {
+        max_lines = RESULT_DEFAULT_MAX_LINES;
     }
-    return (uint8_t)lines;
+    size_t count = simple_app_build_result_lines(app, result, NULL, max_lines);
+    if(count == 0) count = 1;
+    return (uint8_t)count;
 }
 
 static size_t simple_app_total_result_lines(SimpleApp* app) {
@@ -2371,42 +2479,31 @@ static void simple_app_draw_results(SimpleApp* app, Canvas* canvas) {
     uint8_t y = RESULT_START_Y;
     size_t visible_line_budget = (app->result_max_lines > 0) ? app->result_max_lines : 1;
     size_t lines_left = visible_line_budget;
-    size_t char_limit = (app->result_char_limit > 0) ? app->result_char_limit : 1;
+    size_t entry_line_capacity =
+        (app->result_max_lines > 0) ? app->result_max_lines : RESULT_DEFAULT_MAX_LINES;
+    if(entry_line_capacity == 0) entry_line_capacity = RESULT_DEFAULT_MAX_LINES;
+    if(entry_line_capacity > RESULT_DEFAULT_MAX_LINES) {
+        entry_line_capacity = RESULT_DEFAULT_MAX_LINES;
+    }
 
     for(size_t idx = app->scan_result_offset; idx < app->visible_result_count && lines_left > 0; idx++) {
         const ScanResult* result = simple_app_visible_result_const(app, idx);
         if(!result) continue;
-        char line_full[96];
-        size_t line_len = simple_app_format_result_line(app, result, line_full, sizeof(line_full));
 
-        size_t segments_available = simple_app_result_line_count(app, result);
-        if(segments_available == 0) segments_available = 1;
+        char segments[RESULT_DEFAULT_MAX_LINES][64];
+        memset(segments, 0, sizeof(segments));
+        size_t segments_available =
+            simple_app_build_result_lines(app, result, segments, entry_line_capacity);
+        if(segments_available == 0) {
+            strncpy(segments[0], "-", sizeof(segments[0]) - 1);
+            segments[0][sizeof(segments[0]) - 1] = '\0';
+            segments_available = 1;
+        }
         if(segments_available > lines_left) {
             segments_available = lines_left;
         }
 
-        size_t consumed = 0;
         for(size_t segment = 0; segment < segments_available && lines_left > 0; segment++) {
-            size_t remaining = (line_len > consumed) ? (line_len - consumed) : 0;
-            size_t segment_len = (remaining > char_limit) ? char_limit : remaining;
-            char segment_buffer[64];
-            memset(segment_buffer, 0, sizeof(segment_buffer));
-            if(segment_len > 0) {
-                if(segment_len >= sizeof(segment_buffer)) {
-                    segment_len = sizeof(segment_buffer) - 1;
-                }
-                memcpy(segment_buffer, line_full + consumed, segment_len);
-                segment_buffer[segment_len] = '\0';
-            } else {
-                segment_buffer[0] = '\0';
-            }
-            consumed += segment_len;
-            size_t segment_length_actual = strlen(segment_buffer);
-            while(segment_length_actual > 0 && segment_buffer[0] == ' ') {
-                memmove(segment_buffer, segment_buffer + 1, segment_length_actual);
-                segment_length_actual = strlen(segment_buffer);
-            }
-
             if(segment == 0) {
                 if(idx == app->scan_result_index) {
                     canvas_draw_str(canvas, RESULT_PREFIX_X, y, ">");
@@ -2414,7 +2511,7 @@ static void simple_app_draw_results(SimpleApp* app, Canvas* canvas) {
                     canvas_draw_str(canvas, RESULT_PREFIX_X, y, " ");
                 }
             }
-            canvas_draw_str(canvas, RESULT_TEXT_X, y, segment_buffer);
+            canvas_draw_str(canvas, RESULT_TEXT_X, y, segments[segment]);
             y += app->result_line_height;
             lines_left--;
             if(lines_left == 0) break;
