@@ -29,15 +29,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#ifndef FAP_VERSION_TEXT
-#ifdef FAP_VERSION
-#define FAP_VERSION_TEXT FAP_VERSION
-#else
-#define FAP_VERSION_TEXT "0.1"
-#endif
-#endif
-
-#define LAB_C5_VERSION_TEXT FAP_VERSION_TEXT
+#define LAB_C5_VERSION_TEXT "0.9"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -90,6 +82,7 @@ typedef enum {
 #define EVIL_TWIN_HTML_NAME_MAX 32
 #define EVIL_TWIN_POPUP_VISIBLE_LINES 3
 #define EVIL_TWIN_MENU_OPTION_COUNT 2
+#define HELP_HINT_IDLE_MS 3000
 
 typedef enum {
     MenuActionCommand,
@@ -204,6 +197,8 @@ typedef struct {
     char status_message[64];
     uint32_t status_message_until;
     bool status_message_fullscreen;
+    uint32_t last_input_tick;
+    bool help_hint_visible;
 } SimpleApp;
 static void simple_app_adjust_result_offset(SimpleApp* app);
 static void simple_app_rebuild_visible_results(SimpleApp* app);
@@ -272,11 +267,11 @@ static const uint8_t image_icon_0_bits[] = {
 };
 
 static const char hint_section_scanner[] =
-    "Run a Wi-Fi scan\nCollect network list\nResults appear under\nTargets for selection\nUse them for actions.";
+    "Passively listens \nto network events collecting \ninfo about APs, STAs associated \nand Probe Requests.";
 static const char hint_section_sniffers[] =
     "Passive Wi-Fi tools\nMonitor live clients\nAuto channel hopping\nReview captured data\nFrom the results tab.";
 static const char hint_section_targets[] =
-    "Shows scan results\nOK toggles selection\nChoose multiple nets\nFeed attack modules\nBack returns to menu.";
+    "Selects targets \nfor Deauth, Evil Twin \nand SAE Overflow attacks.";
 static const char hint_section_attacks[] =
     "Test features here\nUse only on own lab\nTargets come from\nSelected networks\nFollow local laws.";
 static const char hint_section_setup[] =
@@ -292,17 +287,17 @@ static const char hint_sniffer_debug[] =
     "Enable verbose logs\nPrints frame details\nDecision reasoning\nHelpful diagnostics\nBut very noisy.";
 
 static const char hint_attack_blackout[] =
-    "Prepare blackout test\nRequires confirmation\nFor controlled labs\nUse responsibly\nAvoid live systems.";
+    "Sends broadcast deauth \npackets to all networks \naround you.";
 static const char hint_attack_deauth[] =
-    "Launch deauth waves\nTargets chosen Wi-Fi\nDisrupts client links\nUse only with rights\nMonitor via console.";
+    "Disconnects clients \nof all selected networks.";
 static const char hint_attack_evil_twin[] =
-    "Clone selected SSID\nRequire selected net\nNotify ESP module\nAwait credentials\nPair with deauth.";
+    "Creates fake network \nwith captive portal in the \nname of the first selected.";
 static const char hint_attack_sae_overflow[] =
-    "Craft SAE traffic\nRequire selected net\nExercise WPA3 APs\nWatch retry counts\nStop when done.";
+    "Sends SAE Commit frames \nto overflow WPA3 router.";
 static const char hint_attack_sniffer_dog[] =
-    "Sniff AP-client chat\nListen for traffic\nCatch handshake peaks\nSend deauth frames\nUse in lab only.";
+    "Listens to traffic \nbetween AP and STA \nand sends deauth packet \ndirectly to this STA";
 static const char hint_attack_wardrive[] =
-    "Wardrive logger mode\nWrites data to SD\nAdds GPS context\nMap wireless areas\nReview later.";
+    "Logs networks around you \nwith GPS coordinates.";
 
 static const char hint_setup_backlight[] =
     "Toggle screen light\nKeep brightness high\nOr allow auto dim\nGreat for console\nLong sessions.";
@@ -1570,7 +1565,6 @@ static void simple_app_draw_confirm_blackout(SimpleApp* app, Canvas* canvas) {
     canvas_set_font(canvas, FontSecondary);
     const char* option_line = app->confirm_blackout_yes ? "> Yes        No" : "Yes        > No";
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, option_line);
-    canvas_draw_str(canvas, 2, 62, "Left/Right choose");
 }
 
 static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
@@ -1823,7 +1817,7 @@ static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
 
     canvas_set_font(canvas, FontSecondary);
     uint8_t text_x = bubble_x + 7;
-    uint8_t text_y = bubble_y + 30;
+    uint8_t text_y = bubble_y + 28;
 
     if(app->hint_line_count > 0) {
         size_t visible = app->hint_line_count - app->hint_scroll;
@@ -1842,7 +1836,14 @@ static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
         const uint8_t track_width = 5;
         const uint8_t track_height = (uint8_t)(HINT_VISIBLE_LINES * HINT_LINE_HEIGHT);
         const uint8_t track_x = bubble_x + bubble_w - track_width - 4;
-        const uint8_t track_y = text_y - (HINT_LINE_HEIGHT - 2);
+        int16_t desired_track_y =
+            bubble_y + ((int16_t)bubble_h - (int16_t)track_height) / 2;
+        int16_t track_min = bubble_y + 2;
+        int16_t track_max = bubble_y + bubble_h - track_height - 2;
+        if(track_max < track_min) track_max = track_min;
+        if(desired_track_y < track_min) desired_track_y = track_min;
+        if(desired_track_y > track_max) desired_track_y = track_max;
+        uint8_t track_y = (uint8_t)desired_track_y;
 
         canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
 
@@ -1860,18 +1861,18 @@ static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
                 (uint8_t)(((uint32_t)app->hint_scroll * max_thumb_offset) / max_scroll);
         }
         uint8_t thumb_x = track_x + 1;
-        uint8_t thumb_y = track_y + 1 + thumb_offset;
+        uint8_t thumb_y = (uint8_t)(track_y + 1 + thumb_offset);
         uint8_t thumb_inner_height = (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
         if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
         uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
         canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_inner_height);
 
-        uint8_t arrow_top_center = track_y + 2;
+        uint8_t arrow_top_center = (uint8_t)(track_y + 2);
         canvas_draw_line(canvas, track_x + track_width / 2, arrow_top_center - 2, track_x + 1, arrow_top_center);
         canvas_draw_line(
             canvas, track_x + track_width / 2, arrow_top_center - 2, track_x + track_width - 2, arrow_top_center);
 
-        uint8_t arrow_bottom_center = track_y + track_height - 3;
+        uint8_t arrow_bottom_center = (uint8_t)(track_y + track_height - 3);
         canvas_draw_line(canvas, track_x + 1, arrow_bottom_center, track_x + track_width / 2, arrow_bottom_center + 2);
         canvas_draw_line(
             canvas,
@@ -1963,7 +1964,7 @@ static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str(canvas, bubble_x + 8, bubble_y + 16, "Select HTML");
 
     canvas_set_font(canvas, FontSecondary);
-    uint8_t list_y = bubble_y + 30;
+    uint8_t list_y = bubble_y + 28;
 
     if(app->evil_twin_html_count == 0) {
         canvas_draw_str(canvas, bubble_x + 10, list_y, "No HTML files");
@@ -1999,16 +2000,14 @@ static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
         const uint8_t track_width = 3;
         uint8_t track_height = (uint8_t)(EVIL_TWIN_POPUP_VISIBLE_LINES * HINT_LINE_HEIGHT);
         const uint8_t track_x = bubble_x + bubble_w - track_width - 6;
-        uint8_t track_y = list_y;
-
-        uint8_t track_bottom_limit = (uint8_t)(bubble_y + bubble_h - 6);
-        if((uint8_t)(track_y + track_height) > track_bottom_limit) {
-            if(track_bottom_limit > track_height) {
-                track_y = (uint8_t)(track_bottom_limit - track_height);
-            } else {
-                track_y = (uint8_t)(bubble_y + 2);
-            }
-        }
+        int16_t desired_track_y =
+            bubble_y + ((int16_t)bubble_h - (int16_t)track_height) / 2;
+        int16_t track_min = bubble_y + 2;
+        int16_t track_max = bubble_y + bubble_h - track_height - 2;
+        if(track_max < track_min) track_max = track_min;
+        if(desired_track_y < track_min) desired_track_y = track_min;
+        if(desired_track_y > track_max) desired_track_y = track_max;
+        uint8_t track_y = (uint8_t)desired_track_y;
 
         canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
 
@@ -2044,28 +2043,35 @@ static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
 static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     canvas_set_color(canvas, ColorBlack);
 
-    canvas_set_bitmap_mode(canvas, true);
-    canvas_draw_xbm(canvas, 115, 2, 10, 10, image_icon_0_bits);
+    if(app->section_index >= menu_section_count) {
+        app->section_index = 0;
+    }
+
+    bool show_setup_branding =
+        (app->menu_state == MenuStateItems) && (app->section_index == MENU_SECTION_SETUP);
+
+    if(show_setup_branding) {
+        canvas_set_bitmap_mode(canvas, true);
+        canvas_draw_xbm(canvas, 115, 2, 10, 10, image_icon_0_bits);
+    }
     canvas_set_bitmap_mode(canvas, false);
 
     canvas_set_font(canvas, FontSecondary);
 
-    if(app->menu_state == MenuStateSections) {
+    if(app->help_hint_visible) {
         const uint8_t help_text_x = DISPLAY_WIDTH - 2;
-        const uint8_t help_text_y = 28;
-        canvas_draw_str_aligned(canvas, help_text_x, help_text_y, AlignRight, AlignTop, "Hold OK");
-        canvas_draw_str_aligned(canvas, help_text_x, help_text_y + 8, AlignRight, AlignTop, "for Help");
+        const uint8_t help_text_y = 63;
+        canvas_draw_str_aligned(canvas, help_text_x, (int16_t)help_text_y - 8, AlignRight, AlignBottom, "Hold OK");
+        canvas_draw_str_aligned(canvas, help_text_x, help_text_y, AlignRight, AlignBottom, "for Help");
     }
 
     if(simple_app_status_message_is_active(app) && !app->status_message_fullscreen) {
         canvas_draw_str(canvas, 2, 52, app->status_message);
     }
-    char version_text[24];
-    snprintf(version_text, sizeof(version_text), "v.%s", LAB_C5_VERSION_TEXT);
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 1, 63, AlignRight, AlignBottom, version_text);
-
-    if(app->section_index >= menu_section_count) {
-        app->section_index = 0;
+    if(show_setup_branding) {
+        char version_text[24];
+        snprintf(version_text, sizeof(version_text), "v.%s", LAB_C5_VERSION_TEXT);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 1, 63, AlignRight, AlignBottom, version_text);
     }
 
     if(app->menu_state == MenuStateSections) {
@@ -3243,6 +3249,15 @@ static void simple_app_input(InputEvent* event, void* context) {
     SimpleApp* app = context;
     if(!app || !event) return;
 
+    uint32_t now = furi_get_tick();
+    app->last_input_tick = now;
+    if(app->help_hint_visible) {
+        app->help_hint_visible = false;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+    }
+
     if(simple_app_status_message_is_active(app) && app->status_message_fullscreen) {
         if(event->type == InputTypeShort &&
            (event->key == InputKeyOk || event->key == InputKeyBack)) {
@@ -3371,6 +3386,8 @@ int32_t Lab_C5_app(void* p) {
     app->screen = ScreenMenu;
     app->serial_follow_tail = true;
     simple_app_reset_scan_results(app);
+    app->last_input_tick = furi_get_tick();
+    app->help_hint_visible = false;
 
     app->serial = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
     if(!app->serial) {
@@ -3410,6 +3427,26 @@ int32_t Lab_C5_app(void* p) {
 
     while(!app->exit_app) {
         simple_app_process_stream(app);
+
+        bool previous_help_hint = app->help_hint_visible;
+        bool can_show_help_hint = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
+                                  !app->hint_active && !app->evil_twin_popup_active &&
+                                  !simple_app_status_message_is_active(app);
+
+        if(can_show_help_hint) {
+            uint32_t now = furi_get_tick();
+            if(!app->help_hint_visible &&
+               (now - app->last_input_tick) >= furi_ms_to_ticks(HELP_HINT_IDLE_MS)) {
+                app->help_hint_visible = true;
+            }
+        } else {
+            app->help_hint_visible = false;
+        }
+
+        if(app->help_hint_visible != previous_help_hint && app->viewport) {
+            view_port_update(app->viewport);
+        }
+
         furi_delay_ms(20);
     }
 
