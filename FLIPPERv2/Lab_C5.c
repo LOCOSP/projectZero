@@ -46,8 +46,12 @@ typedef enum {
 #define SERIAL_BUFFER_SIZE 4096
 #define UART_STREAM_SIZE 1024
 #define MENU_VISIBLE_COUNT 6
-#define MENU_VISIBLE_COUNT_SNIFFERS 3
-#define MENU_VISIBLE_COUNT_ATTACKS 3
+#define MENU_VISIBLE_COUNT_SNIFFERS 4
+#define MENU_VISIBLE_COUNT_ATTACKS 4
+#define MENU_TITLE_Y 12
+#define MENU_ITEM_BASE_Y 24
+#define MENU_ITEM_SPACING 12
+#define MENU_SCROLL_TRACK_Y 14
 #define SERIAL_VISIBLE_LINES 6
 #define SERIAL_LINE_CHAR_LIMIT 22
 #define SERIAL_TEXT_LINE_HEIGHT 10
@@ -335,11 +339,11 @@ static const MenuEntry menu_entries_setup[] = {
 };
 
 static const MenuSection menu_sections[] = {
-    {"Scanner", hint_section_scanner, NULL, 0, 12, MENU_VISIBLE_COUNT * 12},
-    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24, MENU_VISIBLE_COUNT_SNIFFERS * 12},
-    {"Targets", hint_section_targets, NULL, 0, 36, MENU_VISIBLE_COUNT * 12},
-    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48, MENU_VISIBLE_COUNT_ATTACKS * 12},
-    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60, MENU_VISIBLE_COUNT * 12},
+    {"Scanner", hint_section_scanner, NULL, 0, 12, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
+    {"Targets", hint_section_targets, NULL, 0, 36, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
+    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -2095,7 +2099,7 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     const MenuSection* section = &menu_sections[app->section_index];
 
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 3, 12, section->title);
+    canvas_draw_str(canvas, 3, MENU_TITLE_Y, section->title);
 
     canvas_set_font(canvas, FontSecondary);
 
@@ -2111,7 +2115,7 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
         } else if(app->section_index == MENU_SECTION_TARGETS) {
             hint = "OK: Show results";
         }
-        canvas_draw_str(canvas, 3, 30, hint);
+        canvas_draw_str(canvas, 3, MENU_ITEM_BASE_Y + (MENU_ITEM_SPACING / 2), hint);
         return;
     }
 
@@ -2135,7 +2139,7 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     for(uint32_t i = 0; i < visible_count; i++) {
         uint32_t idx = app->item_offset + i;
         if(idx >= section->entry_count) break;
-        uint8_t y = 28 + i * 12;
+        uint8_t y = MENU_ITEM_BASE_Y + i * MENU_ITEM_SPACING;
 
         if(idx == app->item_index) {
             canvas_draw_str(canvas, 2, y, ">");
@@ -2147,9 +2151,9 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
 
     if(section->entry_count > visible_count) {
         const uint8_t track_width = 3;
-        uint8_t track_height = section->display_height ? section->display_height : (uint8_t)(visible_count * 12);
+        uint8_t track_height = section->display_height ? section->display_height : (uint8_t)(visible_count * MENU_ITEM_SPACING);
         const uint8_t track_x = DISPLAY_WIDTH - track_width;
-        const uint8_t track_y = 18;
+        const uint8_t track_y = MENU_SCROLL_TRACK_Y;
         canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
         uint8_t thumb_height =
             (uint8_t)(((uint32_t)visible_count * track_height) / section->entry_count);
