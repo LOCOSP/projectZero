@@ -22,6 +22,7 @@ typedef enum {
     ScreenSetupScanner,
     ScreenConsole,
     ScreenConfirmBlackout,
+    ScreenConfirmSnifferDos,
     ScreenEvilTwinMenu,
 } AppScreen;
 
@@ -97,6 +98,7 @@ typedef enum {
     MenuActionOpenScannerSetup,
     MenuActionOpenConsole,
     MenuActionConfirmBlackout,
+    MenuActionConfirmSnifferDos,
     MenuActionOpenEvilTwinMenu,
 } MenuAction;
 
@@ -148,6 +150,7 @@ typedef struct {
     bool serial_targets_hint;
     bool last_command_sent;
     bool confirm_blackout_yes;
+    bool confirm_sniffer_dos_yes;
     uint32_t last_attack_index;
     size_t evil_twin_menu_index;
     EvilTwinHtmlEntry evil_twin_html_entries[EVIL_TWIN_MAX_HTML_FILES];
@@ -324,7 +327,7 @@ static const MenuEntry menu_entries_attacks[] = {
     {"Deauth", "start_deauth", MenuActionCommandWithTargets, hint_attack_deauth},
     {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu, hint_attack_evil_twin},
     {"SAE Overflow", "sae_overflow", MenuActionCommandWithTargets, hint_attack_sae_overflow},
-    {"Sniffer Dog", "start_sniffer_dog", MenuActionCommand, hint_attack_sniffer_dog},
+    {"Sniffer Dog", NULL, MenuActionConfirmSnifferDos, hint_attack_sniffer_dog},
     {"Wardrive", "start_wardrive", MenuActionCommand, hint_attack_wardrive},
 };
 
@@ -1567,7 +1570,25 @@ static void simple_app_draw_confirm_blackout(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 38, AlignCenter, AlignCenter, "Confirm?");
 
     canvas_set_font(canvas, FontSecondary);
-    const char* option_line = app->confirm_blackout_yes ? "> Yes        No" : "Yes        > No";
+    const char* option_line = app->confirm_blackout_yes ? "No        > Yes" : "> No        Yes";
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, option_line);
+}
+
+static void simple_app_draw_confirm_sniffer_dos(SimpleApp* app, Canvas* canvas) {
+    if(!app) return;
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH / 2, 12, AlignCenter, AlignCenter, "Sniffer Dog will flood");
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH / 2, 24, AlignCenter, AlignCenter, "clients found by sniffer");
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 38, AlignCenter, AlignCenter, "Confirm?");
+
+    canvas_set_font(canvas, FontSecondary);
+    const char* option_line =
+        app->confirm_sniffer_dos_yes ? "No        > Yes" : "> No        Yes";
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, option_line);
 }
 
@@ -1652,6 +1673,33 @@ static void simple_app_handle_confirm_blackout_input(SimpleApp* app, InputKey ke
         if(app->confirm_blackout_yes) {
             app->confirm_blackout_yes = false;
             simple_app_send_command(app, "start_blackout", true);
+        } else {
+            simple_app_focus_attacks_menu(app);
+            view_port_update(app->viewport);
+        }
+    }
+}
+
+static void simple_app_handle_confirm_sniffer_dos_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack) {
+        simple_app_send_stop_if_needed(app);
+        app->confirm_sniffer_dos_yes = false;
+        simple_app_focus_attacks_menu(app);
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyLeft || key == InputKeyRight) {
+        app->confirm_sniffer_dos_yes = !app->confirm_sniffer_dos_yes;
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyOk) {
+        if(app->confirm_sniffer_dos_yes) {
+            app->confirm_sniffer_dos_yes = false;
+            simple_app_send_command(app, "start_sniffer_dog", true);
         } else {
             simple_app_focus_attacks_menu(app);
             view_port_update(app->viewport);
@@ -2598,6 +2646,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenConfirmBlackout:
         simple_app_draw_confirm_blackout(app, canvas);
         break;
+    case ScreenConfirmSnifferDos:
+        simple_app_draw_confirm_sniffer_dos(app, canvas);
+        break;
     case ScreenEvilTwinMenu:
         simple_app_draw_evil_twin_menu(app, canvas);
         break;
@@ -2721,8 +2772,11 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         } else if(entry->action == MenuActionOpenConsole) {
             simple_app_console_enter(app);
         } else if(entry->action == MenuActionConfirmBlackout) {
-            app->confirm_blackout_yes = true;
+            app->confirm_blackout_yes = false;
             app->screen = ScreenConfirmBlackout;
+        } else if(entry->action == MenuActionConfirmSnifferDos) {
+            app->confirm_sniffer_dos_yes = false;
+            app->screen = ScreenConfirmSnifferDos;
         }
 
         view_port_update(app->viewport);
@@ -3317,6 +3371,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         break;
     case ScreenConfirmBlackout:
         simple_app_handle_confirm_blackout_input(app, event->key);
+        break;
+    case ScreenConfirmSnifferDos:
+        simple_app_handle_confirm_sniffer_dos_input(app, event->key);
         break;
     case ScreenEvilTwinMenu:
         simple_app_handle_evil_twin_menu_input(app, event->key);
