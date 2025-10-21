@@ -20,9 +20,11 @@ typedef enum {
     ScreenSerial,
     ScreenResults,
     ScreenSetupScanner,
+    ScreenSetupKarma,
     ScreenConsole,
     ScreenConfirmBlackout,
     ScreenConfirmSnifferDos,
+    ScreenKarmaMenu,
     ScreenEvilTwinMenu,
 } AppScreen;
 
@@ -87,6 +89,16 @@ typedef enum {
 #define EVIL_TWIN_HTML_NAME_MAX 32
 #define EVIL_TWIN_POPUP_VISIBLE_LINES 3
 #define EVIL_TWIN_MENU_OPTION_COUNT 2
+#define KARMA_MAX_PROBES 32
+#define KARMA_PROBE_NAME_MAX 48
+#define KARMA_POPUP_VISIBLE_LINES 3
+#define KARMA_MENU_OPTION_COUNT 5
+#define KARMA_MAX_HTML_FILES EVIL_TWIN_MAX_HTML_FILES
+#define KARMA_HTML_NAME_MAX EVIL_TWIN_HTML_NAME_MAX
+#define KARMA_SNIFFER_DURATION_MIN_SEC 5
+#define KARMA_SNIFFER_DURATION_MAX_SEC 180
+#define KARMA_SNIFFER_DURATION_STEP 5
+#define KARMA_AUTO_LIST_DELAY_MS 500
 #define HELP_HINT_IDLE_MS 3000
 
 typedef enum {
@@ -96,10 +108,12 @@ typedef enum {
     MenuActionToggleBacklight,
     MenuActionToggleOtgPower,
     MenuActionOpenScannerSetup,
+    MenuActionOpenKarmaSetup,
     MenuActionOpenConsole,
     MenuActionConfirmBlackout,
     MenuActionConfirmSnifferDos,
     MenuActionOpenEvilTwinMenu,
+    MenuActionOpenKarmaMenu,
 } MenuAction;
 
 typedef enum {
@@ -130,6 +144,16 @@ typedef struct {
     uint8_t id;
     char name[EVIL_TWIN_HTML_NAME_MAX];
 } EvilTwinHtmlEntry;
+
+typedef struct {
+    uint8_t id;
+    char name[KARMA_PROBE_NAME_MAX];
+} KarmaProbeEntry;
+
+typedef struct {
+    uint8_t id;
+    char name[KARMA_HTML_NAME_MAX];
+} KarmaHtmlEntry;
 
 typedef struct {
     bool exit_app;
@@ -164,6 +188,36 @@ typedef struct {
     size_t evil_twin_list_length;
     uint8_t evil_twin_selected_html_id;
     char evil_twin_selected_html_name[EVIL_TWIN_HTML_NAME_MAX];
+    size_t karma_menu_index;
+    size_t karma_menu_offset;
+    KarmaProbeEntry karma_probes[KARMA_MAX_PROBES];
+    size_t karma_probe_count;
+    size_t karma_probe_popup_index;
+    size_t karma_probe_popup_offset;
+    bool karma_probe_popup_active;
+    bool karma_probe_listing_active;
+    bool karma_probe_list_header_seen;
+    char karma_probe_list_buffer[64];
+    size_t karma_probe_list_length;
+    uint8_t karma_selected_probe_id;
+    char karma_selected_probe_name[KARMA_PROBE_NAME_MAX];
+    KarmaHtmlEntry karma_html_entries[KARMA_MAX_HTML_FILES];
+    size_t karma_html_count;
+    size_t karma_html_popup_index;
+    size_t karma_html_popup_offset;
+    bool karma_html_popup_active;
+    bool karma_html_listing_active;
+    bool karma_html_list_header_seen;
+    char karma_html_list_buffer[64];
+    size_t karma_html_list_length;
+    uint8_t karma_selected_html_id;
+    char karma_selected_html_name[KARMA_HTML_NAME_MAX];
+    bool karma_sniffer_running;
+    uint32_t karma_sniffer_stop_tick;
+    uint32_t karma_sniffer_duration_sec;
+    bool karma_pending_probe_refresh;
+    uint32_t karma_pending_probe_tick;
+    bool karma_status_active;
     ScanResult scan_results[MAX_SCAN_RESULTS];
     size_t scan_result_count;
     size_t scan_result_index;
@@ -213,6 +267,7 @@ static bool simple_app_result_is_visible(const SimpleApp* app, const ScanResult*
 static ScanResult* simple_app_visible_result(SimpleApp* app, size_t visible_index);
 static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, size_t visible_index);
 static void simple_app_update_result_layout(SimpleApp* app);
+static void simple_app_update_karma_duration_label(SimpleApp* app);
 static void simple_app_apply_backlight(SimpleApp* app);
 static void simple_app_toggle_backlight(SimpleApp* app);
 static void simple_app_update_otg_label(SimpleApp* app);
@@ -238,6 +293,28 @@ static void simple_app_reset_evil_twin_listing(SimpleApp* app);
 static void simple_app_finish_evil_twin_listing(SimpleApp* app);
 static void simple_app_process_evil_twin_line(SimpleApp* app, const char* line);
 static void simple_app_evil_twin_feed(SimpleApp* app, char ch);
+static void simple_app_draw_karma_menu(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key);
+static void simple_app_start_karma_sniffer(SimpleApp* app);
+static void simple_app_start_karma_attack(SimpleApp* app);
+static void simple_app_request_karma_probe_list(SimpleApp* app);
+static void simple_app_reset_karma_probe_listing(SimpleApp* app);
+static void simple_app_finish_karma_probe_listing(SimpleApp* app);
+static void simple_app_process_karma_probe_line(SimpleApp* app, const char* line);
+static void simple_app_karma_probe_feed(SimpleApp* app, char ch);
+static void simple_app_draw_karma_probe_popup(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const InputEvent* event);
+static void simple_app_request_karma_html_list(SimpleApp* app);
+static void simple_app_reset_karma_html_listing(SimpleApp* app);
+static void simple_app_finish_karma_html_listing(SimpleApp* app);
+static void simple_app_process_karma_html_line(SimpleApp* app, const char* line);
+static void simple_app_karma_html_feed(SimpleApp* app, char ch);
+static void simple_app_draw_karma_html_popup(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const InputEvent* event);
+static void simple_app_update_karma_sniffer(SimpleApp* app);
+static void simple_app_draw_setup_karma(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_setup_karma_input(SimpleApp* app, InputKey key);
+static void simple_app_modify_karma_duration(SimpleApp* app, int32_t delta);
 static void simple_app_save_config_if_dirty(SimpleApp* app, const char* message, bool fullscreen);
 static bool simple_app_save_config(SimpleApp* app, const char* success_message, bool fullscreen);
 static void simple_app_load_config(SimpleApp* app);
@@ -299,6 +376,8 @@ static const char hint_attack_deauth[] =
     "Disconnects clients \nof all selected networks.";
 static const char hint_attack_evil_twin[] =
     "Creates fake network \nwith captive portal in the \nname of the first selected.";
+static const char hint_attack_karma[] =
+    "Collect probe SSIDs\nPick captive portal\nStart Karma beacon\nSniffer auto stops\nLab use only.";
 static const char hint_attack_sae_overflow[] =
     "Sends SAE Commit frames \nto overflow WPA3 router.";
 static const char hint_attack_sniffer_dog[] =
@@ -312,6 +391,8 @@ static const char hint_setup_otg[] =
     "Control USB OTG 5V\nPower external gear\nDisable to save\nBattery capacity\nWhen unused.";
 static const char hint_setup_filters[] =
     "Choose visible fields\nSimplify result list\nHide unused data\nTailor display\nOK flips options.";
+static const char hint_setup_karma_duration[] =
+    "Duration for Karma\nProbe capture phase\nAdjust in 5s steps\nAuto stop sniffer\nSaved on exit.";
 static const char hint_setup_console[] =
     "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
 
@@ -326,6 +407,7 @@ static const MenuEntry menu_entries_attacks[] = {
     {"Blackout", NULL, MenuActionConfirmBlackout, hint_attack_blackout},
     {"Deauth", "start_deauth", MenuActionCommandWithTargets, hint_attack_deauth},
     {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu, hint_attack_evil_twin},
+    {"Karma", NULL, MenuActionOpenKarmaMenu, hint_attack_karma},
     {"SAE Overflow", "sae_overflow", MenuActionCommandWithTargets, hint_attack_sae_overflow},
     {"Sniffer Dog", NULL, MenuActionConfirmSnifferDos, hint_attack_sniffer_dog},
     {"Wardrive", "start_wardrive", MenuActionCommand, hint_attack_wardrive},
@@ -333,10 +415,12 @@ static const MenuEntry menu_entries_attacks[] = {
 
 static char menu_label_backlight[24] = "Backlight: On";
 static char menu_label_otg_power[24] = "5V Power: On";
+static char menu_label_karma_duration[28] = "Karma Sniffer: 15s";
 
 static const MenuEntry menu_entries_setup[] = {
     {menu_label_backlight, NULL, MenuActionToggleBacklight, hint_setup_backlight},
     {menu_label_otg_power, NULL, MenuActionToggleOtgPower, hint_setup_otg},
+    {menu_label_karma_duration, NULL, MenuActionOpenKarmaSetup, hint_setup_karma_duration},
     {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
     {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
 };
@@ -839,6 +923,7 @@ static void simple_app_clear_status_message(SimpleApp* app) {
     app->status_message[0] = '\0';
     app->status_message_until = 0;
     app->status_message_fullscreen = false;
+    app->karma_status_active = false;
     if(app->viewport) {
         view_port_update(app->viewport);
     }
@@ -917,6 +1002,8 @@ static void simple_app_parse_config_line(SimpleApp* app, char* line) {
         app->backlight_enabled = simple_app_parse_bool_value(value, app->backlight_enabled);
     } else if(strcmp(key, "otg_power_enabled") == 0) {
         app->otg_power_enabled = simple_app_parse_bool_value(value, app->otg_power_enabled);
+    } else if(strcmp(key, "karma_duration") == 0) {
+        app->karma_sniffer_duration_sec = (uint32_t)strtoul(value, NULL, 10);
     }
 }
 
@@ -941,7 +1028,8 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             "show_band=%d\n"
             "min_power=%d\n"
             "backlight_enabled=%d\n"
-            "otg_power_enabled=%d\n",
+            "otg_power_enabled=%d\n"
+            "karma_duration=%lu\n",
             app->scanner_show_ssid ? 1 : 0,
             app->scanner_show_bssid ? 1 : 0,
             app->scanner_show_channel ? 1 : 0,
@@ -950,7 +1038,8 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             app->scanner_show_band ? 1 : 0,
             (int)app->scanner_min_power,
             app->backlight_enabled ? 1 : 0,
-            app->otg_power_enabled ? 1 : 0);
+            app->otg_power_enabled ? 1 : 0,
+            (unsigned long)app->karma_sniffer_duration_sec);
         if(len > 0 && len < (int)sizeof(buffer)) {
             size_t written = storage_file_write(file, buffer, (size_t)len);
             if(written == (size_t)len) {
@@ -1013,6 +1102,14 @@ static void simple_app_load_config(SimpleApp* app) {
     } else if(app->scanner_min_power < SCAN_POWER_MIN_DBM) {
         app->scanner_min_power = SCAN_POWER_MIN_DBM;
     }
+    if(app->karma_sniffer_duration_sec < KARMA_SNIFFER_DURATION_MIN_SEC) {
+        app->karma_sniffer_duration_sec = KARMA_SNIFFER_DURATION_MIN_SEC;
+    } else if(app->karma_sniffer_duration_sec > KARMA_SNIFFER_DURATION_MAX_SEC) {
+        app->karma_sniffer_duration_sec = KARMA_SNIFFER_DURATION_MAX_SEC;
+    }
+    simple_app_reset_karma_probe_listing(app);
+    simple_app_reset_karma_probe_listing(app);
+    simple_app_update_karma_duration_label(app);
     simple_app_update_result_layout(app);
     simple_app_rebuild_visible_results(app);
 }
@@ -1426,6 +1523,8 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         char ch = (char)data[i];
         simple_app_scan_feed(app, ch);
         simple_app_evil_twin_feed(app, ch);
+        simple_app_karma_probe_feed(app, ch);
+        simple_app_karma_html_feed(app, ch);
     }
 
     if(trimmed_any && !app->serial_follow_tail) {
@@ -2737,6 +2836,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenSetupScanner:
         simple_app_draw_setup_scanner(app, canvas);
         break;
+    case ScreenSetupKarma:
+        simple_app_draw_setup_karma(app, canvas);
+        break;
     case ScreenConsole:
         simple_app_draw_console(app, canvas);
         break;
@@ -2746,6 +2848,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenConfirmSnifferDos:
         simple_app_draw_confirm_sniffer_dos(app, canvas);
         break;
+    case ScreenKarmaMenu:
+        simple_app_draw_karma_menu(app, canvas);
+        break;
     case ScreenEvilTwinMenu:
         simple_app_draw_evil_twin_menu(app, canvas);
         break;
@@ -2754,7 +2859,11 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         break;
     }
 
-    if(app->evil_twin_popup_active) {
+    if(app->karma_probe_popup_active) {
+        simple_app_draw_karma_probe_popup(app, canvas);
+    } else if(app->karma_html_popup_active) {
+        simple_app_draw_karma_html_popup(app, canvas);
+    } else if(app->evil_twin_popup_active) {
         simple_app_draw_evil_twin_popup(app, canvas);
     } else if(app->hint_active) {
         simple_app_draw_hint(app, canvas);
@@ -2853,6 +2962,11 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             if(entry->command && entry->command[0] != '\0') {
                 simple_app_send_command(app, entry->command, true);
             }
+        } else if(entry->action == MenuActionOpenKarmaMenu) {
+            app->screen = ScreenKarmaMenu;
+            app->karma_menu_index = 0;
+            app->karma_menu_offset = 0;
+            view_port_update(app->viewport);
         } else if(entry->action == MenuActionOpenEvilTwinMenu) {
             app->screen = ScreenEvilTwinMenu;
             app->evil_twin_menu_index = 0;
@@ -2866,6 +2980,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->scanner_setup_index = 0;
             app->scanner_adjusting_power = false;
             app->scanner_view_offset = 0;
+        } else if(entry->action == MenuActionOpenKarmaSetup) {
+            app->screen = ScreenSetupKarma;
         } else if(entry->action == MenuActionOpenConsole) {
             simple_app_console_enter(app);
         } else if(entry->action == MenuActionConfirmBlackout) {
@@ -3198,6 +3314,13 @@ static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputE
                 EVIL_TWIN_HTML_NAME_MAX - 1);
             app->evil_twin_selected_html_name[EVIL_TWIN_HTML_NAME_MAX - 1] = '\0';
 
+            app->karma_selected_html_id = entry->id;
+            strncpy(
+                app->karma_selected_html_name,
+                entry->name,
+                KARMA_HTML_NAME_MAX - 1);
+            app->karma_selected_html_name[KARMA_HTML_NAME_MAX - 1] = '\0';
+
             char command[48];
             snprintf(command, sizeof(command), "select_html %u", (unsigned)entry->id);
             simple_app_send_command(app, command, false);
@@ -3212,6 +3335,1124 @@ static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputE
                 view_port_update(app->viewport);
             }
         }
+    }
+}
+
+static void simple_app_update_karma_duration_label(SimpleApp* app) {
+    if(!app) return;
+    if(app->karma_sniffer_duration_sec < KARMA_SNIFFER_DURATION_MIN_SEC) {
+        app->karma_sniffer_duration_sec = KARMA_SNIFFER_DURATION_MIN_SEC;
+    } else if(app->karma_sniffer_duration_sec > KARMA_SNIFFER_DURATION_MAX_SEC) {
+        app->karma_sniffer_duration_sec = KARMA_SNIFFER_DURATION_MAX_SEC;
+    }
+    snprintf(
+        menu_label_karma_duration,
+        sizeof(menu_label_karma_duration),
+        "Karma Sniffer: %lus",
+        (unsigned long)app->karma_sniffer_duration_sec);
+}
+
+static void simple_app_modify_karma_duration(SimpleApp* app, int32_t delta) {
+    if(!app || delta == 0) return;
+    int32_t value = (int32_t)app->karma_sniffer_duration_sec + delta;
+    if(value < (int32_t)KARMA_SNIFFER_DURATION_MIN_SEC) {
+        value = (int32_t)KARMA_SNIFFER_DURATION_MIN_SEC;
+    }
+    if(value > (int32_t)KARMA_SNIFFER_DURATION_MAX_SEC) {
+        value = (int32_t)KARMA_SNIFFER_DURATION_MAX_SEC;
+    }
+    if((uint32_t)value != app->karma_sniffer_duration_sec) {
+        app->karma_sniffer_duration_sec = (uint32_t)value;
+        simple_app_update_karma_duration_label(app);
+        simple_app_mark_config_dirty(app);
+    }
+}
+
+static void simple_app_reset_karma_probe_listing(SimpleApp* app) {
+    if(!app) return;
+    app->karma_probe_listing_active = false;
+    app->karma_probe_list_header_seen = false;
+    app->karma_probe_list_length = 0;
+    app->karma_probe_count = 0;
+    app->karma_probe_popup_index = 0;
+    app->karma_probe_popup_offset = 0;
+    app->karma_probe_popup_active = false;
+}
+
+static void simple_app_finish_karma_probe_listing(SimpleApp* app) {
+    if(!app || !app->karma_probe_listing_active) return;
+    app->karma_probe_listing_active = false;
+    app->karma_probe_list_length = 0;
+    app->karma_probe_list_header_seen = false;
+    app->last_command_sent = false;
+    bool on_karma_screen = (app->screen == ScreenKarmaMenu);
+    if(app->karma_status_active) {
+        simple_app_clear_status_message(app);
+        app->karma_status_active = false;
+    }
+
+    if(app->karma_probe_count == 0) {
+        if(on_karma_screen) {
+            simple_app_show_status_message(app, "No probes found", 1500, true);
+            app->karma_probe_popup_active = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    if(!on_karma_screen) {
+        app->karma_probe_popup_active = false;
+        return;
+    }
+
+    size_t target_index = 0;
+    if(app->karma_selected_probe_id != 0) {
+        for(size_t i = 0; i < app->karma_probe_count; i++) {
+            if(app->karma_probes[i].id == app->karma_selected_probe_id) {
+                target_index = i;
+                break;
+            }
+        }
+        if(target_index >= app->karma_probe_count) {
+            target_index = 0;
+        }
+    }
+
+    app->karma_probe_popup_index = target_index;
+    size_t visible = (app->karma_probe_count > KARMA_POPUP_VISIBLE_LINES)
+                         ? KARMA_POPUP_VISIBLE_LINES
+                         : app->karma_probe_count;
+    if(visible == 0) visible = 1;
+
+    if(app->karma_probe_count <= visible ||
+       app->karma_probe_popup_index < visible) {
+        app->karma_probe_popup_offset = 0;
+    } else {
+        app->karma_probe_popup_offset = app->karma_probe_popup_index - visible + 1;
+    }
+    size_t max_offset =
+        (app->karma_probe_count > visible) ? (app->karma_probe_count - visible) : 0;
+    if(app->karma_probe_popup_offset > max_offset) {
+        app->karma_probe_popup_offset = max_offset;
+    }
+
+    app->karma_probe_popup_active = true;
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_process_karma_probe_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->karma_probe_listing_active) return;
+
+    const char* cursor = line;
+    while(*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+
+    if(*cursor == '\0') {
+        if(app->karma_probe_count > 0) {
+            simple_app_finish_karma_probe_listing(app);
+        }
+        return;
+    }
+
+    if(strncmp(cursor, "Probes", 6) == 0 || strncmp(cursor, "Probe", 5) == 0) {
+        app->karma_probe_list_header_seen = true;
+        return;
+    }
+
+    if(strncmp(cursor, "No probes", 9) == 0 || strncmp(cursor, "No Probes", 9) == 0) {
+        app->karma_probe_count = 0;
+        simple_app_finish_karma_probe_listing(app);
+        return;
+    }
+
+    if(!isdigit((unsigned char)cursor[0])) {
+        if(app->karma_probe_count > 0) {
+            simple_app_finish_karma_probe_listing(app);
+        }
+        return;
+    }
+
+    char* endptr = NULL;
+    long id = strtol(cursor, &endptr, 10);
+    if(id <= 0 || id > 255 || !endptr) {
+        return;
+    }
+    while(*endptr == ' ' || *endptr == '\t') {
+        endptr++;
+    }
+    if(*endptr == '\0') {
+        return;
+    }
+
+    if(app->karma_probe_count >= KARMA_MAX_PROBES) {
+        return;
+    }
+
+    KarmaProbeEntry* entry = &app->karma_probes[app->karma_probe_count++];
+    entry->id = (uint8_t)id;
+    strncpy(entry->name, endptr, KARMA_PROBE_NAME_MAX - 1);
+    entry->name[KARMA_PROBE_NAME_MAX - 1] = '\0';
+
+    size_t len = strlen(entry->name);
+    while(len > 0 &&
+          (entry->name[len - 1] == '\r' || entry->name[len - 1] == '\n' ||
+           entry->name[len - 1] == ' ' || entry->name[len - 1] == '\t')) {
+        entry->name[--len] = '\0';
+    }
+
+    app->karma_probe_list_header_seen = true;
+}
+
+static void simple_app_karma_probe_feed(SimpleApp* app, char ch) {
+    if(!app || !app->karma_probe_listing_active) return;
+    if(ch == '\r') return;
+
+    if(ch == '>') {
+        if(app->karma_probe_list_length > 0) {
+            app->karma_probe_list_buffer[app->karma_probe_list_length] = '\0';
+            simple_app_process_karma_probe_line(app, app->karma_probe_list_buffer);
+            app->karma_probe_list_length = 0;
+        }
+        if(app->karma_probe_count > 0 || app->karma_probe_list_header_seen) {
+            simple_app_finish_karma_probe_listing(app);
+        }
+        return;
+    }
+
+    if(ch == '\n') {
+        if(app->karma_probe_list_length > 0) {
+            app->karma_probe_list_buffer[app->karma_probe_list_length] = '\0';
+            simple_app_process_karma_probe_line(app, app->karma_probe_list_buffer);
+        } else if(app->karma_probe_list_header_seen) {
+            simple_app_finish_karma_probe_listing(app);
+        }
+        app->karma_probe_list_length = 0;
+        return;
+    }
+
+    if(app->karma_probe_list_length + 1 >= sizeof(app->karma_probe_list_buffer)) {
+        app->karma_probe_list_length = 0;
+        return;
+    }
+
+    app->karma_probe_list_buffer[app->karma_probe_list_length++] = ch;
+}
+
+static void simple_app_draw_karma_probe_popup(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas || !app->karma_probe_popup_active) return;
+
+    const uint8_t bubble_x = 4;
+    const uint8_t bubble_y = 4;
+    const uint8_t bubble_w = DISPLAY_WIDTH - (bubble_x * 2);
+    const uint8_t bubble_h = 56;
+    const uint8_t radius = 9;
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_rbox(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_rframe(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, bubble_x + 8, bubble_y + 16, "Select Probe");
+
+    canvas_set_font(canvas, FontSecondary);
+    uint8_t list_y = bubble_y + 28;
+
+    if(app->karma_probe_count == 0) {
+        canvas_draw_str(canvas, bubble_x + 10, list_y, "No probes found");
+        canvas_draw_str(canvas, bubble_x + 10, (uint8_t)(list_y + HINT_LINE_HEIGHT), "Back returns");
+        return;
+    }
+
+    size_t visible = app->karma_probe_count;
+    if(visible > KARMA_POPUP_VISIBLE_LINES) {
+        visible = KARMA_POPUP_VISIBLE_LINES;
+    }
+
+    if(app->karma_probe_popup_offset >= app->karma_probe_count) {
+        app->karma_probe_popup_offset =
+            (app->karma_probe_count > visible) ? (app->karma_probe_count - visible) : 0;
+    }
+
+    for(size_t i = 0; i < visible; i++) {
+        size_t idx = app->karma_probe_popup_offset + i;
+        if(idx >= app->karma_probe_count) break;
+        const KarmaProbeEntry* entry = &app->karma_probes[idx];
+        char line[48];
+        snprintf(line, sizeof(line), "%u %s", (unsigned)entry->id, entry->name);
+        simple_app_truncate_text(line, 28);
+        uint8_t line_y = (uint8_t)(list_y + i * HINT_LINE_HEIGHT);
+        if(idx == app->karma_probe_popup_index) {
+            canvas_draw_str(canvas, bubble_x + 4, line_y, ">");
+        }
+        canvas_draw_str(canvas, bubble_x + 8, line_y, line);
+    }
+
+    if(app->karma_probe_count > KARMA_POPUP_VISIBLE_LINES) {
+        const uint8_t track_width = 3;
+        uint8_t track_height = (uint8_t)(KARMA_POPUP_VISIBLE_LINES * HINT_LINE_HEIGHT);
+        const uint8_t track_x = bubble_x + bubble_w - track_width - 6;
+        int16_t desired_track_y =
+            bubble_y + ((int16_t)bubble_h - (int16_t)track_height) / 2;
+        int16_t track_min = bubble_y + 2;
+        int16_t track_max = bubble_y + bubble_h - track_height - 2;
+        if(track_max < track_min) track_max = track_min;
+        if(desired_track_y < track_min) desired_track_y = track_min;
+        if(desired_track_y > track_max) desired_track_y = track_max;
+        uint8_t track_y = (uint8_t)desired_track_y;
+
+        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
+
+        size_t max_offset = app->karma_probe_count - KARMA_POPUP_VISIBLE_LINES;
+        uint8_t thumb_height =
+            (uint8_t)(((uint32_t)KARMA_POPUP_VISIBLE_LINES * track_height) / app->karma_probe_count);
+        if(thumb_height < 4) thumb_height = 4;
+        if(thumb_height > track_height) thumb_height = track_height;
+
+        uint8_t max_thumb_offset =
+            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
+        uint8_t thumb_offset = 0;
+        if(max_offset > 0 && max_thumb_offset > 0) {
+            size_t offset = app->karma_probe_popup_offset;
+            if(offset > max_offset) offset = max_offset;
+            thumb_offset = (uint8_t)(((uint32_t)offset * max_thumb_offset) / max_offset);
+        }
+
+        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
+        uint8_t thumb_inner_height =
+            (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
+        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
+
+        canvas_draw_box(
+            canvas,
+            (track_width > 2) ? (uint8_t)(track_x + 1) : track_x,
+            (uint8_t)(track_y + 1 + thumb_offset),
+            thumb_width,
+            thumb_inner_height);
+    }
+}
+
+static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const InputEvent* event) {
+    if(!app || !event || !app->karma_probe_popup_active) return;
+    if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
+
+    InputKey key = event->key;
+    if(event->type == InputTypeShort && key == InputKeyBack) {
+        app->karma_probe_popup_active = false;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->karma_probe_count == 0) {
+        if(event->type == InputTypeShort && key == InputKeyOk) {
+            app->karma_probe_popup_active = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    size_t visible = (app->karma_probe_count > KARMA_POPUP_VISIBLE_LINES)
+                         ? KARMA_POPUP_VISIBLE_LINES
+                         : app->karma_probe_count;
+    if(visible == 0) visible = 1;
+
+    if(key == InputKeyUp) {
+        if(app->karma_probe_popup_index > 0) {
+            app->karma_probe_popup_index--;
+            if(app->karma_probe_popup_index < app->karma_probe_popup_offset) {
+                app->karma_probe_popup_offset = app->karma_probe_popup_index;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyDown) {
+        if(app->karma_probe_popup_index + 1 < app->karma_probe_count) {
+            app->karma_probe_popup_index++;
+            if(app->karma_probe_count > visible &&
+               app->karma_probe_popup_index >= app->karma_probe_popup_offset + visible) {
+                app->karma_probe_popup_offset =
+                    app->karma_probe_popup_index - visible + 1;
+            }
+            size_t max_offset =
+                (app->karma_probe_count > visible) ? (app->karma_probe_count - visible) : 0;
+            if(app->karma_probe_popup_offset > max_offset) {
+                app->karma_probe_popup_offset = max_offset;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(event->type == InputTypeShort && key == InputKeyOk) {
+        if(app->karma_probe_popup_index < app->karma_probe_count) {
+            const KarmaProbeEntry* entry = &app->karma_probes[app->karma_probe_popup_index];
+            app->karma_selected_probe_id = entry->id;
+            strncpy(
+                app->karma_selected_probe_name,
+                entry->name,
+                KARMA_PROBE_NAME_MAX - 1);
+            app->karma_selected_probe_name[KARMA_PROBE_NAME_MAX - 1] = '\0';
+
+            char message[64];
+            snprintf(message, sizeof(message), "Probe selected:\n%s", entry->name);
+            simple_app_show_status_message(app, message, 1500, true);
+
+            app->karma_probe_popup_active = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    }
+}
+
+static void simple_app_request_karma_probe_list(SimpleApp* app) {
+    if(!app) return;
+    simple_app_reset_karma_probe_listing(app);
+    app->karma_probe_listing_active = true;
+    app->karma_pending_probe_refresh = false;
+    bool show_status = (app->screen == ScreenKarmaMenu);
+    if(show_status) {
+        simple_app_show_status_message(app, "Listing probes...", 0, false);
+        app->karma_status_active = true;
+    } else {
+        app->karma_status_active = false;
+    }
+    simple_app_send_command(app, "list_probes", false);
+    if(show_status && app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_reset_karma_html_listing(SimpleApp* app) {
+    if(!app) return;
+    app->karma_html_listing_active = false;
+    app->karma_html_list_header_seen = false;
+    app->karma_html_list_length = 0;
+    app->karma_html_count = 0;
+    app->karma_html_popup_index = 0;
+    app->karma_html_popup_offset = 0;
+    app->karma_html_popup_active = false;
+}
+
+static void simple_app_finish_karma_html_listing(SimpleApp* app) {
+    if(!app || !app->karma_html_listing_active) return;
+    app->karma_html_listing_active = false;
+    app->karma_html_list_length = 0;
+    app->karma_html_list_header_seen = false;
+    app->last_command_sent = false;
+    bool on_karma_screen = (app->screen == ScreenKarmaMenu);
+    if(app->karma_status_active) {
+        simple_app_clear_status_message(app);
+        app->karma_status_active = false;
+    }
+
+    if(app->karma_html_count == 0) {
+        if(on_karma_screen) {
+            simple_app_show_status_message(app, "No HTML files\nfound on SD", 1500, true);
+            app->karma_html_popup_active = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    if(!on_karma_screen) {
+        app->karma_html_popup_active = false;
+        return;
+    }
+
+    size_t target_index = 0;
+    if(app->karma_selected_html_id != 0) {
+        for(size_t i = 0; i < app->karma_html_count; i++) {
+            if(app->karma_html_entries[i].id == app->karma_selected_html_id) {
+                target_index = i;
+                break;
+            }
+        }
+        if(target_index >= app->karma_html_count) {
+            target_index = 0;
+        }
+    }
+
+    app->karma_html_popup_index = target_index;
+    size_t visible = (app->karma_html_count > KARMA_POPUP_VISIBLE_LINES)
+                         ? KARMA_POPUP_VISIBLE_LINES
+                         : app->karma_html_count;
+    if(visible == 0) visible = 1;
+
+    if(app->karma_html_count <= visible ||
+       app->karma_html_popup_index < visible) {
+        app->karma_html_popup_offset = 0;
+    } else {
+        app->karma_html_popup_offset = app->karma_html_popup_index - visible + 1;
+    }
+    size_t max_offset =
+        (app->karma_html_count > visible) ? (app->karma_html_count - visible) : 0;
+    if(app->karma_html_popup_offset > max_offset) {
+        app->karma_html_popup_offset = max_offset;
+    }
+
+    app->karma_html_popup_active = true;
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_process_karma_html_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->karma_html_listing_active) return;
+
+    const char* cursor = line;
+    while(*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+    if(*cursor == '\0') {
+        if(app->karma_html_count > 0) {
+            simple_app_finish_karma_html_listing(app);
+        }
+        return;
+    }
+
+    if(strncmp(cursor, "HTML files", 10) == 0) {
+        app->karma_html_list_header_seen = true;
+        return;
+    }
+
+    if(strncmp(cursor, "No HTML", 7) == 0 || strncmp(cursor, "No html", 7) == 0) {
+        app->karma_html_count = 0;
+        simple_app_finish_karma_html_listing(app);
+        return;
+    }
+
+    if(!isdigit((unsigned char)cursor[0])) {
+        if(app->karma_html_count > 0) {
+            simple_app_finish_karma_html_listing(app);
+        }
+        return;
+    }
+
+    char* endptr = NULL;
+    long id = strtol(cursor, &endptr, 10);
+    if(id <= 0 || id > 255 || !endptr) {
+        return;
+    }
+    while(*endptr == ' ' || *endptr == '\t') {
+        endptr++;
+    }
+    if(*endptr == '\0') {
+        return;
+    }
+
+    if(app->karma_html_count >= KARMA_MAX_HTML_FILES) {
+        return;
+    }
+
+    KarmaHtmlEntry* entry = &app->karma_html_entries[app->karma_html_count++];
+    entry->id = (uint8_t)id;
+    strncpy(entry->name, endptr, KARMA_HTML_NAME_MAX - 1);
+    entry->name[KARMA_HTML_NAME_MAX - 1] = '\0';
+
+    size_t len = strlen(entry->name);
+    while(len > 0 &&
+          (entry->name[len - 1] == '\r' || entry->name[len - 1] == '\n' ||
+           entry->name[len - 1] == ' ' || entry->name[len - 1] == '\t')) {
+        entry->name[--len] = '\0';
+    }
+
+    app->karma_html_list_header_seen = true;
+}
+
+static void simple_app_karma_html_feed(SimpleApp* app, char ch) {
+    if(!app || !app->karma_html_listing_active) return;
+    if(ch == '\r') return;
+
+    if(ch == '>') {
+        if(app->karma_html_list_length > 0) {
+            app->karma_html_list_buffer[app->karma_html_list_length] = '\0';
+            simple_app_process_karma_html_line(app, app->karma_html_list_buffer);
+            app->karma_html_list_length = 0;
+        }
+        if(app->karma_html_count > 0 || app->karma_html_list_header_seen) {
+            simple_app_finish_karma_html_listing(app);
+        }
+        return;
+    }
+
+    if(ch == '\n') {
+        if(app->karma_html_list_length > 0) {
+            app->karma_html_list_buffer[app->karma_html_list_length] = '\0';
+            simple_app_process_karma_html_line(app, app->karma_html_list_buffer);
+        } else if(app->karma_html_list_header_seen) {
+            simple_app_finish_karma_html_listing(app);
+        }
+        app->karma_html_list_length = 0;
+        return;
+    }
+
+    if(app->karma_html_list_length + 1 >= sizeof(app->karma_html_list_buffer)) {
+        app->karma_html_list_length = 0;
+        return;
+    }
+
+    app->karma_html_list_buffer[app->karma_html_list_length++] = ch;
+}
+
+static void simple_app_draw_karma_html_popup(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas || !app->karma_html_popup_active) return;
+
+    const uint8_t bubble_x = 4;
+    const uint8_t bubble_y = 4;
+    const uint8_t bubble_w = DISPLAY_WIDTH - (bubble_x * 2);
+    const uint8_t bubble_h = 56;
+    const uint8_t radius = 9;
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_rbox(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_rframe(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, bubble_x + 8, bubble_y + 16, "Select HTML");
+
+    canvas_set_font(canvas, FontSecondary);
+    uint8_t list_y = bubble_y + 28;
+
+    if(app->karma_html_count == 0) {
+        canvas_draw_str(canvas, bubble_x + 10, list_y, "No HTML files");
+        canvas_draw_str(canvas, bubble_x + 10, (uint8_t)(list_y + HINT_LINE_HEIGHT), "Back returns");
+        return;
+    }
+
+    size_t visible = app->karma_html_count;
+    if(visible > KARMA_POPUP_VISIBLE_LINES) {
+        visible = KARMA_POPUP_VISIBLE_LINES;
+    }
+
+    if(app->karma_html_popup_offset >= app->karma_html_count) {
+        app->karma_html_popup_offset =
+            (app->karma_html_count > visible) ? (app->karma_html_count - visible) : 0;
+    }
+
+    for(size_t i = 0; i < visible; i++) {
+        size_t idx = app->karma_html_popup_offset + i;
+        if(idx >= app->karma_html_count) break;
+        const KarmaHtmlEntry* entry = &app->karma_html_entries[idx];
+        char line[48];
+        snprintf(line, sizeof(line), "%u %s", (unsigned)entry->id, entry->name);
+        simple_app_truncate_text(line, 28);
+        uint8_t line_y = (uint8_t)(list_y + i * HINT_LINE_HEIGHT);
+        if(idx == app->karma_html_popup_index) {
+            canvas_draw_str(canvas, bubble_x + 4, line_y, ">");
+        }
+        canvas_draw_str(canvas, bubble_x + 8, line_y, line);
+    }
+
+    if(app->karma_html_count > KARMA_POPUP_VISIBLE_LINES) {
+        const uint8_t track_width = 3;
+        uint8_t track_height = (uint8_t)(KARMA_POPUP_VISIBLE_LINES * HINT_LINE_HEIGHT);
+        const uint8_t track_x = bubble_x + bubble_w - track_width - 6;
+        int16_t desired_track_y =
+            bubble_y + ((int16_t)bubble_h - (int16_t)track_height) / 2;
+        int16_t track_min = bubble_y + 2;
+        int16_t track_max = bubble_y + bubble_h - track_height - 2;
+        if(track_max < track_min) track_max = track_min;
+        if(desired_track_y < track_min) desired_track_y = track_min;
+        if(desired_track_y > track_max) desired_track_y = track_max;
+        uint8_t track_y = (uint8_t)desired_track_y;
+
+        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
+
+        size_t max_offset = app->karma_html_count - KARMA_POPUP_VISIBLE_LINES;
+        uint8_t thumb_height =
+            (uint8_t)(((uint32_t)KARMA_POPUP_VISIBLE_LINES * track_height) / app->karma_html_count);
+        if(thumb_height < 4) thumb_height = 4;
+        if(thumb_height > track_height) thumb_height = track_height;
+
+        uint8_t max_thumb_offset =
+            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
+        uint8_t thumb_offset = 0;
+        if(max_offset > 0 && max_thumb_offset > 0) {
+            size_t offset = app->karma_html_popup_offset;
+            if(offset > max_offset) offset = max_offset;
+            thumb_offset = (uint8_t)(((uint32_t)offset * max_thumb_offset) / max_offset);
+        }
+
+        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
+        uint8_t thumb_inner_height =
+            (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
+        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
+
+        canvas_draw_box(
+            canvas,
+            (track_width > 2) ? (uint8_t)(track_x + 1) : track_x,
+            (uint8_t)(track_y + 1 + thumb_offset),
+            thumb_width,
+            thumb_inner_height);
+    }
+}
+
+static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const InputEvent* event) {
+    if(!app || !event || !app->karma_html_popup_active) return;
+    if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
+
+    InputKey key = event->key;
+    if(event->type == InputTypeShort && key == InputKeyBack) {
+        app->karma_html_popup_active = false;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->karma_html_count == 0) {
+        if(event->type == InputTypeShort && key == InputKeyOk) {
+            app->karma_html_popup_active = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    size_t visible = (app->karma_html_count > KARMA_POPUP_VISIBLE_LINES)
+                         ? KARMA_POPUP_VISIBLE_LINES
+                         : app->karma_html_count;
+    if(visible == 0) visible = 1;
+
+    if(key == InputKeyUp) {
+        if(app->karma_html_popup_index > 0) {
+            app->karma_html_popup_index--;
+            if(app->karma_html_popup_index < app->karma_html_popup_offset) {
+                app->karma_html_popup_offset = app->karma_html_popup_index;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyDown) {
+        if(app->karma_html_popup_index + 1 < app->karma_html_count) {
+            app->karma_html_popup_index++;
+            if(app->karma_html_count > visible &&
+               app->karma_html_popup_index >= app->karma_html_popup_offset + visible) {
+                app->karma_html_popup_offset =
+                    app->karma_html_popup_index - visible + 1;
+            }
+            size_t max_offset =
+                (app->karma_html_count > visible) ? (app->karma_html_count - visible) : 0;
+            if(app->karma_html_popup_offset > max_offset) {
+                app->karma_html_popup_offset = max_offset;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(event->type == InputTypeShort && key == InputKeyOk) {
+        if(app->karma_html_popup_index < app->karma_html_count) {
+            const KarmaHtmlEntry* entry = &app->karma_html_entries[app->karma_html_popup_index];
+            app->karma_selected_html_id = entry->id;
+            strncpy(
+                app->karma_selected_html_name,
+                entry->name,
+                KARMA_HTML_NAME_MAX - 1);
+            app->karma_selected_html_name[KARMA_HTML_NAME_MAX - 1] = '\0';
+
+            app->evil_twin_selected_html_id = entry->id;
+            strncpy(
+                app->evil_twin_selected_html_name,
+                entry->name,
+                EVIL_TWIN_HTML_NAME_MAX - 1);
+            app->evil_twin_selected_html_name[EVIL_TWIN_HTML_NAME_MAX - 1] = '\0';
+
+            char command[48];
+            snprintf(command, sizeof(command), "select_html %u", (unsigned)entry->id);
+            simple_app_send_command(app, command, false);
+            app->last_command_sent = false;
+
+            char message[64];
+            snprintf(message, sizeof(message), "HTML set:\n%s", entry->name);
+            simple_app_show_status_message(app, message, 1500, true);
+
+            app->karma_html_popup_active = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    }
+}
+
+static void simple_app_request_karma_html_list(SimpleApp* app) {
+    if(!app) return;
+    simple_app_reset_karma_html_listing(app);
+    app->karma_html_listing_active = true;
+    bool show_status = (app->screen == ScreenKarmaMenu);
+    if(show_status) {
+        simple_app_show_status_message(app, "Listing HTML...", 0, false);
+        app->karma_status_active = true;
+    } else {
+        app->karma_status_active = false;
+    }
+    simple_app_send_command(app, "list_sd", false);
+    if(show_status && app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_start_karma_sniffer(SimpleApp* app) {
+    if(!app) return;
+    if(app->karma_probe_listing_active || app->karma_html_listing_active || app->evil_twin_listing_active) {
+        simple_app_send_stop_if_needed(app);
+        simple_app_reset_karma_probe_listing(app);
+        simple_app_reset_karma_html_listing(app);
+        if(app->evil_twin_listing_active) {
+            simple_app_reset_evil_twin_listing(app);
+        }
+    }
+    if(app->karma_sniffer_running) {
+        simple_app_send_stop_if_needed(app);
+        app->karma_sniffer_running = false;
+        app->karma_pending_probe_refresh = false;
+    }
+    simple_app_update_karma_duration_label(app);
+    uint32_t duration_ms = app->karma_sniffer_duration_sec * 1000;
+    app->karma_sniffer_stop_tick = furi_get_tick() + furi_ms_to_ticks(duration_ms);
+    app->karma_sniffer_running = true;
+    app->karma_pending_probe_refresh = false;
+
+    simple_app_show_status_message(app, "Collecting probes...", 0, false);
+    app->karma_status_active = true;
+    simple_app_send_command(app, "start_sniffer", false);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_start_karma_attack(SimpleApp* app) {
+    if(!app) return;
+    if(app->karma_probe_listing_active || app->karma_html_listing_active || app->evil_twin_listing_active) {
+        simple_app_show_status_message(app, "Wait for list\ncompletion", 1500, true);
+        return;
+    }
+    if(app->karma_selected_probe_id == 0) {
+        simple_app_show_status_message(app, "Select probe\nbefore starting", 1500, true);
+        return;
+    }
+    if(app->karma_selected_html_id == 0) {
+        simple_app_show_status_message(app, "Select HTML file\nbefore starting", 1500, true);
+        return;
+    }
+
+    char select_command[48];
+    snprintf(select_command, sizeof(select_command), "select_html %u", (unsigned)app->karma_selected_html_id);
+    simple_app_send_command(app, select_command, false);
+    app->last_command_sent = false;
+
+    char start_command[48];
+    snprintf(start_command, sizeof(start_command), "start_karma %u", (unsigned)app->karma_selected_probe_id);
+    simple_app_send_command(app, start_command, true);
+}
+
+static void simple_app_draw_karma_menu(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 4, 8, "Karma");
+
+    canvas_set_font(canvas, FontSecondary);
+
+    const size_t visible_count = 4;
+    const size_t total_count = KARMA_MENU_OPTION_COUNT;
+    size_t offset = app->karma_menu_offset;
+
+    if(app->karma_menu_index < offset) {
+        offset = app->karma_menu_index;
+    } else if(app->karma_menu_index >= offset + visible_count) {
+        offset = (app->karma_menu_index >= visible_count)
+                     ? (app->karma_menu_index - visible_count + 1)
+                     : 0;
+    }
+
+    if(total_count <= visible_count) {
+        offset = 0;
+    } else if(offset + visible_count > total_count) {
+        offset = total_count - visible_count;
+    }
+    app->karma_menu_offset = offset;
+
+    const uint8_t base_y = 20;
+
+    for(size_t line = 0; line < visible_count && (offset + line) < total_count; line++) {
+        size_t idx = offset + line;
+        uint8_t row_y = (uint8_t)(base_y + line * 12);
+
+        if(app->karma_menu_index == idx) {
+            canvas_draw_str(canvas, 2, row_y, ">");
+        }
+
+        char label[20];
+        char info[32];
+        info[0] = '\0';
+
+        switch(idx) {
+        case 0:
+            strncpy(label, "Collect Probes", sizeof(label) - 1);
+            label[sizeof(label) - 1] = '\0';
+            if(app->karma_sniffer_running) {
+                strncpy(info, "running", sizeof(info) - 1);
+            } else if(app->karma_pending_probe_refresh) {
+                strncpy(info, "updating", sizeof(info) - 1);
+            } else {
+                strncpy(info, "idle", sizeof(info) - 1);
+            }
+            break;
+        case 1:
+            strncpy(label, "Duration", sizeof(label) - 1);
+            label[sizeof(label) - 1] = '\0';
+            snprintf(info, sizeof(info), "%lus", (unsigned long)app->karma_sniffer_duration_sec);
+            break;
+        case 2:
+            strncpy(label, "Select Probe", sizeof(label) - 1);
+            label[sizeof(label) - 1] = '\0';
+            if(app->karma_selected_probe_id != 0 && app->karma_selected_probe_name[0] != '\0') {
+                strncpy(info, app->karma_selected_probe_name, sizeof(info) - 1);
+                info[sizeof(info) - 1] = '\0';
+                simple_app_truncate_text(info, 16);
+            } else {
+                strncpy(info, "<none>", sizeof(info) - 1);
+            }
+            break;
+        case 3:
+            strncpy(label, "Select HTML", sizeof(label) - 1);
+            label[sizeof(label) - 1] = '\0';
+            if(app->karma_selected_html_id != 0 && app->karma_selected_html_name[0] != '\0') {
+                strncpy(info, app->karma_selected_html_name, sizeof(info) - 1);
+                info[sizeof(info) - 1] = '\0';
+                simple_app_truncate_text(info, 16);
+            } else {
+                strncpy(info, "<none>", sizeof(info) - 1);
+            }
+            break;
+        default:
+            strncpy(label, "Start Karma", sizeof(label) - 1);
+            label[sizeof(label) - 1] = '\0';
+            if(app->karma_selected_probe_id == 0) {
+                strncpy(info, "need probe", sizeof(info) - 1);
+            } else if(app->karma_selected_html_id == 0) {
+                strncpy(info, "need HTML", sizeof(info) - 1);
+            } else if(app->karma_sniffer_running) {
+                strncpy(info, "sniffer", sizeof(info) - 1);
+            } else {
+                info[0] = '\0';
+            }
+            break;
+        }
+        label[sizeof(label) - 1] = '\0';
+        info[sizeof(info) - 1] = '\0';
+
+        canvas_draw_str(canvas, 12, row_y, label);
+        if(info[0] != '\0') {
+            canvas_draw_str_aligned(canvas, 124, row_y, AlignRight, AlignCenter, info);
+        }
+    }
+
+    if(offset > 0) {
+        canvas_draw_line(canvas, 122, 16, 126, 16);
+        canvas_draw_line(canvas, 122, 16, 124, 14);
+        canvas_draw_line(canvas, 126, 16, 124, 14);
+    }
+    if(offset + visible_count < total_count) {
+        uint8_t arrow_y = (uint8_t)(base_y + visible_count * 12 - 4);
+        canvas_draw_line(canvas, 122, arrow_y, 126, arrow_y);
+        canvas_draw_line(canvas, 122, arrow_y, 124, arrow_y + 2);
+        canvas_draw_line(canvas, 126, arrow_y, 124, arrow_y + 2);
+    }
+}
+
+static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack || key == InputKeyLeft) {
+        simple_app_send_stop_if_needed(app);
+        simple_app_reset_karma_probe_listing(app);
+        simple_app_reset_karma_html_listing(app);
+        simple_app_clear_status_message(app);
+        app->karma_status_active = false;
+        app->karma_probe_popup_active = false;
+        app->karma_html_popup_active = false;
+        app->karma_menu_offset = 0;
+        simple_app_focus_attacks_menu(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyUp) {
+        if(app->karma_menu_index > 0) {
+            app->karma_menu_index--;
+            if(app->karma_menu_index < app->karma_menu_offset) {
+                app->karma_menu_offset = app->karma_menu_index;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyDown) {
+        if(app->karma_menu_index + 1 < KARMA_MENU_OPTION_COUNT) {
+            app->karma_menu_index++;
+            size_t visible = 4;
+            if(app->karma_menu_index >= app->karma_menu_offset + visible) {
+                app->karma_menu_offset = app->karma_menu_index - visible + 1;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyOk) {
+        switch(app->karma_menu_index) {
+        case 0:
+            simple_app_start_karma_sniffer(app);
+            break;
+        case 1:
+            simple_app_clear_status_message(app);
+            app->karma_status_active = false;
+            app->screen = ScreenSetupKarma;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            break;
+        case 2:
+            if(app->karma_probe_listing_active) {
+                simple_app_request_karma_probe_list(app);
+            } else if(app->karma_probe_count > 0) {
+                simple_app_clear_status_message(app);
+                app->karma_status_active = false;
+                if(app->karma_probe_popup_index >= app->karma_probe_count) {
+                    app->karma_probe_popup_index = 0;
+                }
+                if(app->karma_probe_popup_offset >= app->karma_probe_count) {
+                    app->karma_probe_popup_offset = 0;
+                }
+                app->karma_probe_popup_active = true;
+                if(app->viewport) {
+                    view_port_update(app->viewport);
+                }
+            } else {
+                simple_app_request_karma_probe_list(app);
+            }
+            break;
+        case 3:
+            if(app->karma_html_listing_active) {
+                simple_app_request_karma_html_list(app);
+            } else if(app->karma_html_count > 0) {
+                simple_app_clear_status_message(app);
+                app->karma_status_active = false;
+                if(app->karma_html_popup_index >= app->karma_html_count) {
+                    app->karma_html_popup_index = 0;
+                }
+                if(app->karma_html_popup_offset >= app->karma_html_count) {
+                    app->karma_html_popup_offset = 0;
+                }
+                app->karma_html_popup_active = true;
+                if(app->viewport) {
+                    view_port_update(app->viewport);
+                }
+            } else {
+                simple_app_request_karma_html_list(app);
+            }
+            break;
+        default:
+            simple_app_start_karma_attack(app);
+            break;
+        }
+    }
+}
+
+static void simple_app_update_karma_sniffer(SimpleApp* app) {
+    if(!app) return;
+
+    uint32_t now = furi_get_tick();
+    if(app->karma_sniffer_running && now >= app->karma_sniffer_stop_tick) {
+        app->karma_sniffer_running = false;
+        simple_app_send_command(app, "stop", false);
+        app->last_command_sent = false;
+        if(app->screen == ScreenKarmaMenu) {
+            simple_app_show_status_message(app, "Sniffer stopped", 1000, true);
+            app->karma_status_active = false;
+        } else {
+            simple_app_clear_status_message(app);
+            app->karma_status_active = false;
+        }
+        app->karma_pending_probe_refresh = true;
+        app->karma_pending_probe_tick = now + furi_ms_to_ticks(KARMA_AUTO_LIST_DELAY_MS);
+        if(app->screen == ScreenKarmaMenu && app->viewport) {
+            view_port_update(app->viewport);
+        }
+    }
+
+    if(app->karma_pending_probe_refresh && now >= app->karma_pending_probe_tick) {
+        if(app->karma_probe_listing_active) {
+            app->karma_pending_probe_tick = now + furi_ms_to_ticks(KARMA_AUTO_LIST_DELAY_MS);
+        } else {
+            app->karma_pending_probe_refresh = false;
+            simple_app_request_karma_probe_list(app);
+            if(app->screen == ScreenKarmaMenu && app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    }
+}
+
+static void simple_app_draw_setup_karma(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 6, 16, "Karma Sniffer");
+
+    canvas_set_font(canvas, FontSecondary);
+    char line[32];
+    snprintf(line, sizeof(line), "Duration: %lus", (unsigned long)app->karma_sniffer_duration_sec);
+    canvas_draw_str(canvas, 6, 32, line);
+    canvas_draw_str(canvas, 6, 46, "Up/Down 5s  Left/Right 1s");
+    canvas_draw_str(canvas, 6, 58, "Back saves & exits");
+}
+
+static void simple_app_handle_setup_karma_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack) {
+        simple_app_save_config_if_dirty(app, "Config saved", true);
+        app->screen = ScreenMenu;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    uint32_t before = app->karma_sniffer_duration_sec;
+
+    if(key == InputKeyUp) {
+        simple_app_modify_karma_duration(app, KARMA_SNIFFER_DURATION_STEP);
+    } else if(key == InputKeyDown) {
+        simple_app_modify_karma_duration(app, -(int32_t)KARMA_SNIFFER_DURATION_STEP);
+    } else if(key == InputKeyRight) {
+        simple_app_modify_karma_duration(app, 1);
+    } else if(key == InputKeyLeft) {
+        simple_app_modify_karma_duration(app, -1);
+    }
+
+    if(before != app->karma_sniffer_duration_sec && app->viewport) {
+        view_port_update(app->viewport);
     }
 }
 
@@ -3424,6 +4665,16 @@ static void simple_app_input(InputEvent* event, void* context) {
         return;
     }
 
+    if(app->karma_probe_popup_active) {
+        simple_app_handle_karma_probe_popup_event(app, event);
+        return;
+    }
+
+    if(app->karma_html_popup_active) {
+        simple_app_handle_karma_html_popup_event(app, event);
+        return;
+    }
+
     if(app->evil_twin_popup_active) {
         simple_app_handle_evil_twin_popup_event(app, event);
         return;
@@ -3463,6 +4714,9 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenSetupScanner:
         simple_app_handle_setup_scanner_input(app, event->key);
         break;
+    case ScreenSetupKarma:
+        simple_app_handle_setup_karma_input(app, event->key);
+        break;
     case ScreenConsole:
         simple_app_handle_console_input(app, event->key);
         break;
@@ -3474,6 +4728,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         break;
     case ScreenEvilTwinMenu:
         simple_app_handle_evil_twin_menu_input(app, event->key);
+        break;
+    case ScreenKarmaMenu:
+        simple_app_handle_karma_menu_input(app, event->key);
         break;
     default:
         simple_app_handle_results_input(app, event->key);
@@ -3530,6 +4787,8 @@ int32_t Lab_C5_app(void* p) {
     app->otg_power_enabled = app->otg_power_initial_state;
     app->backlight_enabled = true;
     app->scanner_view_offset = 0;
+    app->karma_sniffer_duration_sec = 15;
+    simple_app_update_karma_duration_label(app);
     simple_app_update_result_layout(app);
     simple_app_update_backlight_label(app);
     simple_app_update_otg_label(app);
@@ -3585,6 +4844,7 @@ int32_t Lab_C5_app(void* p) {
 
     while(!app->exit_app) {
         simple_app_process_stream(app);
+        simple_app_update_karma_sniffer(app);
 
         bool previous_help_hint = app->help_hint_visible;
         bool can_show_help_hint = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
