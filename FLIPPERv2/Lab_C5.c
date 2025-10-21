@@ -51,6 +51,7 @@ typedef enum {
 #define MENU_VISIBLE_COUNT 6
 #define MENU_VISIBLE_COUNT_SNIFFERS 4
 #define MENU_VISIBLE_COUNT_ATTACKS 4
+#define MENU_VISIBLE_COUNT_SETUP 4
 #define MENU_TITLE_Y 12
 #define MENU_ITEM_BASE_Y 24
 #define MENU_ITEM_SPACING 12
@@ -108,7 +109,7 @@ typedef enum {
     MenuActionToggleBacklight,
     MenuActionToggleOtgPower,
     MenuActionOpenScannerSetup,
-    MenuActionOpenKarmaSetup,
+    
     MenuActionOpenConsole,
     MenuActionConfirmBlackout,
     MenuActionConfirmSnifferDos,
@@ -391,8 +392,6 @@ static const char hint_setup_otg[] =
     "Control USB OTG 5V\nPower external gear\nDisable to save\nBattery capacity\nWhen unused.";
 static const char hint_setup_filters[] =
     "Choose visible fields\nSimplify result list\nHide unused data\nTailor display\nOK flips options.";
-static const char hint_setup_karma_duration[] =
-    "Duration for Karma\nProbe capture phase\nAdjust in 5s steps\nAuto stop sniffer\nSaved on exit.";
 static const char hint_setup_console[] =
     "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
 
@@ -415,12 +414,10 @@ static const MenuEntry menu_entries_attacks[] = {
 
 static char menu_label_backlight[24] = "Backlight: On";
 static char menu_label_otg_power[24] = "5V Power: On";
-static char menu_label_karma_duration[28] = "Karma Sniffer: 15s";
 
 static const MenuEntry menu_entries_setup[] = {
     {menu_label_backlight, NULL, MenuActionToggleBacklight, hint_setup_backlight},
     {menu_label_otg_power, NULL, MenuActionToggleOtgPower, hint_setup_otg},
-    {menu_label_karma_duration, NULL, MenuActionOpenKarmaSetup, hint_setup_karma_duration},
     {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
     {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
 };
@@ -430,7 +427,7 @@ static const MenuSection menu_sections[] = {
     {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
     {"Targets", hint_section_targets, NULL, 0, 36, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
     {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
-    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -442,6 +439,9 @@ static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t secti
     }
     if(section_index == MENU_SECTION_ATTACKS) {
         return MENU_VISIBLE_COUNT_ATTACKS;
+    }
+    if(section_index == MENU_SECTION_SETUP) {
+        return MENU_VISIBLE_COUNT_SETUP;
     }
     return MENU_VISIBLE_COUNT;
 }
@@ -2201,8 +2201,6 @@ static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas) {
         }
         y += 12;
     }
-
-    canvas_draw_str(canvas, 2, 62, "OK choose, Back menu");
 }
 
 static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
@@ -2405,35 +2403,23 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     }
 
     if(section->entry_count > visible_count) {
-        const uint8_t track_width = 3;
-        uint8_t track_height = section->display_height ? section->display_height : (uint8_t)(visible_count * MENU_ITEM_SPACING);
-        const uint8_t track_x = DISPLAY_WIDTH - track_width;
-        const uint8_t track_y = MENU_SCROLL_TRACK_Y;
-        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
-        uint8_t thumb_height =
-            (uint8_t)(((uint32_t)visible_count * track_height) / section->entry_count);
-        if(thumb_height < 4) thumb_height = 4;
-        if(thumb_height > track_height) thumb_height = track_height;
-        uint8_t max_thumb_offset =
-            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
-        uint8_t thumb_offset = 0;
-        if(max_offset > 0 && max_thumb_offset > 0) {
-            thumb_offset = (uint8_t)(((uint32_t)app->item_offset * max_thumb_offset) / max_offset);
+        uint8_t arrow_x = DISPLAY_WIDTH - 6;
+        if(app->item_offset > 0) {
+            int16_t top_y = (int16_t)MENU_ITEM_BASE_Y - 4;
+            if(top_y < 12) top_y = 12;
+            canvas_draw_line(canvas, arrow_x, top_y, arrow_x + 4, top_y);
+            canvas_draw_line(canvas, arrow_x, top_y, arrow_x + 2, top_y - 2);
+            canvas_draw_line(canvas, arrow_x + 4, top_y, arrow_x + 2, top_y - 2);
         }
-        uint8_t thumb_x = (track_width > 2) ? (track_x + 1) : track_x;
-        uint8_t thumb_y = track_y + 1 + thumb_offset;
-        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
-        if(track_width > 2) {
-            uint8_t draw_height = thumb_height;
-            uint8_t draw_y = thumb_y;
-            if(draw_height > 2) {
-                draw_height = (uint8_t)(draw_height - 2);
-                draw_y = thumb_y;
-            }
-            if(draw_height == 0) draw_height = 1;
-            canvas_draw_box(canvas, thumb_x, draw_y, thumb_width, draw_height);
-        } else {
-            canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_height);
+        if(app->item_offset + visible_count < section->entry_count) {
+            uint8_t max_rows = (section->entry_count < visible_count) ? section->entry_count : visible_count;
+            int16_t bottom_y =
+                (int16_t)(MENU_ITEM_BASE_Y + (max_rows * MENU_ITEM_SPACING) - 8);
+            if(bottom_y > 60) bottom_y = 60;
+            if(bottom_y < 16) bottom_y = 16;
+            canvas_draw_line(canvas, arrow_x, bottom_y, arrow_x + 4, bottom_y);
+            canvas_draw_line(canvas, arrow_x, bottom_y, arrow_x + 2, bottom_y + 2);
+            canvas_draw_line(canvas, arrow_x + 4, bottom_y, arrow_x + 2, bottom_y + 2);
         }
     }
 }
@@ -2980,8 +2966,6 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->scanner_setup_index = 0;
             app->scanner_adjusting_power = false;
             app->scanner_view_offset = 0;
-        } else if(entry->action == MenuActionOpenKarmaSetup) {
-            app->screen = ScreenSetupKarma;
         } else if(entry->action == MenuActionOpenConsole) {
             simple_app_console_enter(app);
         } else if(entry->action == MenuActionConfirmBlackout) {
@@ -3345,11 +3329,6 @@ static void simple_app_update_karma_duration_label(SimpleApp* app) {
     } else if(app->karma_sniffer_duration_sec > KARMA_SNIFFER_DURATION_MAX_SEC) {
         app->karma_sniffer_duration_sec = KARMA_SNIFFER_DURATION_MAX_SEC;
     }
-    snprintf(
-        menu_label_karma_duration,
-        sizeof(menu_label_karma_duration),
-        "Karma Sniffer: %lus",
-        (unsigned long)app->karma_sniffer_duration_sec);
 }
 
 static void simple_app_modify_karma_duration(SimpleApp* app, int32_t delta) {
@@ -4169,7 +4148,7 @@ static void simple_app_draw_karma_menu(SimpleApp* app, Canvas* canvas) {
 
     canvas_set_font(canvas, FontSecondary);
 
-    const size_t visible_count = 4;
+    const size_t visible_count = 3;
     const size_t total_count = KARMA_MENU_OPTION_COUNT;
     size_t offset = app->karma_menu_offset;
 
@@ -4188,18 +4167,17 @@ static void simple_app_draw_karma_menu(SimpleApp* app, Canvas* canvas) {
     }
     app->karma_menu_offset = offset;
 
-    const uint8_t base_y = 20;
+    const uint8_t base_y = 18;
+    uint8_t current_y = base_y;
+    uint8_t list_bottom_y = base_y;
 
-    for(size_t line = 0; line < visible_count && (offset + line) < total_count; line++) {
-        size_t idx = offset + line;
-        uint8_t row_y = (uint8_t)(base_y + line * 12);
-
-        if(app->karma_menu_index == idx) {
-            canvas_draw_str(canvas, 2, row_y, ">");
-        }
+    size_t draw_count = 0;
+    for(size_t idx = offset; idx < total_count && draw_count < visible_count; idx++, draw_count++) {
+        bool is_selected = (app->karma_menu_index == idx);
+        bool detail_block = (idx == 2 || idx == 3);
 
         char label[20];
-        char info[32];
+        char info[48];
         info[0] = '\0';
 
         switch(idx) {
@@ -4225,7 +4203,7 @@ static void simple_app_draw_karma_menu(SimpleApp* app, Canvas* canvas) {
             if(app->karma_selected_probe_id != 0 && app->karma_selected_probe_name[0] != '\0') {
                 strncpy(info, app->karma_selected_probe_name, sizeof(info) - 1);
                 info[sizeof(info) - 1] = '\0';
-                simple_app_truncate_text(info, 16);
+                simple_app_truncate_text(info, 20);
             } else {
                 strncpy(info, "<none>", sizeof(info) - 1);
             }
@@ -4236,7 +4214,7 @@ static void simple_app_draw_karma_menu(SimpleApp* app, Canvas* canvas) {
             if(app->karma_selected_html_id != 0 && app->karma_selected_html_name[0] != '\0') {
                 strncpy(info, app->karma_selected_html_name, sizeof(info) - 1);
                 info[sizeof(info) - 1] = '\0';
-                simple_app_truncate_text(info, 16);
+                simple_app_truncate_text(info, 20);
             } else {
                 strncpy(info, "<none>", sizeof(info) - 1);
             }
@@ -4258,19 +4236,33 @@ static void simple_app_draw_karma_menu(SimpleApp* app, Canvas* canvas) {
         label[sizeof(label) - 1] = '\0';
         info[sizeof(info) - 1] = '\0';
 
-        canvas_draw_str(canvas, 12, row_y, label);
-        if(info[0] != '\0') {
-            canvas_draw_str_aligned(canvas, 124, row_y, AlignRight, AlignCenter, info);
+        if(is_selected) {
+            canvas_draw_str(canvas, 2, current_y, ">");
         }
+        canvas_draw_str(canvas, 12, current_y, label);
+
+        if(detail_block) {
+            canvas_draw_str(canvas, 14, (uint8_t)(current_y + 10), info);
+        } else if(info[0] != '\0') {
+            canvas_draw_str_aligned(canvas, 124, current_y, AlignRight, AlignCenter, info);
+        }
+
+        uint8_t block_height = detail_block ? 18 : 12;
+        current_y = (uint8_t)(current_y + block_height);
+        list_bottom_y = current_y;
     }
 
     if(offset > 0) {
-        canvas_draw_line(canvas, 122, 16, 126, 16);
-        canvas_draw_line(canvas, 122, 16, 124, 14);
-        canvas_draw_line(canvas, 126, 16, 124, 14);
+        uint8_t top_arrow_y = (base_y > 4) ? (uint8_t)(base_y - 4) : 12;
+        canvas_draw_line(canvas, 122, top_arrow_y, 126, top_arrow_y);
+        canvas_draw_line(canvas, 122, top_arrow_y, 124, top_arrow_y - 2);
+        canvas_draw_line(canvas, 126, top_arrow_y, 124, top_arrow_y - 2);
     }
     if(offset + visible_count < total_count) {
-        uint8_t arrow_y = (uint8_t)(base_y + visible_count * 12 - 4);
+        int16_t raw_y = (int16_t)list_bottom_y - 8;
+        if(raw_y > 60) raw_y = 60;
+        if(raw_y < 16) raw_y = 16;
+        uint8_t arrow_y = (uint8_t)raw_y;
         canvas_draw_line(canvas, 122, arrow_y, 126, arrow_y);
         canvas_draw_line(canvas, 122, arrow_y, 124, arrow_y + 2);
         canvas_draw_line(canvas, 126, arrow_y, 124, arrow_y + 2);
@@ -4309,7 +4301,7 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
     } else if(key == InputKeyDown) {
         if(app->karma_menu_index + 1 < KARMA_MENU_OPTION_COUNT) {
             app->karma_menu_index++;
-            size_t visible = 4;
+            size_t visible = 3;
             if(app->karma_menu_index >= app->karma_menu_offset + visible) {
                 app->karma_menu_offset = app->karma_menu_index - visible + 1;
             }
@@ -4331,9 +4323,9 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
             }
             break;
         case 2:
-            if(app->karma_probe_listing_active) {
+            if(app->karma_probe_listing_active || app->karma_probe_count == 0) {
                 simple_app_request_karma_probe_list(app);
-            } else if(app->karma_probe_count > 0) {
+            } else {
                 simple_app_clear_status_message(app);
                 app->karma_status_active = false;
                 if(app->karma_probe_popup_index >= app->karma_probe_count) {
@@ -4346,14 +4338,12 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
                 if(app->viewport) {
                     view_port_update(app->viewport);
                 }
-            } else {
-                simple_app_request_karma_probe_list(app);
             }
             break;
         case 3:
-            if(app->karma_html_listing_active) {
+            if(app->karma_html_listing_active || app->karma_html_count == 0) {
                 simple_app_request_karma_html_list(app);
-            } else if(app->karma_html_count > 0) {
+            } else {
                 simple_app_clear_status_message(app);
                 app->karma_status_active = false;
                 if(app->karma_html_popup_index >= app->karma_html_count) {
@@ -4366,8 +4356,6 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
                 if(app->viewport) {
                     view_port_update(app->viewport);
                 }
-            } else {
-                simple_app_request_karma_html_list(app);
             }
             break;
         default:
@@ -4423,16 +4411,16 @@ static void simple_app_draw_setup_karma(SimpleApp* app, Canvas* canvas) {
     char line[32];
     snprintf(line, sizeof(line), "Duration: %lus", (unsigned long)app->karma_sniffer_duration_sec);
     canvas_draw_str(canvas, 6, 32, line);
-    canvas_draw_str(canvas, 6, 46, "Up/Down 5s  Left/Right 1s");
-    canvas_draw_str(canvas, 6, 58, "Back saves & exits");
+    canvas_draw_str(canvas, 6, 46, "Adjust with arrows");
+    canvas_draw_str(canvas, 6, 58, "OK to exit");
 }
 
 static void simple_app_handle_setup_karma_input(SimpleApp* app, InputKey key) {
     if(!app) return;
 
-    if(key == InputKeyBack) {
+    if(key == InputKeyBack || key == InputKeyOk) {
         simple_app_save_config_if_dirty(app, "Config saved", true);
-        app->screen = ScreenMenu;
+        app->screen = ScreenKarmaMenu;
         if(app->viewport) {
             view_port_update(app->viewport);
         }
@@ -4904,3 +4892,5 @@ int32_t Lab_C5_app(void* p) {
 
     return 0;
 }
+
+
