@@ -24,6 +24,7 @@ typedef enum {
     ScreenSetupScanner,
     ScreenSetupKarma,
     ScreenConsole,
+    ScreenPackageMonitor,
     ScreenConfirmBlackout,
     ScreenConfirmSnifferDos,
     ScreenKarmaMenu,
@@ -35,7 +36,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.11"
+#define LAB_C5_VERSION_TEXT "0.12"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -55,6 +56,7 @@ typedef enum {
 #define MENU_VISIBLE_COUNT_SNIFFERS 4
 #define MENU_VISIBLE_COUNT_ATTACKS 4
 #define MENU_VISIBLE_COUNT_SETUP 4
+#define PACKAGE_MONITOR_MAX_HISTORY 96
 #define MENU_TITLE_Y 12
 #define MENU_ITEM_BASE_Y 24
 #define MENU_ITEM_SPACING 12
@@ -77,12 +79,21 @@ typedef enum {
 #define MENU_SECTION_SNIFFERS 1
 #define MENU_SECTION_TARGETS 2
 #define MENU_SECTION_ATTACKS 3
-#define MENU_SECTION_SETUP 4
+#define MENU_SECTION_MONITORING 4
+#define MENU_SECTION_SETUP 5
 #define SCANNER_FILTER_VISIBLE_COUNT 3
 #define SCANNER_SCAN_COMMAND "scan_networks"
 #define TARGETS_RESULTS_COMMAND "show_scan_results"
 #define LAB_C5_CONFIG_DIR_PATH "apps_assets/labC5"
 #define LAB_C5_CONFIG_FILE_PATH LAB_C5_CONFIG_DIR_PATH "/config.txt"
+
+#define PACKAGE_MONITOR_CHANNELS_24GHZ 14
+#define PACKAGE_MONITOR_CHANNELS_5GHZ 23
+#define PACKAGE_MONITOR_TOTAL_CHANNELS (PACKAGE_MONITOR_CHANNELS_24GHZ + PACKAGE_MONITOR_CHANNELS_5GHZ)
+#define PACKAGE_MONITOR_DEFAULT_CHANNEL 1
+#define PACKAGE_MONITOR_COMMAND "packet_monitor"
+#define PACKAGE_MONITOR_BAR_SPACING 2
+#define PACKAGE_MONITOR_CHANNEL_SWITCH_COOLDOWN_MS 200
 
 #define HINT_MAX_LINES 16
 #define HINT_VISIBLE_LINES 3
@@ -116,6 +127,7 @@ typedef enum {
     MenuActionOpenScannerSetup,
     
     MenuActionOpenConsole,
+    MenuActionOpenPackageMonitor,
     MenuActionConfirmBlackout,
     MenuActionConfirmSnifferDos,
     MenuActionOpenEvilTwinMenu,
@@ -272,6 +284,15 @@ typedef struct {
     bool status_message_fullscreen;
     uint32_t last_input_tick;
     bool help_hint_visible;
+    bool package_monitor_active;
+    uint8_t package_monitor_channel;
+    uint16_t package_monitor_history[PACKAGE_MONITOR_MAX_HISTORY];
+    size_t package_monitor_history_count;
+    uint16_t package_monitor_last_value;
+    bool package_monitor_dirty;
+    char package_monitor_line_buffer[64];
+    size_t package_monitor_line_length;
+    uint32_t package_monitor_last_channel_tick;
 } SimpleApp;
 static void simple_app_adjust_result_offset(SimpleApp* app);
 static void simple_app_rebuild_visible_results(SimpleApp* app);
@@ -293,6 +314,14 @@ static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas);
 static void simple_app_prepare_hint_lines(SimpleApp* app, const char* text);
 static void simple_app_hint_scroll(SimpleApp* app, int delta);
 static size_t simple_app_hint_max_scroll(const SimpleApp* app);
+static void simple_app_package_monitor_enter(SimpleApp* app);
+static void simple_app_package_monitor_start(SimpleApp* app, uint8_t channel, bool reset_history);
+static void simple_app_package_monitor_stop(SimpleApp* app);
+static void simple_app_package_monitor_reset(SimpleApp* app);
+static void simple_app_package_monitor_process_line(SimpleApp* app, const char* line);
+static void simple_app_package_monitor_feed(SimpleApp* app, char ch);
+static void simple_app_draw_package_monitor(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_package_monitor_input(SimpleApp* app, InputKey key);
 static bool simple_app_try_show_hint(SimpleApp* app);
 static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key);
@@ -396,6 +425,8 @@ static const char hint_section_targets[] =
     "Selects targets \nfor Deauth, Evil Twin \nand SAE Overflow attacks.";
 static const char hint_section_attacks[] =
     "Test features here\nUse only on own lab\nTargets come from\nSelected networks\nFollow local laws.";
+static const char hint_section_monitoring[] =
+    "Watch live packets\nDefault channel 1\nUse Up/Down keys\nSwitch between\n2.4 & 5GHz bands.";
 static const char hint_section_setup[] =
     "General settings\nBacklight and OTG\nAdjust scanner view\nConsole with logs\nUseful for debug.";
 
@@ -452,6 +483,13 @@ static const MenuEntry menu_entries_attacks[] = {
     {"Wardrive", "start_wardrive", MenuActionCommand, hint_attack_wardrive},
 };
 
+static const char hint_monitor_package[] =
+    "Live packet count\nShows vertical bars\nBack stops monitor\nUp/Down change ch.";
+
+static const MenuEntry menu_entries_monitoring[] = {
+    {"Package Monitor", NULL, MenuActionOpenPackageMonitor, hint_monitor_package},
+};
+
 static char menu_label_backlight[24] = "Backlight: On";
 static char menu_label_otg_power[24] = "5V Power: On";
 
@@ -464,10 +502,11 @@ static const MenuEntry menu_entries_setup[] = {
 
 static const MenuSection menu_sections[] = {
     {"Scanner", hint_section_scanner, NULL, 0, 12, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
-    {"Targets", hint_section_targets, NULL, 0, 36, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
-    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
+    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 22, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
+    {"Targets", hint_section_targets, NULL, 0, 32, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 42, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
+    {"Monitoring", hint_section_monitoring, menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 52, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 62, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -1637,6 +1676,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
     for(size_t i = 0; i < length; i++) {
         char ch = (char)data[i];
         simple_app_scan_feed(app, ch);
+        simple_app_package_monitor_feed(app, ch);
         simple_app_evil_twin_feed(app, ch);
         simple_app_karma_probe_feed(app, ch);
         simple_app_karma_html_feed(app, ch);
@@ -1997,6 +2037,314 @@ static void simple_app_handle_confirm_sniffer_dos_input(SimpleApp* app, InputKey
             simple_app_send_command(app, "start_sniffer_dog", true);
         } else {
             simple_app_focus_attacks_menu(app);
+            view_port_update(app->viewport);
+        }
+    }
+}
+
+static void simple_app_package_monitor_reset(SimpleApp* app) {
+    if(!app) return;
+    memset(app->package_monitor_history, 0, sizeof(app->package_monitor_history));
+    app->package_monitor_history_count = 0;
+    app->package_monitor_last_value = 0;
+    app->package_monitor_line_length = 0;
+    app->package_monitor_dirty = true;
+    app->package_monitor_last_channel_tick = 0;
+}
+
+static void simple_app_package_monitor_process_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return;
+
+    while(*line == '>' || *line == ' ') {
+        line++;
+    }
+    if(*line == '\0') return;
+
+    if(strstr(line, "monitor started on channel") != NULL) {
+        const char* digits = line;
+        while(*digits && !isdigit((unsigned char)*digits)) {
+            digits++;
+        }
+        if(*digits) {
+            unsigned long channel = strtoul(digits, NULL, 10);
+            if(channel == 0 || channel > PACKAGE_MONITOR_TOTAL_CHANNELS) {
+                channel = PACKAGE_MONITOR_DEFAULT_CHANNEL;
+            }
+            app->package_monitor_channel = (uint8_t)channel;
+        }
+        app->package_monitor_active = true;
+        app->package_monitor_dirty = true;
+        return;
+    }
+
+    if(strstr(line, "monitor stopped") != NULL) {
+        app->package_monitor_active = false;
+        app->package_monitor_dirty = true;
+        return;
+    }
+
+    size_t len = strlen(line);
+    if(len < 4) return;
+
+    if(strcmp(line + len - 4, "pkts") == 0) {
+        const char* digits = line;
+        while(*digits && !isdigit((unsigned char)*digits)) {
+            digits++;
+        }
+        if(!*digits) return;
+
+        unsigned long value = strtoul(digits, NULL, 10);
+        if(value > UINT16_MAX) {
+            value = UINT16_MAX;
+        }
+        app->package_monitor_last_value = (uint16_t)value;
+
+        if(app->package_monitor_history_count < PACKAGE_MONITOR_MAX_HISTORY) {
+            app->package_monitor_history[app->package_monitor_history_count++] = (uint16_t)value;
+        } else {
+            memmove(
+                app->package_monitor_history,
+                app->package_monitor_history + 1,
+                (PACKAGE_MONITOR_MAX_HISTORY - 1) *
+                    sizeof(app->package_monitor_history[0]));
+            app->package_monitor_history[PACKAGE_MONITOR_MAX_HISTORY - 1] = (uint16_t)value;
+        }
+        app->package_monitor_dirty = true;
+    }
+}
+
+static void simple_app_package_monitor_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+
+    if(ch == '\r') return;
+
+    if(ch == '\n') {
+        if(app->package_monitor_line_length > 0) {
+            app->package_monitor_line_buffer[app->package_monitor_line_length] = '\0';
+            simple_app_package_monitor_process_line(app, app->package_monitor_line_buffer);
+        }
+        app->package_monitor_line_length = 0;
+        return;
+    }
+
+    if(app->package_monitor_line_length + 1 >= sizeof(app->package_monitor_line_buffer)) {
+        app->package_monitor_line_length = 0;
+        return;
+    }
+
+    app->package_monitor_line_buffer[app->package_monitor_line_length++] = ch;
+}
+
+static void simple_app_package_monitor_start(SimpleApp* app, uint8_t channel, bool reset_history) {
+    if(!app) return;
+
+    if(channel < 1) {
+        channel = PACKAGE_MONITOR_DEFAULT_CHANNEL;
+    }
+    if(channel > PACKAGE_MONITOR_TOTAL_CHANNELS) {
+        channel = PACKAGE_MONITOR_TOTAL_CHANNELS;
+    }
+
+    if(reset_history) {
+        simple_app_package_monitor_reset(app);
+    }
+
+    simple_app_send_stop_if_needed(app);
+
+    char command[32];
+    snprintf(command, sizeof(command), "%s %u", PACKAGE_MONITOR_COMMAND, (unsigned)channel);
+    simple_app_send_command(app, command, false);
+
+    app->package_monitor_channel = channel;
+    app->package_monitor_active = true;
+    app->package_monitor_dirty = true;
+    uint32_t now = furi_get_tick();
+    if(reset_history) {
+        uint32_t cooldown = furi_ms_to_ticks(PACKAGE_MONITOR_CHANNEL_SWITCH_COOLDOWN_MS);
+        app->package_monitor_last_channel_tick = (now > cooldown) ? (now - cooldown) : 0;
+    } else {
+        app->package_monitor_last_channel_tick = now;
+    }
+}
+
+static void simple_app_package_monitor_stop(SimpleApp* app) {
+    if(!app) return;
+    if(app->package_monitor_active || app->last_command_sent) {
+        simple_app_send_stop_if_needed(app);
+    }
+    app->package_monitor_active = false;
+    app->package_monitor_dirty = true;
+}
+
+static void simple_app_package_monitor_enter(SimpleApp* app) {
+    if(!app) return;
+    if(app->package_monitor_channel < 1 || app->package_monitor_channel > PACKAGE_MONITOR_TOTAL_CHANNELS) {
+        app->package_monitor_channel = PACKAGE_MONITOR_DEFAULT_CHANNEL;
+    }
+    app->screen = ScreenPackageMonitor;
+    simple_app_package_monitor_start(app, app->package_monitor_channel, true);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_draw_package_monitor(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 4, 12, "Package Monitor");
+
+    uint8_t channel = app->package_monitor_channel;
+    if(channel < 1 || channel > PACKAGE_MONITOR_TOTAL_CHANNELS) {
+        channel = PACKAGE_MONITOR_DEFAULT_CHANNEL;
+    }
+
+    char channel_text[32];
+    snprintf(
+        channel_text,
+        sizeof(channel_text),
+        "Ch %02u/%02u",
+        (unsigned)channel,
+        (unsigned)PACKAGE_MONITOR_TOTAL_CHANNELS);
+    char value_text[24];
+    snprintf(value_text, sizeof(value_text), "%upkts", (unsigned)app->package_monitor_last_value);
+
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 4, 24, channel_text);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, 24, AlignRight, AlignBottom, value_text);
+
+    const int16_t frame_x = 2;
+    const int16_t frame_y = 28;
+    const int16_t frame_w = DISPLAY_WIDTH - 4;
+    const int16_t frame_h = 34;
+
+    canvas_draw_line(canvas, frame_x, frame_y, frame_x + frame_w, frame_y);
+    canvas_draw_line(canvas, frame_x, frame_y + frame_h, frame_x + frame_w, frame_y + frame_h);
+    canvas_draw_line(canvas, frame_x, frame_y, frame_x, frame_y + frame_h);
+    canvas_draw_line(canvas, frame_x + frame_w, frame_y, frame_x + frame_w, frame_y + frame_h);
+
+    const int16_t graph_left = frame_x + 1;
+    const int16_t graph_right = frame_x + frame_w - 1;
+    const int16_t graph_top = frame_y + 1;
+    const int16_t graph_bottom = frame_y + frame_h - 1;
+    const int16_t graph_width_px = graph_right - graph_left + 1;
+    const int16_t graph_height_px = graph_bottom - graph_top + 1;
+
+    if(graph_width_px <= 0 || graph_height_px <= 0) {
+        app->package_monitor_dirty = false;
+        return;
+    }
+
+    if(app->package_monitor_history_count == 0) {
+        const char* message = app->package_monitor_active ? "Waiting for data" : "Press OK to restart";
+        canvas_draw_str_aligned(
+            canvas,
+            graph_left + graph_width_px / 2,
+            graph_top + graph_height_px / 2,
+            AlignCenter,
+            AlignCenter,
+            message);
+        app->package_monitor_dirty = false;
+        return;
+    }
+
+    uint16_t max_value = 0;
+    for(size_t i = 0; i < app->package_monitor_history_count; i++) {
+        if(app->package_monitor_history[i] > max_value) {
+            max_value = app->package_monitor_history[i];
+        }
+    }
+    if(max_value == 0) {
+        max_value = 1;
+    }
+
+    size_t sample_count = app->package_monitor_history_count;
+    size_t slot_capacity = (PACKAGE_MONITOR_BAR_SPACING > 0)
+                               ? ((size_t)(graph_width_px - 1) / PACKAGE_MONITOR_BAR_SPACING) + 1
+                               : (size_t)graph_width_px;
+    if(slot_capacity == 0) {
+        slot_capacity = 1;
+    }
+    size_t visible_samples = (sample_count < slot_capacity) ? sample_count : slot_capacity;
+    size_t start_index = (sample_count > visible_samples) ? (sample_count - visible_samples) : 0;
+
+    for(size_t idx = start_index; idx < sample_count; idx++) {
+        size_t relative = idx - start_index;
+        int16_t x = graph_right - (int16_t)(relative * PACKAGE_MONITOR_BAR_SPACING);
+        if(x < graph_left) {
+            break;
+        }
+
+        uint16_t value = app->package_monitor_history[idx];
+        int16_t bar_height = 0;
+        if(value > 0) {
+            bar_height = (int16_t)((value * (uint32_t)(graph_height_px - 1)) / max_value);
+            if(bar_height == 0) {
+                bar_height = 1;
+            }
+        }
+        int16_t bar_top = graph_bottom - bar_height;
+        if(bar_top < graph_top) {
+            bar_top = graph_top;
+        }
+        canvas_draw_line(canvas, x, graph_bottom, x, bar_top);
+    }
+
+    app->package_monitor_dirty = false;
+}
+
+static void simple_app_handle_package_monitor_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack) {
+        simple_app_package_monitor_stop(app);
+        app->menu_state = MenuStateItems;
+        app->section_index = MENU_SECTION_MONITORING;
+        app->item_index = 0;
+        app->item_offset = 0;
+        app->screen = ScreenMenu;
+        app->package_monitor_dirty = false;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    uint32_t now = furi_get_tick();
+    uint32_t cooldown_ticks = furi_ms_to_ticks(PACKAGE_MONITOR_CHANNEL_SWITCH_COOLDOWN_MS);
+    bool can_switch =
+        (app->package_monitor_last_channel_tick == 0) ||
+        ((now - app->package_monitor_last_channel_tick) >= cooldown_ticks);
+
+    if(key == InputKeyUp) {
+        if(!can_switch) {
+            return;
+        }
+        if(app->package_monitor_channel < PACKAGE_MONITOR_TOTAL_CHANNELS) {
+            uint8_t next_channel = app->package_monitor_channel + 1;
+            simple_app_package_monitor_reset(app);
+            simple_app_package_monitor_start(app, next_channel, false);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyDown) {
+        if(!can_switch) {
+            return;
+        }
+        if(app->package_monitor_channel > 1) {
+            uint8_t prev_channel = app->package_monitor_channel - 1;
+            simple_app_package_monitor_reset(app);
+            simple_app_package_monitor_start(app, prev_channel, false);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyOk) {
+        simple_app_package_monitor_start(app, app->package_monitor_channel, true);
+        if(app->viewport) {
             view_port_update(app->viewport);
         }
     }
@@ -3121,6 +3469,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenConsole:
         simple_app_draw_console(app, canvas);
         break;
+    case ScreenPackageMonitor:
+        simple_app_draw_package_monitor(app, canvas);
+        break;
     case ScreenConfirmBlackout:
         simple_app_draw_confirm_blackout(app, canvas);
         break;
@@ -3268,6 +3619,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->scanner_setup_index = 0;
             app->scanner_adjusting_power = false;
             app->scanner_view_offset = 0;
+        } else if(entry->action == MenuActionOpenPackageMonitor) {
+            simple_app_package_monitor_enter(app);
+            return;
         } else if(entry->action == MenuActionOpenConsole) {
             simple_app_console_enter(app);
         } else if(entry->action == MenuActionConfirmBlackout) {
@@ -4959,6 +5313,9 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenConsole:
         simple_app_handle_console_input(app, event->key);
         break;
+    case ScreenPackageMonitor:
+        simple_app_handle_package_monitor_input(app, event->key);
+        break;
     case ScreenConfirmBlackout:
         simple_app_handle_confirm_blackout_input(app, event->key);
         break;
@@ -4996,6 +5353,9 @@ static void simple_app_process_stream(SimpleApp* app) {
     if(updated && (app->screen == ScreenSerial || app->screen == ScreenConsole)) {
         view_port_update(app->viewport);
     }
+    if(app->package_monitor_dirty && app->screen == ScreenPackageMonitor && app->viewport) {
+        view_port_update(app->viewport);
+    }
 }
 
 static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context) {
@@ -5016,6 +5376,7 @@ int32_t Lab_C5_app(void* p) {
         return 0;
     }
     memset(app, 0, sizeof(SimpleApp));
+    app->package_monitor_channel = PACKAGE_MONITOR_DEFAULT_CHANNEL;
     app->scanner_show_ssid = true;
     app->scanner_show_bssid = true;
     app->scanner_show_channel = true;
