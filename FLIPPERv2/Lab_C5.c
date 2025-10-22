@@ -285,6 +285,23 @@ static size_t simple_app_hint_max_scroll(const SimpleApp* app);
 static bool simple_app_try_show_hint(SimpleApp* app);
 static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key);
+static void simple_app_draw_scroll_arrow(Canvas* canvas, uint8_t base_left_x, int16_t base_y, bool upwards);
+static void simple_app_draw_scroll_hints(
+    Canvas* canvas,
+    uint8_t base_left_x,
+    int16_t content_top_y,
+    int16_t content_bottom_y,
+    bool show_up,
+    bool show_down);
+static void simple_app_draw_scroll_hints_clamped(
+    Canvas* canvas,
+    uint8_t base_left_x,
+    int16_t content_top_y,
+    int16_t content_bottom_y,
+    bool show_up,
+    bool show_down,
+    int16_t min_base_y,
+    int16_t max_base_y);
 static void simple_app_request_evil_twin_html_list(SimpleApp* app);
 static void simple_app_start_evil_portal(SimpleApp* app);
 static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas);
@@ -490,6 +507,81 @@ static void simple_app_truncate_text(char* text, size_t max_chars) {
     }
     text[max_chars - 1] = '.';
     text[max_chars] = '\0';
+}
+
+static void simple_app_draw_scroll_arrow(Canvas* canvas, uint8_t base_left_x, int16_t base_y, bool upwards) {
+    if(!canvas) return;
+
+    if(upwards) {
+        if(base_y < 2) base_y = 2;
+    } else {
+        if(base_y > 61) base_y = 61;
+    }
+
+    if(base_y < 0) base_y = 0;
+    if(base_y > 63) base_y = 63;
+
+    uint8_t base = (uint8_t)base_y;
+    uint8_t base_right_x = (uint8_t)(base_left_x + 4);
+    uint8_t apex_x = (uint8_t)(base_left_x + 2);
+    uint8_t apex_y = upwards ? (uint8_t)(base - 2) : (uint8_t)(base + 2);
+
+    canvas_draw_line(canvas, base_left_x, base, base_right_x, base);
+    canvas_draw_line(canvas, base_left_x, base, apex_x, apex_y);
+    canvas_draw_line(canvas, base_right_x, base, apex_x, apex_y);
+}
+
+static void simple_app_draw_scroll_hints_clamped(
+    Canvas* canvas,
+    uint8_t base_left_x,
+    int16_t content_top_y,
+    int16_t content_bottom_y,
+    bool show_up,
+    bool show_down,
+    int16_t min_base_y,
+    int16_t max_base_y) {
+    if(!canvas || (!show_up && !show_down)) return;
+
+    if(min_base_y > max_base_y) {
+        int16_t tmp = min_base_y;
+        min_base_y = max_base_y;
+        max_base_y = tmp;
+    }
+
+    int16_t up_base = content_top_y - 4;
+    int16_t down_base = content_bottom_y + 4;
+
+    if(up_base < min_base_y) up_base = min_base_y;
+    if(up_base > max_base_y) up_base = max_base_y;
+
+    if(down_base < min_base_y) down_base = min_base_y;
+    if(down_base > max_base_y) down_base = max_base_y;
+
+    if(show_up) {
+        simple_app_draw_scroll_arrow(canvas, base_left_x, up_base, true);
+    }
+
+    if(show_down) {
+        if(show_up && down_base <= up_base) {
+            down_base = up_base + 4;
+            if(down_base > max_base_y) down_base = max_base_y;
+        }
+        if(!show_up && down_base < min_base_y) {
+            down_base = min_base_y;
+        }
+        simple_app_draw_scroll_arrow(canvas, base_left_x, down_base, false);
+    }
+}
+
+static void simple_app_draw_scroll_hints(
+    Canvas* canvas,
+    uint8_t base_left_x,
+    int16_t content_top_y,
+    int16_t content_bottom_y,
+    bool show_up,
+    bool show_down) {
+    simple_app_draw_scroll_hints_clamped(
+        canvas, base_left_x, content_top_y, content_bottom_y, show_up, show_down, 10, 60);
 }
 
 static void simple_app_copy_field(char* dest, size_t dest_size, const char* src, const char* fallback) {
@@ -1707,44 +1799,17 @@ static void simple_app_draw_console(SimpleApp* app, Canvas* canvas) {
 
     size_t total_lines = simple_app_total_display_lines(app);
     if(total_lines > CONSOLE_VISIBLE_LINES) {
-        const uint8_t track_width = 3;
-        const uint8_t track_x = DISPLAY_WIDTH - track_width;
-        const uint8_t track_y = 4;
-        const uint8_t track_height = 56;
-
-        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
-        canvas_draw_box(canvas, track_x + 1, track_y + 1, 1, 1);
-        canvas_draw_box(canvas, track_x + 1, track_y + track_height - 2, 1, 1);
-
         size_t max_scroll = simple_app_max_scroll(app);
-        uint8_t thumb_height =
-            (uint8_t)(((uint32_t)CONSOLE_VISIBLE_LINES * track_height) / total_lines);
-        if(thumb_height < 4) thumb_height = 4;
-        if(thumb_height > track_height) thumb_height = track_height;
-
-        uint8_t thumb_track_top = track_y;
-        uint8_t thumb_track_height = track_height;
-        uint8_t thumb_width = (track_width > 2) ? (track_width - 2) : 1;
-        uint8_t thumb_x = (track_width > 2) ? (track_x + 1) : track_x;
-
-        if(track_width > 2 && track_height > 2) {
-            thumb_track_top = track_y + 1;
-            thumb_track_height = track_height - 2;
+        bool show_up = (app->serial_scroll > 0);
+        bool show_down = (app->serial_scroll < max_scroll);
+        if(show_up || show_down) {
+            uint8_t arrow_x = DISPLAY_WIDTH - 6;
+            int16_t content_top = 8;
+            int16_t visible_rows =
+                (CONSOLE_VISIBLE_LINES > 0) ? (CONSOLE_VISIBLE_LINES - 1) : 0;
+            int16_t content_bottom = 8 + (int16_t)(visible_rows * SERIAL_TEXT_LINE_HEIGHT);
+            simple_app_draw_scroll_hints(canvas, arrow_x, content_top, content_bottom, show_up, show_down);
         }
-
-        if(thumb_height > thumb_track_height) {
-            thumb_height = thumb_track_height;
-        }
-
-        uint8_t max_thumb_offset =
-            (thumb_track_height > thumb_height) ? (thumb_track_height - thumb_height) : 0;
-        uint8_t thumb_offset = 0;
-        if(max_scroll > 0 && max_thumb_offset > 0) {
-            thumb_offset = (uint8_t)(((uint32_t)app->serial_scroll * max_thumb_offset) / max_scroll);
-        }
-
-        uint8_t thumb_y = thumb_track_top + thumb_offset;
-        canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_height);
     }
 
     if(simple_app_status_message_is_active(app) && !app->status_message_fullscreen) {
@@ -2092,53 +2157,19 @@ static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
     }
 
     if(app->hint_line_count > HINT_VISIBLE_LINES) {
-        const uint8_t track_width = 5;
-        const uint8_t track_height = (uint8_t)(HINT_VISIBLE_LINES * HINT_LINE_HEIGHT);
-        const uint8_t track_x = bubble_x + bubble_w - track_width - 4;
-        int16_t desired_track_y =
-            bubble_y + ((int16_t)bubble_h - (int16_t)track_height) / 2;
-        int16_t track_min = bubble_y + 2;
-        int16_t track_max = bubble_y + bubble_h - track_height - 2;
-        if(track_max < track_min) track_max = track_min;
-        if(desired_track_y < track_min) desired_track_y = track_min;
-        if(desired_track_y > track_max) desired_track_y = track_max;
-        uint8_t track_y = (uint8_t)desired_track_y;
-
-        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
-
         size_t max_scroll = simple_app_hint_max_scroll(app);
-        uint8_t thumb_height =
-            (uint8_t)(((uint32_t)HINT_VISIBLE_LINES * track_height) / app->hint_line_count);
-        if(thumb_height < 4) thumb_height = 4;
-        if(thumb_height > track_height) thumb_height = track_height;
-
-        uint8_t max_thumb_offset =
-            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
-        uint8_t thumb_offset = 0;
-        if(max_scroll > 0 && max_thumb_offset > 0) {
-            thumb_offset =
-                (uint8_t)(((uint32_t)app->hint_scroll * max_thumb_offset) / max_scroll);
+        bool show_up = (app->hint_scroll > 0);
+        bool show_down = (app->hint_scroll < max_scroll);
+        if(show_up || show_down) {
+            uint8_t arrow_x = (uint8_t)(bubble_x + bubble_w - 10);
+            int16_t content_top = text_y;
+            int16_t content_bottom =
+                text_y + (int16_t)((HINT_VISIBLE_LINES > 0 ? (HINT_VISIBLE_LINES - 1) : 0) * HINT_LINE_HEIGHT);
+            int16_t min_base = bubble_y + 12;
+            int16_t max_base = bubble_y + bubble_h - 12;
+            simple_app_draw_scroll_hints_clamped(
+                canvas, arrow_x, content_top, content_bottom, show_up, show_down, min_base, max_base);
         }
-        uint8_t thumb_x = track_x + 1;
-        uint8_t thumb_y = (uint8_t)(track_y + 1 + thumb_offset);
-        uint8_t thumb_inner_height = (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
-        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
-        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
-        canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_inner_height);
-
-        uint8_t arrow_top_center = (uint8_t)(track_y + 2);
-        canvas_draw_line(canvas, track_x + track_width / 2, arrow_top_center - 2, track_x + 1, arrow_top_center);
-        canvas_draw_line(
-            canvas, track_x + track_width / 2, arrow_top_center - 2, track_x + track_width - 2, arrow_top_center);
-
-        uint8_t arrow_bottom_center = (uint8_t)(track_y + track_height - 3);
-        canvas_draw_line(canvas, track_x + 1, arrow_bottom_center, track_x + track_width / 2, arrow_bottom_center + 2);
-        canvas_draw_line(
-            canvas,
-            track_x + track_width - 2,
-            arrow_bottom_center,
-            track_x + track_width / 2,
-            arrow_bottom_center + 2);
     }
 }
 
@@ -2254,46 +2285,19 @@ static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
     }
 
     if(app->evil_twin_html_count > EVIL_TWIN_POPUP_VISIBLE_LINES) {
-        const uint8_t track_width = 3;
-        uint8_t track_height = (uint8_t)(EVIL_TWIN_POPUP_VISIBLE_LINES * HINT_LINE_HEIGHT);
-        const uint8_t track_x = bubble_x + bubble_w - track_width - 6;
-        int16_t desired_track_y =
-            bubble_y + ((int16_t)bubble_h - (int16_t)track_height) / 2;
-        int16_t track_min = bubble_y + 2;
-        int16_t track_max = bubble_y + bubble_h - track_height - 2;
-        if(track_max < track_min) track_max = track_min;
-        if(desired_track_y < track_min) desired_track_y = track_min;
-        if(desired_track_y > track_max) desired_track_y = track_max;
-        uint8_t track_y = (uint8_t)desired_track_y;
-
-        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
-
-        size_t max_offset = app->evil_twin_html_count - EVIL_TWIN_POPUP_VISIBLE_LINES;
-        uint8_t thumb_height =
-            (uint8_t)(((uint32_t)EVIL_TWIN_POPUP_VISIBLE_LINES * track_height) / app->evil_twin_html_count);
-        if(thumb_height < 4) thumb_height = 4;
-        if(thumb_height > track_height) thumb_height = track_height;
-
-        uint8_t max_thumb_offset =
-            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
-        uint8_t thumb_offset = 0;
-        if(max_offset > 0 && max_thumb_offset > 0) {
-            size_t offset = app->evil_twin_html_popup_offset;
-            if(offset > max_offset) offset = max_offset;
-            thumb_offset = (uint8_t)(((uint32_t)offset * max_thumb_offset) / max_offset);
+        bool show_up = (app->evil_twin_html_popup_offset > 0);
+        bool show_down =
+            (app->evil_twin_html_popup_offset + visible < app->evil_twin_html_count);
+        if(show_up || show_down) {
+            uint8_t arrow_x = (uint8_t)(bubble_x + bubble_w - 10);
+            int16_t content_top = list_y;
+            int16_t content_bottom =
+                list_y + (int16_t)((visible > 0 ? (visible - 1) : 0) * HINT_LINE_HEIGHT);
+            int16_t min_base = bubble_y + 12;
+            int16_t max_base = bubble_y + bubble_h - 12;
+            simple_app_draw_scroll_hints_clamped(
+                canvas, arrow_x, content_top, content_bottom, show_up, show_down, min_base, max_base);
         }
-
-        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
-        uint8_t thumb_inner_height =
-            (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
-        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
-
-        canvas_draw_box(
-            canvas,
-            (track_width > 2) ? (uint8_t)(track_x + 1) : track_x,
-            (uint8_t)(track_y + 1 + thumb_offset),
-            thumb_width,
-            thumb_inner_height);
     }
 }
 
@@ -2403,23 +2407,16 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     }
 
     if(section->entry_count > visible_count) {
-        uint8_t arrow_x = DISPLAY_WIDTH - 6;
-        if(app->item_offset > 0) {
-            int16_t top_y = (int16_t)MENU_ITEM_BASE_Y - 4;
-            if(top_y < 12) top_y = 12;
-            canvas_draw_line(canvas, arrow_x, top_y, arrow_x + 4, top_y);
-            canvas_draw_line(canvas, arrow_x, top_y, arrow_x + 2, top_y - 2);
-            canvas_draw_line(canvas, arrow_x + 4, top_y, arrow_x + 2, top_y - 2);
-        }
-        if(app->item_offset + visible_count < section->entry_count) {
-            uint8_t max_rows = (section->entry_count < visible_count) ? section->entry_count : visible_count;
-            int16_t bottom_y =
-                (int16_t)(MENU_ITEM_BASE_Y + (max_rows * MENU_ITEM_SPACING) - 8);
-            if(bottom_y > 60) bottom_y = 60;
-            if(bottom_y < 16) bottom_y = 16;
-            canvas_draw_line(canvas, arrow_x, bottom_y, arrow_x + 4, bottom_y);
-            canvas_draw_line(canvas, arrow_x, bottom_y, arrow_x + 2, bottom_y + 2);
-            canvas_draw_line(canvas, arrow_x + 4, bottom_y, arrow_x + 2, bottom_y + 2);
+        bool show_up = (app->item_offset > 0);
+        bool show_down = (app->item_offset + visible_count < section->entry_count);
+        if(show_up || show_down) {
+            uint8_t arrow_x = DISPLAY_WIDTH - 6;
+            uint8_t max_rows =
+                (section->entry_count < visible_count) ? section->entry_count : visible_count;
+            if(max_rows == 0) max_rows = 1;
+            int16_t content_top = MENU_ITEM_BASE_Y;
+            int16_t content_bottom = MENU_ITEM_BASE_Y + (int16_t)((max_rows - 1) * MENU_ITEM_SPACING);
+            simple_app_draw_scroll_hints(canvas, arrow_x, content_top, content_bottom, show_up, show_down);
         }
     }
 }
@@ -2498,44 +2495,16 @@ static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
 
     size_t total_lines = simple_app_total_display_lines(app);
     if(total_lines > SERIAL_VISIBLE_LINES) {
-        const uint8_t track_width = 3;
-        const uint8_t track_x = DISPLAY_WIDTH - track_width;
-        const uint8_t track_y = 4;
-        const uint8_t track_height = 56;
-
-        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
-        canvas_draw_box(canvas, track_x + 1, track_y + 1, 1, 1);
-        canvas_draw_box(canvas, track_x + 1, track_y + track_height - 2, 1, 1);
-
         size_t max_scroll = simple_app_max_scroll(app);
-        uint8_t thumb_height =
-            (uint8_t)(((uint32_t)SERIAL_VISIBLE_LINES * track_height) / total_lines);
-        if(thumb_height < 4) thumb_height = 4;
-        if(thumb_height > track_height) thumb_height = track_height;
-
-        uint8_t thumb_track_top = track_y;
-        uint8_t thumb_track_height = track_height;
-        uint8_t thumb_width = (track_width > 2) ? (track_width - 2) : 1;
-        uint8_t thumb_x = (track_width > 2) ? (track_x + 1) : track_x;
-
-        if(track_width > 2 && track_height > 2) {
-            thumb_track_top = track_y + 1;
-            thumb_track_height = track_height - 2;
+        bool show_up = (app->serial_scroll > 0);
+        bool show_down = (app->serial_scroll < max_scroll);
+        if(show_up || show_down) {
+            uint8_t arrow_x = DISPLAY_WIDTH - 6;
+            int16_t content_top = 8;
+            int16_t content_bottom =
+                8 + (int16_t)((SERIAL_VISIBLE_LINES > 0 ? (SERIAL_VISIBLE_LINES - 1) : 0) * SERIAL_TEXT_LINE_HEIGHT);
+            simple_app_draw_scroll_hints(canvas, arrow_x, content_top, content_bottom, show_up, show_down);
         }
-
-        if(thumb_height > thumb_track_height) {
-            thumb_height = thumb_track_height;
-        }
-
-        uint8_t max_thumb_offset =
-            (thumb_track_height > thumb_height) ? (thumb_track_height - thumb_height) : 0;
-        uint8_t thumb_offset = 0;
-        if(max_scroll > 0 && max_thumb_offset > 0) {
-            thumb_offset = (uint8_t)(((uint32_t)app->serial_scroll * max_thumb_offset) / max_scroll);
-        }
-
-        uint8_t thumb_y = thumb_track_top + thumb_offset;
-        canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_height);
     }
 
     if(app->serial_targets_hint) {
@@ -2623,33 +2592,19 @@ static void simple_app_draw_results(SimpleApp* app, Canvas* canvas) {
     size_t total_lines = simple_app_total_result_lines(app);
     size_t offset_lines = simple_app_result_offset_lines(app);
     if(total_lines > visible_line_budget) {
-        const uint8_t track_width = RESULT_SCROLL_WIDTH;
-        const uint8_t track_height = (uint8_t)(app->result_line_height * visible_line_budget);
-        const uint8_t track_x = DISPLAY_WIDTH - track_width;
-        const uint8_t track_y = (RESULT_START_Y > 5) ? (RESULT_START_Y - 5) : 0;
-
-        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
-
         size_t max_scroll = total_lines - visible_line_budget;
-        uint8_t thumb_height =
-            (uint8_t)(((uint32_t)visible_line_budget * track_height) / total_lines);
-        if(thumb_height < 4) thumb_height = 4;
-        if(thumb_height > track_height) thumb_height = track_height;
-
-        uint8_t max_thumb_offset =
-            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
-        uint8_t thumb_offset = 0;
-        if(max_scroll > 0 && max_thumb_offset > 0) {
-            if(offset_lines > max_scroll) offset_lines = max_scroll;
-            thumb_offset = (uint8_t)(((uint32_t)offset_lines * max_thumb_offset) / max_scroll);
+        if(offset_lines > max_scroll) offset_lines = max_scroll;
+        bool show_up = (offset_lines > 0);
+        bool show_down = (offset_lines < max_scroll);
+        if(show_up || show_down) {
+            uint8_t arrow_x = DISPLAY_WIDTH - 6;
+            int16_t content_top = RESULT_START_Y;
+            int16_t visible_rows =
+                (visible_line_budget > 0) ? (int16_t)(visible_line_budget - 1) : 0;
+            int16_t content_bottom =
+                RESULT_START_Y + (int16_t)(visible_rows * app->result_line_height);
+            simple_app_draw_scroll_hints(canvas, arrow_x, content_top, content_bottom, show_up, show_down);
         }
-
-        uint8_t thumb_x = track_x + 1;
-        uint8_t thumb_y = track_y + 1 + thumb_offset;
-        uint8_t thumb_inner_height = (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
-        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
-        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
-        canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_inner_height);
     }
 
     char footer[48];
@@ -2730,35 +2685,19 @@ static void simple_app_draw_setup_scanner(SimpleApp* app, Canvas* canvas) {
     }
 
     if(option_count > SCANNER_FILTER_VISIBLE_COUNT) {
-        const uint8_t track_width = 3;
-        const uint8_t track_height = (uint8_t)(SCANNER_FILTER_VISIBLE_COUNT * 10);
-        const uint8_t track_x = DISPLAY_WIDTH - track_width;
-        const uint8_t track_y = 24;
-
-        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
-
         size_t max_offset = option_count - SCANNER_FILTER_VISIBLE_COUNT;
-        uint8_t thumb_height =
-            (uint8_t)(((uint32_t)SCANNER_FILTER_VISIBLE_COUNT * track_height) / option_count);
-        if(thumb_height < 4) thumb_height = 4;
-        if(thumb_height > track_height) thumb_height = track_height;
-
-        uint8_t max_thumb_offset =
-            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
-        uint8_t thumb_offset = 0;
-        if(max_offset > 0 && max_thumb_offset > 0) {
-            if(app->scanner_view_offset > max_offset) {
-                app->scanner_view_offset = max_offset;
-            }
-            thumb_offset =
-                (uint8_t)(((uint32_t)app->scanner_view_offset * max_thumb_offset) / max_offset);
+        if(app->scanner_view_offset > max_offset) {
+            app->scanner_view_offset = max_offset;
         }
-        uint8_t thumb_x = track_x + 1;
-        uint8_t thumb_y = track_y + 1 + thumb_offset;
-        uint8_t thumb_inner_height = (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
-        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
-        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
-        canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_inner_height);
+        bool show_up = (app->scanner_view_offset > 0);
+        bool show_down = (app->scanner_view_offset < max_offset);
+        if(show_up || show_down) {
+            uint8_t arrow_x = DISPLAY_WIDTH - 6;
+            int16_t content_top = 26;
+            int16_t content_bottom =
+                26 + (int16_t)((SCANNER_FILTER_VISIBLE_COUNT > 0 ? (SCANNER_FILTER_VISIBLE_COUNT - 1) : 0) * 10);
+            simple_app_draw_scroll_hints(canvas, arrow_x, content_top, content_bottom, show_up, show_down);
+        }
     }
 
     const char* footer = "OK toggle, Back exit";
@@ -3573,46 +3512,19 @@ static void simple_app_draw_karma_probe_popup(SimpleApp* app, Canvas* canvas) {
     }
 
     if(app->karma_probe_count > KARMA_POPUP_VISIBLE_LINES) {
-        const uint8_t track_width = 3;
-        uint8_t track_height = (uint8_t)(KARMA_POPUP_VISIBLE_LINES * HINT_LINE_HEIGHT);
-        const uint8_t track_x = bubble_x + bubble_w - track_width - 6;
-        int16_t desired_track_y =
-            bubble_y + ((int16_t)bubble_h - (int16_t)track_height) / 2;
-        int16_t track_min = bubble_y + 2;
-        int16_t track_max = bubble_y + bubble_h - track_height - 2;
-        if(track_max < track_min) track_max = track_min;
-        if(desired_track_y < track_min) desired_track_y = track_min;
-        if(desired_track_y > track_max) desired_track_y = track_max;
-        uint8_t track_y = (uint8_t)desired_track_y;
-
-        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
-
-        size_t max_offset = app->karma_probe_count - KARMA_POPUP_VISIBLE_LINES;
-        uint8_t thumb_height =
-            (uint8_t)(((uint32_t)KARMA_POPUP_VISIBLE_LINES * track_height) / app->karma_probe_count);
-        if(thumb_height < 4) thumb_height = 4;
-        if(thumb_height > track_height) thumb_height = track_height;
-
-        uint8_t max_thumb_offset =
-            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
-        uint8_t thumb_offset = 0;
-        if(max_offset > 0 && max_thumb_offset > 0) {
-            size_t offset = app->karma_probe_popup_offset;
-            if(offset > max_offset) offset = max_offset;
-            thumb_offset = (uint8_t)(((uint32_t)offset * max_thumb_offset) / max_offset);
+        bool show_up = (app->karma_probe_popup_offset > 0);
+        bool show_down =
+            (app->karma_probe_popup_offset + visible < app->karma_probe_count);
+        if(show_up || show_down) {
+            uint8_t arrow_x = (uint8_t)(bubble_x + bubble_w - 10);
+            int16_t content_top = list_y;
+            int16_t content_bottom =
+                list_y + (int16_t)((visible > 0 ? (visible - 1) : 0) * HINT_LINE_HEIGHT);
+            int16_t min_base = bubble_y + 12;
+            int16_t max_base = bubble_y + bubble_h - 12;
+            simple_app_draw_scroll_hints_clamped(
+                canvas, arrow_x, content_top, content_bottom, show_up, show_down, min_base, max_base);
         }
-
-        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
-        uint8_t thumb_inner_height =
-            (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
-        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
-
-        canvas_draw_box(
-            canvas,
-            (track_width > 2) ? (uint8_t)(track_x + 1) : track_x,
-            (uint8_t)(track_y + 1 + thumb_offset),
-            thumb_width,
-            thumb_inner_height);
     }
 }
 
@@ -3936,46 +3848,19 @@ static void simple_app_draw_karma_html_popup(SimpleApp* app, Canvas* canvas) {
     }
 
     if(app->karma_html_count > KARMA_POPUP_VISIBLE_LINES) {
-        const uint8_t track_width = 3;
-        uint8_t track_height = (uint8_t)(KARMA_POPUP_VISIBLE_LINES * HINT_LINE_HEIGHT);
-        const uint8_t track_x = bubble_x + bubble_w - track_width - 6;
-        int16_t desired_track_y =
-            bubble_y + ((int16_t)bubble_h - (int16_t)track_height) / 2;
-        int16_t track_min = bubble_y + 2;
-        int16_t track_max = bubble_y + bubble_h - track_height - 2;
-        if(track_max < track_min) track_max = track_min;
-        if(desired_track_y < track_min) desired_track_y = track_min;
-        if(desired_track_y > track_max) desired_track_y = track_max;
-        uint8_t track_y = (uint8_t)desired_track_y;
-
-        canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
-
-        size_t max_offset = app->karma_html_count - KARMA_POPUP_VISIBLE_LINES;
-        uint8_t thumb_height =
-            (uint8_t)(((uint32_t)KARMA_POPUP_VISIBLE_LINES * track_height) / app->karma_html_count);
-        if(thumb_height < 4) thumb_height = 4;
-        if(thumb_height > track_height) thumb_height = track_height;
-
-        uint8_t max_thumb_offset =
-            (track_height > thumb_height) ? (uint8_t)(track_height - thumb_height) : 0;
-        uint8_t thumb_offset = 0;
-        if(max_offset > 0 && max_thumb_offset > 0) {
-            size_t offset = app->karma_html_popup_offset;
-            if(offset > max_offset) offset = max_offset;
-            thumb_offset = (uint8_t)(((uint32_t)offset * max_thumb_offset) / max_offset);
+        bool show_up = (app->karma_html_popup_offset > 0);
+        bool show_down =
+            (app->karma_html_popup_offset + visible < app->karma_html_count);
+        if(show_up || show_down) {
+            uint8_t arrow_x = (uint8_t)(bubble_x + bubble_w - 10);
+            int16_t content_top = list_y;
+            int16_t content_bottom =
+                list_y + (int16_t)((visible > 0 ? (visible - 1) : 0) * HINT_LINE_HEIGHT);
+            int16_t min_base = bubble_y + 12;
+            int16_t max_base = bubble_y + bubble_h - 12;
+            simple_app_draw_scroll_hints_clamped(
+                canvas, arrow_x, content_top, content_bottom, show_up, show_down, min_base, max_base);
         }
-
-        uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
-        uint8_t thumb_inner_height =
-            (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
-        if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
-
-        canvas_draw_box(
-            canvas,
-            (track_width > 2) ? (uint8_t)(track_x + 1) : track_x,
-            (uint8_t)(track_y + 1 + thumb_offset),
-            thumb_width,
-            thumb_inner_height);
     }
 }
 
@@ -4252,20 +4137,16 @@ static void simple_app_draw_karma_menu(SimpleApp* app, Canvas* canvas) {
         list_bottom_y = current_y;
     }
 
+    uint8_t arrow_x = DISPLAY_WIDTH - 6;
     if(offset > 0) {
-        uint8_t top_arrow_y = (base_y > 4) ? (uint8_t)(base_y - 4) : 12;
-        canvas_draw_line(canvas, 122, top_arrow_y, 126, top_arrow_y);
-        canvas_draw_line(canvas, 122, top_arrow_y, 124, top_arrow_y - 2);
-        canvas_draw_line(canvas, 126, top_arrow_y, 124, top_arrow_y - 2);
+        int16_t top_arrow_y = (base_y > 4) ? (int16_t)(base_y - 4) : 12;
+        simple_app_draw_scroll_arrow(canvas, arrow_x, top_arrow_y, true);
     }
     if(offset + visible_count < total_count) {
         int16_t raw_y = (int16_t)list_bottom_y - 8;
         if(raw_y > 60) raw_y = 60;
         if(raw_y < 16) raw_y = 16;
-        uint8_t arrow_y = (uint8_t)raw_y;
-        canvas_draw_line(canvas, 122, arrow_y, 126, arrow_y);
-        canvas_draw_line(canvas, 122, arrow_y, 124, arrow_y + 2);
-        canvas_draw_line(canvas, 126, arrow_y, 124, arrow_y + 2);
+        simple_app_draw_scroll_arrow(canvas, arrow_x, raw_y, false);
     }
 }
 
