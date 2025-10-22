@@ -56,12 +56,19 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.5.1"
+#define JANOS_VERSION "0.5.2"
 
 
 #define NEOPIXEL_GPIO      27
 #define LED_COUNT          1
 #define RMT_RES_HZ         (10 * 1000 * 1000)  // 10 MHz
+
+// Boot/flash button (GPIO28) starts sniffer dog on tap, blackout on long-press
+#define BOOT_BUTTON_GPIO               28
+#define BOOT_BUTTON_TASK_STACK_SIZE    2048
+#define BOOT_BUTTON_TASK_PRIORITY      5
+#define BOOT_BUTTON_POLL_DELAY_MS      20
+#define BOOT_BUTTON_LONG_PRESS_MS      1000
 
 // GPS UART pins (Marauder compatible)
 #define GPS_UART_NUM       UART_NUM_1
@@ -199,6 +206,7 @@ static httpd_handle_t portal_server = NULL;
 static volatile bool portal_active = false;
 static TaskHandle_t dns_server_task_handle = NULL;
 static int dns_server_socket = -1;
+static TaskHandle_t boot_button_task_handle = NULL;
 
 // DNS server configuration
 #define DNS_PORT 53
@@ -1568,6 +1576,43 @@ static int cmd_start_blackout(int argc, char **argv) {
     }
     
     return 0;
+}
+
+static void boot_button_task(void *arg) {
+    const TickType_t delay_ticks = pdMS_TO_TICKS(BOOT_BUTTON_POLL_DELAY_MS);
+    const TickType_t long_press_ticks = pdMS_TO_TICKS(BOOT_BUTTON_LONG_PRESS_MS);
+    bool prev_pressed = (gpio_get_level(BOOT_BUTTON_GPIO) == 0);
+    TickType_t press_start_tick = prev_pressed ? xTaskGetTickCount() : 0;
+    bool long_action_triggered = false;
+
+    while (1) {
+        bool pressed = (gpio_get_level(BOOT_BUTTON_GPIO) == 0);
+        TickType_t now = xTaskGetTickCount();
+
+        if (pressed) {
+            if (!prev_pressed) {
+                // Rising edge - start tracking the press
+                press_start_tick = now;
+                long_action_triggered = false;
+            } else if (!long_action_triggered && (now - press_start_tick) >= long_press_ticks) {
+                long_action_triggered = true;
+                printf("Boot Long Pressed\n");
+                fflush(stdout);
+                (void)cmd_start_blackout(0, NULL);
+            }
+        } else if (prev_pressed) {
+            // Falling edge - button released
+            if (!long_action_triggered) {
+                printf("Boot Pressed\n");
+                fflush(stdout);
+                (void)cmd_start_sniffer_dog(0, NULL);
+            }
+            long_action_triggered = false;
+        }
+
+        prev_pressed = pressed;
+        vTaskDelay(delay_ticks);
+    }
 }
 
 /*
@@ -4168,9 +4213,33 @@ void app_main(void) {
 
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
- 
+
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     vTaskDelay(pdMS_TO_TICKS(500));
+
+    gpio_config_t boot_button_config = {
+        .pin_bit_mask = 1ULL << BOOT_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&boot_button_config));
+
+    if (boot_button_task_handle == NULL) {
+        BaseType_t boot_task_created = xTaskCreate(
+            boot_button_task,
+            "boot_button",
+            BOOT_BUTTON_TASK_STACK_SIZE,
+            NULL,
+            BOOT_BUTTON_TASK_PRIORITY,
+            &boot_button_task_handle
+        );
+        if (boot_task_created != pdPASS) {
+            MY_LOG_INFO(TAG, "Failed to create boot button task");
+            boot_button_task_handle = NULL;
+        }
+    }
     
     // Initialize SD card and create necessary directories
     esp_err_t sd_init_ret = init_sd_card();
