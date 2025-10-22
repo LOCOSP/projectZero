@@ -14,6 +14,8 @@
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
 #include <furi/core/stream_buffer.h>
+#include <gui/view_dispatcher.h>
+#include <gui/modules/text_input.h>
 
 typedef enum {
     ScreenMenu,
@@ -26,13 +28,14 @@ typedef enum {
     ScreenConfirmSnifferDos,
     ScreenKarmaMenu,
     ScreenEvilTwinMenu,
+    ScreenPortalMenu,
 } AppScreen;
 
 typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.10"
+#define LAB_C5_VERSION_TEXT "0.11"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -94,6 +97,8 @@ typedef enum {
 #define KARMA_PROBE_NAME_MAX 48
 #define KARMA_POPUP_VISIBLE_LINES 3
 #define KARMA_MENU_OPTION_COUNT 5
+#define PORTAL_MENU_OPTION_COUNT 3
+#define PORTAL_VISIBLE_COUNT 2
 #define KARMA_MAX_HTML_FILES EVIL_TWIN_MAX_HTML_FILES
 #define KARMA_HTML_NAME_MAX EVIL_TWIN_HTML_NAME_MAX
 #define KARMA_SNIFFER_DURATION_MIN_SEC 5
@@ -115,6 +120,7 @@ typedef enum {
     MenuActionConfirmSnifferDos,
     MenuActionOpenEvilTwinMenu,
     MenuActionOpenKarmaMenu,
+    MenuActionOpenPortalMenu,
 } MenuAction;
 
 typedef enum {
@@ -189,6 +195,11 @@ typedef struct {
     size_t evil_twin_list_length;
     uint8_t evil_twin_selected_html_id;
     char evil_twin_selected_html_name[EVIL_TWIN_HTML_NAME_MAX];
+    size_t portal_menu_index;
+    char portal_ssid[SCAN_SSID_MAX_LEN];
+    size_t portal_menu_offset;
+    bool portal_input_requested;
+    bool portal_input_active;
     size_t karma_menu_index;
     size_t karma_menu_offset;
     KarmaProbeEntry karma_probes[KARMA_MAX_PROBES];
@@ -283,6 +294,15 @@ static void simple_app_prepare_hint_lines(SimpleApp* app, const char* text);
 static void simple_app_hint_scroll(SimpleApp* app, int delta);
 static size_t simple_app_hint_max_scroll(const SimpleApp* app);
 static bool simple_app_try_show_hint(SimpleApp* app);
+static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key);
+static void simple_app_copy_portal_ssid(SimpleApp* app, const char* source);
+static void simple_app_portal_prompt_ssid(SimpleApp* app);
+static void simple_app_portal_sync_offset(SimpleApp* app);
+static bool simple_app_portal_run_text_input(SimpleApp* app);
+static void simple_app_portal_text_input_result(void* context);
+static bool simple_app_portal_text_input_navigation(void* context);
+static void simple_app_start_portal(SimpleApp* app);
 static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key);
 static void simple_app_draw_scroll_arrow(Canvas* canvas, uint8_t base_left_x, int16_t base_y, bool upwards);
@@ -394,6 +414,8 @@ static const char hint_attack_deauth[] =
     "Disconnects clients \nof all selected networks.";
 static const char hint_attack_evil_twin[] =
     "Creates fake network \nwith captive portal in the \nname of the first selected.";
+static const char hint_attack_portal[] =
+    "Custom captive portal\nSet SSID manually\nUse keyboard input\nStart when ready\nLab testing only.";
 static const char hint_attack_karma[] =
     "Collect probe SSIDs\nPick captive portal\nStart Karma beacon\nSniffer auto stops\nLab use only.";
 static const char hint_attack_sae_overflow[] =
@@ -423,6 +445,7 @@ static const MenuEntry menu_entries_attacks[] = {
     {"Blackout", NULL, MenuActionConfirmBlackout, hint_attack_blackout},
     {"Deauth", "start_deauth", MenuActionCommandWithTargets, hint_attack_deauth},
     {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu, hint_attack_evil_twin},
+    {"Portal", NULL, MenuActionOpenPortalMenu, hint_attack_portal},
     {"Karma", NULL, MenuActionOpenKarmaMenu, hint_attack_karma},
     {"SAE Overflow", "sae_overflow", MenuActionCommandWithTargets, hint_attack_sae_overflow},
     {"Sniffer Dog", NULL, MenuActionConfirmSnifferDos, hint_attack_sniffer_dog},
@@ -2202,6 +2225,337 @@ static bool simple_app_try_show_hint(SimpleApp* app) {
     return true;
 }
 
+static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 4, 14, "Portal");
+
+    canvas_set_font(canvas, FontSecondary);
+    simple_app_portal_sync_offset(app);
+
+    size_t offset = app->portal_menu_offset;
+    size_t visible = PORTAL_VISIBLE_COUNT;
+    if(visible == 0) visible = 1;
+    if(visible > PORTAL_MENU_OPTION_COUNT) {
+        visible = PORTAL_MENU_OPTION_COUNT;
+    }
+
+    uint8_t base_y = 30;
+    uint8_t y = base_y;
+    uint8_t list_bottom_y = base_y;
+
+    for(size_t pos = 0; pos < visible; pos++) {
+        size_t idx = offset + pos;
+        if(idx >= PORTAL_MENU_OPTION_COUNT) break;
+
+        const char* label = "Start Portal";
+        char detail[48];
+        detail[0] = '\0';
+        bool show_detail_line = false;
+
+        switch(idx) {
+        case 0:
+            label = "SSID";
+            if(app->portal_ssid[0] != '\0') {
+                snprintf(detail, sizeof(detail), "Current: %s", app->portal_ssid);
+            } else {
+                snprintf(detail, sizeof(detail), "Current: <none>");
+            }
+            simple_app_truncate_text(detail, 26);
+            show_detail_line = true;
+            break;
+        case 1:
+            label = "Select HTML";
+            if(app->karma_selected_html_id != 0 && app->karma_selected_html_name[0] != '\0') {
+                snprintf(detail, sizeof(detail), "Current: %s", app->karma_selected_html_name);
+            } else {
+                snprintf(detail, sizeof(detail), "Current: <none>");
+            }
+            simple_app_truncate_text(detail, 26);
+            show_detail_line = true;
+            break;
+        default:
+            label = "Start Portal";
+            if(app->portal_ssid[0] == '\0') {
+                snprintf(detail, sizeof(detail), "Need SSID");
+            } else if(app->karma_selected_html_id == 0) {
+                snprintf(detail, sizeof(detail), "Need HTML");
+            } else {
+                detail[0] = '\0';
+            }
+            simple_app_truncate_text(detail, 20);
+            break;
+        }
+
+        if(app->portal_menu_index == idx) {
+            canvas_draw_str(canvas, 2, y, ">");
+        }
+        canvas_draw_str(canvas, 14, y, label);
+
+        uint8_t item_height = 12;
+        if(show_detail_line || detail[0] != '\0') {
+            canvas_draw_str(canvas, 14, (uint8_t)(y + 10), detail);
+            item_height += 10;
+        }
+        y = (uint8_t)(y + item_height);
+        list_bottom_y = y;
+    }
+
+    uint8_t arrow_x = DISPLAY_WIDTH - 6;
+    if(offset > 0) {
+        int16_t arrow_y = (int16_t)(base_y - 6);
+        if(arrow_y < 12) arrow_y = 12;
+        simple_app_draw_scroll_arrow(canvas, arrow_x, arrow_y, true);
+    }
+    if(offset + visible < PORTAL_MENU_OPTION_COUNT) {
+        int16_t arrow_y = (int16_t)(list_bottom_y - 6);
+        if(arrow_y > 60) arrow_y = 60;
+        if(arrow_y < 16) arrow_y = 16;
+        simple_app_draw_scroll_arrow(canvas, arrow_x, arrow_y, false);
+    }
+}
+
+static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack || key == InputKeyLeft) {
+        if(app->karma_html_listing_active) {
+            simple_app_reset_karma_html_listing(app);
+        }
+        app->karma_html_popup_active = false;
+        simple_app_clear_status_message(app);
+        app->karma_status_active = false;
+        app->portal_menu_offset = 0;
+        simple_app_focus_attacks_menu(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyUp) {
+        if(app->portal_menu_index > 0) {
+            app->portal_menu_index--;
+            simple_app_portal_sync_offset(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyDown) {
+        if(app->portal_menu_index + 1 < PORTAL_MENU_OPTION_COUNT) {
+            app->portal_menu_index++;
+            simple_app_portal_sync_offset(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyOk) {
+        if(app->portal_menu_index == 0) {
+            simple_app_portal_prompt_ssid(app);
+        } else if(app->portal_menu_index == 1) {
+            if(app->karma_html_listing_active || app->karma_html_count == 0) {
+                simple_app_request_karma_html_list(app);
+            } else {
+                simple_app_clear_status_message(app);
+                app->karma_status_active = false;
+                if(app->karma_html_popup_index >= app->karma_html_count) {
+                    app->karma_html_popup_index = 0;
+                }
+                if(app->karma_html_popup_offset >= app->karma_html_count) {
+                    app->karma_html_popup_offset = 0;
+                }
+                app->karma_html_popup_active = true;
+                if(app->viewport) {
+                    view_port_update(app->viewport);
+                }
+            }
+        } else {
+            simple_app_start_portal(app);
+        }
+    }
+}
+
+static void simple_app_copy_portal_ssid(SimpleApp* app, const char* source) {
+    if(!app) return;
+    if(!source) {
+        app->portal_ssid[0] = '\0';
+        return;
+    }
+
+    size_t dst = 0;
+    size_t max_len = sizeof(app->portal_ssid);
+    for(size_t i = 0; source[i] != '\0' && dst + 1 < max_len; i++) {
+        char ch = source[i];
+        if((unsigned char)ch < 32) {
+            continue;
+        }
+        if(ch == '"') {
+            ch = '\'';
+        }
+        app->portal_ssid[dst++] = ch;
+    }
+    app->portal_ssid[dst] = '\0';
+    simple_app_trim(app->portal_ssid);
+}
+
+static void simple_app_portal_prompt_ssid(SimpleApp* app) {
+    if(!app) return;
+    if(app->portal_input_active) return;
+    app->portal_input_requested = true;
+}
+
+static void simple_app_portal_sync_offset(SimpleApp* app) {
+    if(!app) return;
+    size_t total = PORTAL_MENU_OPTION_COUNT;
+    size_t visible = PORTAL_VISIBLE_COUNT;
+    if(visible == 0) visible = 1;
+    if(visible > total) visible = total;
+    if(total == 0) {
+        app->portal_menu_index = 0;
+        app->portal_menu_offset = 0;
+        return;
+    }
+    if(app->portal_menu_index >= total) {
+        app->portal_menu_index = total - 1;
+    }
+    size_t max_offset = (total > visible) ? (total - visible) : 0;
+    if(app->portal_menu_offset > max_offset) {
+        app->portal_menu_offset = max_offset;
+    }
+    if(app->portal_menu_index < app->portal_menu_offset) {
+        app->portal_menu_offset = app->portal_menu_index;
+    } else if(app->portal_menu_index >= app->portal_menu_offset + visible) {
+        app->portal_menu_offset = app->portal_menu_index - visible + 1;
+    }
+    if(app->portal_menu_offset > max_offset) {
+        app->portal_menu_offset = max_offset;
+    }
+}
+
+typedef struct {
+    ViewDispatcher* dispatcher;
+    bool accepted;
+} SimpleAppPortalInputContext;
+
+static void simple_app_portal_text_input_result(void* context) {
+    SimpleAppPortalInputContext* ctx = context;
+    if(!ctx || !ctx->dispatcher) return;
+    ctx->accepted = true;
+    view_dispatcher_stop(ctx->dispatcher);
+}
+
+static bool simple_app_portal_text_input_navigation(void* context) {
+    SimpleAppPortalInputContext* ctx = context;
+    if(!ctx || !ctx->dispatcher) return false;
+    ctx->accepted = false;
+    view_dispatcher_stop(ctx->dispatcher);
+    return true;
+}
+
+static bool simple_app_portal_run_text_input(SimpleApp* app) {
+    if(!app || !app->gui || !app->viewport) return false;
+
+    bool accepted = false;
+    bool viewport_detached = false;
+
+    char buffer[SCAN_SSID_MAX_LEN];
+    strncpy(buffer, app->portal_ssid, sizeof(buffer));
+    buffer[sizeof(buffer) - 1] = '\0';
+
+    ViewDispatcher* dispatcher = view_dispatcher_alloc();
+    if(!dispatcher) return false;
+
+    TextInput* text_input = text_input_alloc();
+    if(!text_input) {
+        view_dispatcher_free(dispatcher);
+        return false;
+    }
+
+    SimpleAppPortalInputContext ctx = {
+        .dispatcher = dispatcher,
+        .accepted = false,
+    };
+
+    view_dispatcher_set_event_callback_context(dispatcher, &ctx);
+    view_dispatcher_set_navigation_event_callback(dispatcher, simple_app_portal_text_input_navigation);
+
+    text_input_set_header_text(text_input, "Portal SSID");
+    text_input_set_result_callback(
+        text_input,
+        simple_app_portal_text_input_result,
+        &ctx,
+        buffer,
+        sizeof(buffer),
+        false);
+    text_input_set_minimum_length(text_input, 1);
+
+    view_dispatcher_add_view(dispatcher, 0, text_input_get_view(text_input));
+
+    gui_remove_view_port(app->gui, app->viewport);
+    viewport_detached = true;
+    app->portal_input_active = true;
+
+    view_dispatcher_attach_to_gui(dispatcher, app->gui, ViewDispatcherTypeFullscreen);
+    view_dispatcher_switch_to_view(dispatcher, 0);
+    view_dispatcher_run(dispatcher);
+
+    view_dispatcher_remove_view(dispatcher, 0);
+    view_dispatcher_free(dispatcher);
+    text_input_free(text_input);
+
+    if(viewport_detached) {
+        gui_add_view_port(app->gui, app->viewport, GuiLayerFullscreen);
+        view_port_update(app->viewport);
+    }
+    app->portal_input_active = false;
+
+    if(ctx.accepted) {
+        simple_app_copy_portal_ssid(app, buffer);
+        accepted = true;
+    }
+
+    return accepted;
+}
+
+static void simple_app_start_portal(SimpleApp* app) {
+    if(!app) return;
+
+    if(app->karma_html_listing_active) {
+        simple_app_show_status_message(app, "Wait for list\ncompletion", 1500, true);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->portal_ssid[0] == '\0') {
+        simple_app_show_status_message(app, "Set SSID first", 1200, true);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->karma_selected_html_id == 0) {
+        simple_app_show_status_message(app, "Select HTML file\nbefore starting", 1500, true);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    char select_command[48];
+    snprintf(select_command, sizeof(select_command), "select_html %u", (unsigned)app->karma_selected_html_id);
+    simple_app_send_command(app, select_command, false);
+    app->last_command_sent = false;
+
+    char command[128];
+    snprintf(command, sizeof(command), "start_portal \"%s\"", app->portal_ssid);
+    simple_app_send_command(app, command, true);
+}
+
 static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
 
@@ -2779,6 +3133,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenEvilTwinMenu:
         simple_app_draw_evil_twin_menu(app, canvas);
         break;
+    case ScreenPortalMenu:
+        simple_app_draw_portal_menu(app, canvas);
+        break;
     default:
         simple_app_draw_results(app, canvas);
         break;
@@ -2895,6 +3252,12 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         } else if(entry->action == MenuActionOpenEvilTwinMenu) {
             app->screen = ScreenEvilTwinMenu;
             app->evil_twin_menu_index = 0;
+            view_port_update(app->viewport);
+        } else if(entry->action == MenuActionOpenPortalMenu) {
+            app->screen = ScreenPortalMenu;
+            app->portal_menu_index = 0;
+            app->portal_menu_offset = 0;
+            simple_app_portal_sync_offset(app);
             view_port_update(app->viewport);
         } else if(entry->action == MenuActionToggleBacklight) {
             simple_app_toggle_backlight(app);
@@ -3640,14 +4003,14 @@ static void simple_app_finish_karma_html_listing(SimpleApp* app) {
     app->karma_html_list_length = 0;
     app->karma_html_list_header_seen = false;
     app->last_command_sent = false;
-    bool on_karma_screen = (app->screen == ScreenKarmaMenu);
+    bool on_html_screen = (app->screen == ScreenKarmaMenu) || (app->screen == ScreenPortalMenu);
     if(app->karma_status_active) {
         simple_app_clear_status_message(app);
         app->karma_status_active = false;
     }
 
     if(app->karma_html_count == 0) {
-        if(on_karma_screen) {
+        if(on_html_screen) {
             simple_app_show_status_message(app, "No HTML files\nfound on SD", 1500, true);
             app->karma_html_popup_active = false;
             if(app->viewport) {
@@ -3657,7 +4020,7 @@ static void simple_app_finish_karma_html_listing(SimpleApp* app) {
         return;
     }
 
-    if(!on_karma_screen) {
+    if(!on_html_screen) {
         app->karma_html_popup_active = false;
         return;
     }
@@ -3866,10 +4229,12 @@ static void simple_app_draw_karma_html_popup(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->karma_html_popup_active) return;
-    if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
+    if(event->type != InputTypeShort && event->type != InputTypeRepeat && event->type != InputTypeLong) return;
 
     InputKey key = event->key;
-    if(event->type == InputTypeShort && key == InputKeyBack) {
+    bool is_short = (event->type == InputTypeShort);
+
+    if(is_short && key == InputKeyBack) {
         app->karma_html_popup_active = false;
         if(app->viewport) {
             view_port_update(app->viewport);
@@ -3878,7 +4243,7 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
     }
 
     if(app->karma_html_count == 0) {
-        if(event->type == InputTypeShort && key == InputKeyOk) {
+        if(is_short && key == InputKeyOk) {
             app->karma_html_popup_active = false;
             if(app->viewport) {
                 view_port_update(app->viewport);
@@ -3919,7 +4284,7 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
                 view_port_update(app->viewport);
             }
         }
-    } else if(event->type == InputTypeShort && key == InputKeyOk) {
+    } else if(is_short && key == InputKeyOk) {
         if(app->karma_html_popup_index < app->karma_html_count) {
             const KarmaHtmlEntry* entry = &app->karma_html_entries[app->karma_html_popup_index];
             app->karma_selected_html_id = entry->id;
@@ -3945,6 +4310,11 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
             snprintf(message, sizeof(message), "HTML set:\n%s", entry->name);
             simple_app_show_status_message(app, message, 1500, true);
 
+            if(app->screen == ScreenPortalMenu) {
+                app->portal_menu_index = PORTAL_MENU_OPTION_COUNT - 1;
+                simple_app_portal_sync_offset(app);
+            }
+
             app->karma_html_popup_active = false;
             if(app->viewport) {
                 view_port_update(app->viewport);
@@ -3957,7 +4327,7 @@ static void simple_app_request_karma_html_list(SimpleApp* app) {
     if(!app) return;
     simple_app_reset_karma_html_listing(app);
     app->karma_html_listing_active = true;
-    bool show_status = (app->screen == ScreenKarmaMenu);
+    bool show_status = (app->screen == ScreenKarmaMenu) || (app->screen == ScreenPortalMenu);
     if(show_status) {
         simple_app_show_status_message(app, "Listing HTML...", 0, false);
         app->karma_status_active = true;
@@ -4601,6 +4971,9 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenKarmaMenu:
         simple_app_handle_karma_menu_input(app, event->key);
         break;
+    case ScreenPortalMenu:
+        simple_app_handle_portal_menu_input(app, event->key);
+        break;
     default:
         simple_app_handle_results_input(app, event->key);
         break;
@@ -4714,6 +5087,23 @@ int32_t Lab_C5_app(void* p) {
     while(!app->exit_app) {
         simple_app_process_stream(app);
         simple_app_update_karma_sniffer(app);
+
+        if(app->portal_input_requested && !app->portal_input_active) {
+            app->portal_input_requested = false;
+            bool accepted = simple_app_portal_run_text_input(app);
+            if(accepted) {
+                if(app->portal_ssid[0] != '\0') {
+                    simple_app_show_status_message(app, "SSID updated", 1000, true);
+                    app->portal_menu_index = 1;
+                } else {
+                    simple_app_show_status_message(app, "SSID cleared", 1000, true);
+                }
+                simple_app_portal_sync_offset(app);
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
 
         bool previous_help_hint = app->help_hint_visible;
         bool can_show_help_hint = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
