@@ -143,6 +143,16 @@ static volatile bool sniffer_active = false;
 static volatile bool sniffer_scan_phase = false;
 static int sniff_debug = 0; // Debug flag for detailed packet logging
 
+// Packet monitor state
+static volatile bool packet_monitor_active = false;
+static volatile uint32_t packet_monitor_total = 0;
+static TaskHandle_t packet_monitor_task_handle = NULL;
+static uint8_t packet_monitor_prev_primary = 1;
+static wifi_second_chan_t packet_monitor_prev_secondary = WIFI_SECOND_CHAN_NONE;
+static bool packet_monitor_has_prev_channel = false;
+static bool packet_monitor_promiscuous_owned = false;
+static bool packet_monitor_callback_installed = false;
+
 // Probe request storage
 static probe_request_t probe_requests[MAX_PROBE_REQUESTS];
 static int probe_request_count = 0;
@@ -298,6 +308,7 @@ static int cmd_select_networks(int argc, char **argv);
 static int cmd_start_evil_twin(int argc, char **argv);
 static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
+static int cmd_packet_monitor(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
 static int cmd_show_probes(int argc, char **argv);
 static int cmd_list_probes(int argc, char **argv);
@@ -336,6 +347,11 @@ static esp_err_t captive_detection_handler(httpd_req_t *req);
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
 static void sniffer_channel_hop(void);
+// Packet monitor functions
+static void packet_monitor_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
+static void packet_monitor_task(void *pvParameters);
+static void packet_monitor_shutdown(void);
+static void packet_monitor_stop(void);
 // Sniffer Dog functions
 static int cmd_start_sniffer_dog(int argc, char **argv);
 static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
@@ -1829,6 +1845,9 @@ static int cmd_stop(int argc, char **argv) {
     // Set global stop flags
     operation_stop_requested = true;
     wardrive_active = false;
+
+    // Stop packet monitor if running
+    packet_monitor_stop();
     
     // Stop deauth attack task if running
     if (deauth_attack_active || deauth_attack_task_handle != NULL) {
@@ -2045,6 +2064,200 @@ static int cmd_stop(int argc, char **argv) {
     }
     
     MY_LOG_INFO(TAG, "All operations stopped.");
+    return 0;
+}
+
+static void packet_monitor_shutdown(void) {
+    if (packet_monitor_promiscuous_owned) {
+        esp_wifi_set_promiscuous(false);
+        packet_monitor_promiscuous_owned = false;
+    }
+
+    if (packet_monitor_callback_installed) {
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+        packet_monitor_callback_installed = false;
+    }
+
+    if (packet_monitor_has_prev_channel) {
+        esp_wifi_set_channel(packet_monitor_prev_primary, packet_monitor_prev_secondary);
+        packet_monitor_has_prev_channel = false;
+    }
+}
+
+static void packet_monitor_stop(void) {
+    if (!packet_monitor_active && packet_monitor_task_handle == NULL && !packet_monitor_promiscuous_owned && !packet_monitor_callback_installed) {
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "Stopping packet monitor...");
+
+    packet_monitor_active = false;
+
+    for (int i = 0; i < 40 && packet_monitor_task_handle != NULL; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (packet_monitor_task_handle != NULL) {
+        vTaskDelete(packet_monitor_task_handle);
+        packet_monitor_task_handle = NULL;
+    }
+
+    packet_monitor_shutdown();
+    packet_monitor_total = 0;
+}
+
+static void packet_monitor_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    (void)buf;
+
+    if (!packet_monitor_active) {
+        return;
+    }
+
+    packet_monitor_total++;
+}
+
+static void packet_monitor_task(void *pvParameters) {
+    (void)pvParameters;
+
+    uint32_t last_total = 0;
+
+    while (packet_monitor_active) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        if (!packet_monitor_active) {
+            break;
+        }
+
+        uint32_t current = packet_monitor_total;
+        uint32_t diff = current - last_total;
+        last_total = current;
+
+        printf("%" PRIu32 "pkts\n", diff);
+        fflush(stdout);
+    }
+
+    packet_monitor_shutdown();
+    packet_monitor_task_handle = NULL;
+    packet_monitor_total = 0;
+    packet_monitor_active = false;
+    vTaskDelete(NULL);
+}
+
+static int cmd_packet_monitor(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: packet_monitor <channel>");
+        return 1;
+    }
+
+    if (packet_monitor_active || packet_monitor_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Packet monitor already active. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    char *endptr = NULL;
+    long channel = strtol(argv[1], &endptr, 10);
+    if (argv[1][0] == '\0' || (endptr != NULL && *endptr != '\0')) {
+        MY_LOG_INFO(TAG, "Invalid channel argument. Usage: packet_monitor <channel>");
+        return 1;
+    }
+
+    if (channel < 1 || channel > 165) {
+        MY_LOG_INFO(TAG, "Channel must be between 1 and 165.");
+        return 1;
+    }
+
+    if (sniffer_active || sniffer_scan_phase || sniffer_dog_active) {
+        MY_LOG_INFO(TAG, "Sniffer is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    if (applicationState != IDLE) {
+        MY_LOG_INFO(TAG, "Another attack is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    if (wardrive_active) {
+        MY_LOG_INFO(TAG, "Wardrive is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Portal is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    esp_err_t err;
+    uint8_t primary = 1;
+    wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+    err = esp_wifi_get_channel(&primary, &secondary);
+    if (err == ESP_OK) {
+        packet_monitor_prev_primary = primary;
+        packet_monitor_prev_secondary = secondary;
+        packet_monitor_has_prev_channel = true;
+    } else {
+        packet_monitor_has_prev_channel = false;
+    }
+
+    wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
+                       WIFI_PROMIS_FILTER_MASK_DATA |
+                       WIFI_PROMIS_FILTER_MASK_CTRL
+    };
+
+    esp_wifi_set_promiscuous(false);
+
+    err = esp_wifi_set_promiscuous_filter(&filter);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set promiscuous filter: %s", esp_err_to_name(err));
+        packet_monitor_shutdown();
+        return 1;
+    }
+
+    err = esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set channel %ld: %s", channel, esp_err_to_name(err));
+        packet_monitor_shutdown();
+        return 1;
+    }
+
+    err = esp_wifi_set_promiscuous_rx_cb(packet_monitor_promiscuous_callback);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set promiscuous callback: %s", esp_err_to_name(err));
+        packet_monitor_shutdown();
+        return 1;
+    }
+    packet_monitor_callback_installed = true;
+
+    packet_monitor_total = 0;
+    packet_monitor_active = true;
+
+    err = esp_wifi_set_promiscuous(true);
+    if (err != ESP_OK) {
+        packet_monitor_active = false;
+        MY_LOG_INFO(TAG, "Failed to enable promiscuous mode: %s", esp_err_to_name(err));
+        packet_monitor_shutdown();
+        return 1;
+    }
+    packet_monitor_promiscuous_owned = true;
+
+    BaseType_t task_ok = xTaskCreate(
+        packet_monitor_task,
+        "packet_monitor",
+        2048,
+        NULL,
+        5,
+        &packet_monitor_task_handle
+    );
+
+    if (task_ok != pdPASS) {
+        packet_monitor_active = false;
+        packet_monitor_task_handle = NULL;
+        MY_LOG_INFO(TAG, "Failed to create packet monitor task.");
+        packet_monitor_shutdown();
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "Packet monitor started on channel %ld. Type 'stop' to stop.", channel);
     return 0;
 }
 
@@ -3691,6 +3904,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_cmd));
 
+    const esp_console_cmd_t packet_monitor_cmd = {
+        .command = "packet_monitor",
+        .help = "Monitor packets per second on a channel: packet_monitor <channel>",
+        .hint = NULL,
+        .func = &cmd_packet_monitor,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&packet_monitor_cmd));
+
 
     const esp_console_cmd_t show_sniffer_cmd = {
         .command = "show_sniffer_results",
@@ -3930,6 +4152,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  list_sd");
     MY_LOG_INFO(TAG,"  select_html <index>");
     MY_LOG_INFO(TAG,"  start_sniffer");
+    MY_LOG_INFO(TAG,"  packet_monitor <channel>");
     MY_LOG_INFO(TAG,"  show_sniffer_results");
     MY_LOG_INFO(TAG,"  show_probes");
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
