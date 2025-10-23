@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.5.2"
+#define JANOS_VERSION "0.5.3"
 
 
 #define NEOPIXEL_GPIO      27
@@ -2461,12 +2461,28 @@ static int cmd_list_probes(int argc, char **argv) {
         return 0;
     }
     
-    // Display each probe request with index: INDEX SSID
+    int unique_count = 0;
+    
+    // Display each unique SSID only once
     for (int i = 0; i < probe_request_count; i++) {
         probe_request_t *probe = &probe_requests[i];
-        printf("%d %s\n", i + 1, probe->ssid);
         
-        vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to avoid overwhelming UART
+        // Check if this SSID has already been displayed by looking at previous entries
+        bool already_displayed = false;
+        for (int j = 0; j < i; j++) {
+            if (strcmp(probe->ssid, probe_requests[j].ssid) == 0) {
+                already_displayed = true;
+                break;
+            }
+        }
+        
+        // If not displayed yet, display it
+        if (!already_displayed) {
+            unique_count++;
+            printf("%d %s\n", unique_count, probe->ssid);
+            
+            vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to avoid overwhelming UART
+        }
     }
     
     return 0;
