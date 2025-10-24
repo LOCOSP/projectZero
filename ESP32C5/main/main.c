@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.5.3"
+#define JANOS_VERSION "0.5.4"
 
 
 #define NEOPIXEL_GPIO      27
@@ -650,7 +650,7 @@ static void wifi_event_handler(void *event_handler_arg,
                     }
                 }
             } else {
-                if (!periodic_rescan_in_progress) {
+                if (!(periodic_rescan_in_progress || wardrive_active)) {
                     MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
                 }
                 g_scan_count = 0;
@@ -2801,7 +2801,8 @@ static void wardrive_task(void *pvParameters) {
     // Wait for GPS fix before starting
     MY_LOG_INFO(TAG, "Waiting for GPS fix...");
     if (!wait_for_gps_fix(120)) {  // Wait up to 120 seconds for GPS fix
-        MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, continuing without GPS data");
+        MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, not continuing without GPS data - please ensure clear view of the sky and try again.");
+        operation_stop_requested = true;
     } else {
         MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f", 
                    current_gps.latitude, current_gps.longitude);
