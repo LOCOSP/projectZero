@@ -281,6 +281,7 @@ static wifi_ap_record_t g_scan_results[MAX_AP_CNT];
 static uint16_t g_scan_count = 0;
 static volatile bool g_scan_in_progress = false;
 static volatile bool g_scan_done = false;
+static volatile uint32_t g_last_scan_status = 1; // 0 => success, non-zero => failure/unknown
 
 static int g_selected_indices[MAX_AP_CNT];
 static int g_selected_count = 0;
@@ -637,6 +638,7 @@ static void wifi_event_handler(void *event_handler_arg,
                 MY_LOG_INFO(TAG, "WiFi scan completed. Found %u networks, status: %" PRIu32, e->number, e->status);
             }
             
+            g_last_scan_status = e->status;
             if (e->status == 0) { // Success
                 g_scan_count = MAX_AP_CNT;
                 esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results);
@@ -2842,40 +2844,49 @@ static void wardrive_task(void *pvParameters) {
             .channel = 0,
             .show_hidden = true,
             .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-            .scan_time.active.min = 100,
-            .scan_time.active.max = 300,
+            .scan_time.active.min = 120,
+            .scan_time.active.max = 700,
         };
         
-        // Start non-blocking scan
-        esp_wifi_scan_start(&scan_cfg, false);
-        
-        // Wait for scan to complete with stop check
-        bool scan_done = false;
-        int timeout_ms = 10000; // 10 second timeout
-        int elapsed_ms = 0;
-        
-        while (!scan_done && elapsed_ms < timeout_ms && !operation_stop_requested) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            elapsed_ms += 100;
-            
-            // Check if scan is done by trying to get results
-            uint16_t temp_count = 0;
-            esp_err_t result = esp_wifi_scan_get_ap_num(&temp_count);
-            if (result == ESP_OK) {
-                scan_done = true;
-            }
+        // Perform blocking scan to ensure results are ready before logging
+        if (operation_stop_requested) {
+            break;
+        }
+        esp_err_t scan_err = esp_wifi_scan_start(&scan_cfg, true);
+        if (scan_err != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
         }
         
-        if (!scan_done || operation_stop_requested) {
-            esp_wifi_scan_stop();
-            if (operation_stop_requested) {
-                break; // Exit wardrive loop
+        // If driver reported failure or no results, try a blocking fallback scan
+        uint16_t scan_count = 0;
+        esp_wifi_scan_get_ap_num(&scan_count);
+        if ((scan_count == 0) || (g_last_scan_status != 0)) {
+            wifi_scan_config_t fb_cfg = scan_cfg;
+            fb_cfg.scan_time.active.min = 120;
+            fb_cfg.scan_time.active.max = 700;
+            esp_err_t fb = esp_wifi_scan_start(&fb_cfg, true); // blocking
+            if (fb != ESP_OK) {
+                continue;
             }
-            continue; // Skip this scan iteration
+            scan_count = MAX_AP_CNT;
+            esp_wifi_scan_get_ap_records(&scan_count, wardrive_scan_results);
+        } else {
+            scan_count = MAX_AP_CNT;
+            esp_wifi_scan_get_ap_records(&scan_count, wardrive_scan_results);
         }
-        
-        uint16_t scan_count = MAX_AP_CNT;
-        esp_wifi_scan_get_ap_records(&scan_count, wardrive_scan_results);
+
+        // If still no records, fall back to the buffer populated by the event handler
+        if (scan_count == 0 && g_scan_count > 0) {
+            if (g_scan_count > MAX_AP_CNT) {
+                scan_count = MAX_AP_CNT;
+            } else {
+                scan_count = g_scan_count;
+            }
+            memcpy(wardrive_scan_results, g_scan_results, scan_count * sizeof(wifi_ap_record_t));
+        }
+
+        MY_LOG_INFO(TAG, "Wardrive: scan_count=%u (status=%" PRIu32 ")", scan_count, g_last_scan_status);
         
         // Create filename (keep it simple for FAT filesystem)
         char filename[64];
