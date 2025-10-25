@@ -36,7 +36,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.12"
+#define LAB_C5_VERSION_TEXT "0.13"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -191,6 +191,7 @@ typedef struct {
     size_t serial_scroll;
     bool serial_follow_tail;
     bool serial_targets_hint;
+    bool blackout_view_active;
     bool last_command_sent;
     bool confirm_blackout_yes;
     bool confirm_sniffer_dos_yes;
@@ -1656,7 +1657,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
     }
     app->serial_buffer[app->serial_len] = '\0';
 
-    if(!app->serial_targets_hint) {
+    if(!app->serial_targets_hint && !app->blackout_view_active) {
         static const char hint_phrase[] = "Scan results printed.";
         size_t phrase_len = strlen(hint_phrase);
         if(app->serial_len >= phrase_len) {
@@ -1696,6 +1697,9 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     if(!app || !command || command[0] == '\0') return;
 
     app->serial_targets_hint = false;
+    if(strcmp(command, "start_blackout") != 0) {
+        app->blackout_view_active = false;
+    }
 
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "%s\n", command);
@@ -1800,6 +1804,7 @@ static void simple_app_send_stop_if_needed(SimpleApp* app) {
     if(!app || !app->last_command_sent) return;
     simple_app_send_command(app, "stop", false);
     app->last_command_sent = false;
+    app->blackout_view_active = false;
 }
 
 static void simple_app_request_scan_results(SimpleApp* app, const char* command) {
@@ -2007,6 +2012,8 @@ static void simple_app_handle_confirm_blackout_input(SimpleApp* app, InputKey ke
     if(key == InputKeyOk) {
         if(app->confirm_blackout_yes) {
             app->confirm_blackout_yes = false;
+            app->blackout_view_active = true;
+            app->serial_targets_hint = false;
             simple_app_send_command(app, "start_blackout", true);
         } else {
             simple_app_focus_attacks_menu(app);
@@ -3209,7 +3216,7 @@ static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
         }
     }
 
-    if(app->serial_targets_hint) {
+    if(app->serial_targets_hint && !app->blackout_view_active) {
         canvas_draw_str(canvas, DISPLAY_WIDTH - 14, 62, "->");
     }
 }
@@ -5125,10 +5132,20 @@ static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) 
 }
 
 static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(app->blackout_view_active && key != InputKeyBack && key != InputKeyUp && key != InputKeyDown) {
+        return;
+    }
+
     if(key == InputKeyBack) {
         simple_app_send_stop_if_needed(app);
         app->serial_targets_hint = false;
-        app->screen = ScreenMenu;
+        if(app->blackout_view_active) {
+            app->blackout_view_active = false;
+            simple_app_focus_attacks_menu(app);
+        } else {
+            app->screen = ScreenMenu;
+        }
         app->serial_follow_tail = true;
         simple_app_update_scroll(app);
         view_port_update(app->viewport);
