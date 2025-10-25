@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.5.4"
+#define JANOS_VERSION "0.5.6"
 
 
 #define NEOPIXEL_GPIO      27
@@ -634,7 +634,7 @@ static void wifi_event_handler(void *event_handler_arg,
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *e = (const wifi_event_sta_scan_done_t *)event_data;
             
-            if (!periodic_rescan_in_progress) {
+            if (!periodic_rescan_in_progress && !wardrive_active) {
                 MY_LOG_INFO(TAG, "WiFi scan completed. Found %u networks, status: %" PRIu32, e->number, e->status);
             }
             
@@ -643,7 +643,7 @@ static void wifi_event_handler(void *event_handler_arg,
                 g_scan_count = MAX_AP_CNT;
                 esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results);
                 
-                if (!periodic_rescan_in_progress) {
+                if (!periodic_rescan_in_progress && !wardrive_active) {
                     MY_LOG_INFO(TAG, "Retrieved %u network records", g_scan_count);
                     
                     // Automatically display scan results after completion
@@ -697,7 +697,7 @@ static void wifi_event_handler(void *event_handler_arg,
                 }
                 
                 MY_LOG_INFO(TAG, "Sniffer: Scan complete, now monitoring client traffic with dual-band channel hopping (2.4GHz + 5GHz)...");
-            } else {
+            } else if (!wardrive_active) {
                 // Clear LED when normal scan is complete (ignore errors if LED is in invalid state)
                 esp_err_t led_err = led_strip_clear(strip);
                 if (led_err == ESP_OK) {
@@ -872,6 +872,11 @@ static esp_err_t wifi_init_ap_sta(void) {
 
 // --- Start background scan ---
 static esp_err_t start_background_scan(void) {
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start background scan: wardrive is active. Use 'stop' first.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (g_scan_in_progress) {
         MY_LOG_INFO(TAG, "Scan already in progress");
         return ESP_ERR_INVALID_STATE;
@@ -1166,6 +1171,11 @@ static void print_scan_results(void) {
 static int cmd_scan_networks(int argc, char **argv) {
     (void)argc; (void)argv;
     
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Wardrive is active. Use 'stop' to stop it first before scanning.");
+        return 1;
+    }
+
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
     
