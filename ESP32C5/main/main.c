@@ -19,6 +19,7 @@
 #include "esp_err.h"
 
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -310,6 +311,10 @@ static bool led_initialized = false;
 static bool led_user_enabled = true;
 static uint8_t led_brightness_percent = LED_BRIGHTNESS_DEFAULT;
 
+#define LED_NVS_NAMESPACE "ledcfg"
+#define LED_NVS_KEY_ENABLED "enabled"
+#define LED_NVS_KEY_LEVEL   "level"
+
 static uint8_t led_scale_component(uint8_t value) {
     if (value == 0) {
         return 0;
@@ -390,10 +395,69 @@ static esp_err_t led_set_brightness(uint8_t percent) {
     return led_apply_current();
 }
 
+static void led_persist_state(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(LED_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "LED config save open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    esp_err_t write_err = nvs_set_u8(handle, LED_NVS_KEY_ENABLED, led_user_enabled ? 1U : 0U);
+    if (write_err == ESP_OK) {
+        write_err = nvs_set_u8(handle, LED_NVS_KEY_LEVEL, led_brightness_percent);
+    }
+    if (write_err == ESP_OK) {
+        write_err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+
+    if (write_err != ESP_OK) {
+        ESP_LOGW(TAG, "LED config save failed: %s", esp_err_to_name(write_err));
+    }
+}
+
+static void led_load_state_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(LED_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "LED config load open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t enabled_value = 0;
+    err = nvs_get_u8(handle, LED_NVS_KEY_ENABLED, &enabled_value);
+    if (err == ESP_OK) {
+        led_user_enabled = enabled_value != 0;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "LED enabled read failed: %s", esp_err_to_name(err));
+    }
+
+    uint8_t level_value = 0;
+    err = nvs_get_u8(handle, LED_NVS_KEY_LEVEL, &level_value);
+    if (err == ESP_OK) {
+        if (level_value >= LED_BRIGHTNESS_MIN && level_value <= LED_BRIGHTNESS_MAX) {
+            led_brightness_percent = level_value;
+        } else {
+            ESP_LOGW(TAG, "LED brightness %u out of range, keeping %u", level_value, led_brightness_percent);
+        }
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "LED brightness read failed: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
+}
+
 static void led_boot_sequence(void) {
     led_user_enabled = true;
     led_brightness_percent = LED_BRIGHTNESS_DEFAULT;
     led_current_color = (led_color_t){0, 0, 0};
+
+    led_load_state_from_nvs();
 
     if (!led_initialized) {
         return;
@@ -403,7 +467,6 @@ static void led_boot_sequence(void) {
     vTaskDelay(pdMS_TO_TICKS(50));
     (void)led_set_idle();
     vTaskDelay(pdMS_TO_TICKS(100));
-    (void)led_set_brightness(LED_BRIGHTNESS_DEFAULT);
 }
 
 // SD card HTML file management
@@ -2726,7 +2789,7 @@ static int cmd_reboot(int argc, char **argv)
 
 static int cmd_led(int argc, char **argv) {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100>");
+        MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100> | led read");
         return 1;
     }
 
@@ -2742,6 +2805,7 @@ static int cmd_led(int argc, char **argv) {
                 ESP_LOGW(TAG, "Failed to enable LED: %s", esp_err_to_name(err));
                 return 1;
             }
+            led_persist_state();
             MY_LOG_INFO(TAG, "LED turned on (brightness %u%%)", led_brightness_percent);
             return 0;
         } else if (strcasecmp(argv[2], "off") == 0) {
@@ -2750,6 +2814,7 @@ static int cmd_led(int argc, char **argv) {
                 ESP_LOGW(TAG, "Failed to disable LED: %s", esp_err_to_name(err));
                 return 1;
             }
+            led_persist_state();
             MY_LOG_INFO(TAG, "LED turned off (previous brightness %u%% stored)", led_brightness_percent);
             return 0;
         }
@@ -2775,6 +2840,7 @@ static int cmd_led(int argc, char **argv) {
             ESP_LOGW(TAG, "Failed to set LED brightness: %s", esp_err_to_name(err));
             return 1;
         }
+        led_persist_state();
 
         if (led_is_enabled()) {
             MY_LOG_INFO(TAG, "LED brightness set to %d%%", level);
@@ -2784,7 +2850,12 @@ static int cmd_led(int argc, char **argv) {
         return 0;
     }
 
-    MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100>");
+    if (strcasecmp(argv[1], "read") == 0) {
+        MY_LOG_INFO(TAG, "LED status: %s, brightness %u%%", led_is_enabled() ? "on" : "off", led_brightness_percent);
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100> | led read");
     return 1;
 }
 
@@ -4300,7 +4371,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t led_cmd = {
         .command = "led",
-        .help = "Controls status LED: led set <on|off>, led level <1-100>",
+        .help = "Controls status LED: led set <on|off> | led level <1-100> | led read",
         .hint = NULL,
         .func = &cmd_led,
         .argtable = NULL
@@ -4392,13 +4463,13 @@ void app_main(void) {
     // 3. strip instance
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip));
 
+    ESP_ERROR_CHECK(nvs_flash_init());
+
     led_initialized = true;
     led_boot_sequence();
-    MY_LOG_INFO(TAG, "Status LED ready (idle brightness %u%%)", led_brightness_percent);
+    MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
 
 
-
-    ESP_ERROR_CHECK(nvs_flash_init());
 
     ESP_ERROR_CHECK(wifi_init_ap_sta()); 
 
@@ -4437,7 +4508,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  show_probes");
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
     MY_LOG_INFO(TAG,"  start_sniffer_dog");
-    MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100>");
+    MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
     MY_LOG_INFO(TAG,"  stop");
     MY_LOG_INFO(TAG,"  reboot");
 
