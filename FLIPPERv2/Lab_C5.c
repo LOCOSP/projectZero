@@ -272,6 +272,9 @@ typedef struct {
     bool led_enabled;
     uint8_t led_level;
     size_t led_setup_index;
+    bool led_read_pending;
+    char led_read_buffer[64];
+    size_t led_read_length;
     size_t scanner_view_offset;
     uint8_t result_line_height;
     uint8_t result_char_limit;
@@ -312,8 +315,12 @@ static void simple_app_toggle_backlight(SimpleApp* app);
 static void simple_app_update_led_label(SimpleApp* app);
 static void simple_app_send_led_power_command(SimpleApp* app);
 static void simple_app_send_led_level_command(SimpleApp* app);
-static void simple_app_apply_led_settings(SimpleApp* app);
+static void simple_app_send_command_quiet(SimpleApp* app, const char* command);
+static void simple_app_request_led_status(SimpleApp* app);
+static bool simple_app_handle_led_status_line(SimpleApp* app, const char* line);
+static void simple_app_led_feed(SimpleApp* app, char ch);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
+static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length);
 static void simple_app_update_otg_label(SimpleApp* app);
 static void simple_app_apply_otg_power(SimpleApp* app);
 static void simple_app_toggle_otg_power(SimpleApp* app);
@@ -809,7 +816,7 @@ static void simple_app_send_led_power_command(SimpleApp* app) {
     const char* state = app->led_enabled ? "on" : "off";
     char command[24];
     snprintf(command, sizeof(command), "led set %s", state);
-    simple_app_send_command(app, command, false);
+    simple_app_send_command_quiet(app, command);
 }
 
 static void simple_app_send_led_level_command(SimpleApp* app) {
@@ -819,14 +826,114 @@ static void simple_app_send_led_level_command(SimpleApp* app) {
     if(level > 100) level = 100;
     char command[24];
     snprintf(command, sizeof(command), "led level %lu", (unsigned long)level);
-    simple_app_send_command(app, command, false);
+    simple_app_send_command_quiet(app, command);
 }
 
-static void simple_app_apply_led_settings(SimpleApp* app) {
+static void simple_app_send_command_quiet(SimpleApp* app, const char* command) {
+    if(!app || !command || !app->serial) return;
+    char cmd[64];
+    int len = snprintf(cmd, sizeof(cmd), "%s\n", command);
+    if(len <= 0) return;
+    if(app->rx_stream) {
+        furi_stream_buffer_reset(app->rx_stream);
+    }
+    furi_hal_serial_tx(app->serial, (const uint8_t*)cmd, (size_t)len);
+    furi_hal_serial_tx_wait_complete(app->serial);
+    char log_line[96];
+    int log_len = snprintf(log_line, sizeof(log_line), "TX: %s\n", command);
+    if(log_len > 0) {
+        simple_app_append_serial_data(app, (const uint8_t*)log_line, (size_t)log_len);
+    }
+}
+
+static void simple_app_request_led_status(SimpleApp* app) {
     if(!app || !app->serial) return;
+    app->led_read_pending = true;
+    app->led_read_length = 0;
+    app->led_read_buffer[0] = '\0';
+    simple_app_send_command_quiet(app, "led read");
+}
+
+static bool simple_app_handle_led_status_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return false;
+    const char* status_marker = "LED status:";
+    const char* status_ptr = strstr(line, status_marker);
+    if(!status_ptr) return false;
+    status_ptr += strlen(status_marker);
+    while(*status_ptr == ' ' || *status_ptr == '\t') {
+        status_ptr++;
+    }
+    bool enabled = app->led_enabled;
+    if(status_ptr[0] != '\0') {
+        if((status_ptr[0] == 'o' || status_ptr[0] == 'O') &&
+           (status_ptr[1] == 'n' || status_ptr[1] == 'N')) {
+            enabled = true;
+        } else if((status_ptr[0] == 'o' || status_ptr[0] == 'O') &&
+                  (status_ptr[1] == 'f' || status_ptr[1] == 'F')) {
+            enabled = false;
+        }
+    }
+
+    uint32_t level = app->led_level;
+    const char* brightness_marker = "brightness";
+    const char* brightness_ptr = strstr(line, brightness_marker);
+    if(brightness_ptr) {
+        brightness_ptr += strlen(brightness_marker);
+        while(*brightness_ptr == ' ' || *brightness_ptr == ':' || *brightness_ptr == ',' ||
+              *brightness_ptr == '\t') {
+            brightness_ptr++;
+        }
+        char digits[6] = {0};
+        size_t idx = 0;
+        while(brightness_ptr[idx] && idx < sizeof(digits) - 1) {
+            if(isdigit((unsigned char)brightness_ptr[idx])) {
+                digits[idx] = brightness_ptr[idx];
+            } else {
+                break;
+            }
+            idx++;
+        }
+        if(idx > 0) {
+            digits[idx] = '\0';
+            long parsed = strtol(digits, NULL, 10);
+            if(parsed >= 0) {
+                level = (uint32_t)parsed;
+            }
+        }
+    }
+
+    if(level < 1) level = 1;
+    if(level > 100) level = 100;
+
+    app->led_enabled = enabled;
+    app->led_level = (uint8_t)level;
     simple_app_update_led_label(app);
-    simple_app_send_led_power_command(app);
-    simple_app_send_led_level_command(app);
+
+    if(app->screen == ScreenMenu && app->menu_state == MenuStateItems &&
+       app->section_index == MENU_SECTION_SETUP && app->viewport) {
+        view_port_update(app->viewport);
+    } else if(app->screen == ScreenSetupLed && app->viewport) {
+        view_port_update(app->viewport);
+    }
+    return true;
+}
+
+static void simple_app_led_feed(SimpleApp* app, char ch) {
+    if(!app || !app->led_read_pending) return;
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        app->led_read_buffer[app->led_read_length] = '\0';
+        if(simple_app_handle_led_status_line(app, app->led_read_buffer)) {
+            app->led_read_pending = false;
+        }
+        app->led_read_length = 0;
+        return;
+    }
+    if(app->led_read_length + 1 >= sizeof(app->led_read_buffer)) {
+        app->led_read_length = 0;
+        return;
+    }
+    app->led_read_buffer[app->led_read_length++] = ch;
 }
 
 static void simple_app_update_otg_label(SimpleApp* app) {
@@ -1248,9 +1355,7 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             "min_power=%d\n"
             "backlight_enabled=%d\n"
             "otg_power_enabled=%d\n"
-            "karma_duration=%lu\n"
-            "led_enabled=%d\n"
-            "led_level=%u\n",
+            "karma_duration=%lu\n",
             app->scanner_show_ssid ? 1 : 0,
             app->scanner_show_bssid ? 1 : 0,
             app->scanner_show_channel ? 1 : 0,
@@ -1260,9 +1365,7 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             (int)app->scanner_min_power,
             app->backlight_enabled ? 1 : 0,
             app->otg_power_enabled ? 1 : 0,
-            (unsigned long)app->karma_sniffer_duration_sec,
-            app->led_enabled ? 1 : 0,
-            (unsigned)app->led_level);
+            (unsigned long)app->karma_sniffer_duration_sec);
         if(len > 0 && len < (int)sizeof(buffer)) {
             size_t written = storage_file_write(file, buffer, (size_t)len);
             if(written == (size_t)len) {
@@ -1754,6 +1857,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_evil_twin_feed(app, ch);
         simple_app_karma_probe_feed(app, ch);
         simple_app_karma_html_feed(app, ch);
+        simple_app_led_feed(app, ch);
     }
 
     if(trimmed_any && !app->serial_follow_tail) {
@@ -3621,45 +3725,67 @@ static void simple_app_draw(Canvas* canvas, void* context) {
 static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
     if(key == InputKeyUp) {
         if(app->menu_state == MenuStateSections) {
+            size_t section_count = menu_section_count;
+            if(section_count == 0) return;
             if(app->section_index > 0) {
                 app->section_index--;
-                view_port_update(app->viewport);
+            } else {
+                app->section_index = section_count - 1;
             }
+            view_port_update(app->viewport);
         } else {
             const MenuSection* section = &menu_sections[app->section_index];
-            if(section->entry_count == 0) return;
+            size_t entry_count = section->entry_count;
+            if(entry_count == 0) return;
             if(app->item_index > 0) {
                 app->item_index--;
-                if(app->section_index == MENU_SECTION_ATTACKS) {
-                    app->last_attack_index = app->item_index;
-                }
                 if(app->item_index < app->item_offset) {
                     app->item_offset = app->item_index;
                 }
-                view_port_update(app->viewport);
+            } else {
+                app->item_index = entry_count - 1;
+                size_t visible_count = simple_app_menu_visible_count(app, app->section_index);
+                if(visible_count == 0) visible_count = 1;
+                if(app->item_index >= visible_count) {
+                    app->item_offset = app->item_index - visible_count + 1;
+                } else {
+                    app->item_offset = 0;
+                }
             }
+            if(app->section_index == MENU_SECTION_ATTACKS) {
+                app->last_attack_index = app->item_index;
+            }
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyDown) {
         if(app->menu_state == MenuStateSections) {
-            if(app->section_index + 1 < menu_section_count) {
+            size_t section_count = menu_section_count;
+            if(section_count == 0) return;
+            if(app->section_index + 1 < section_count) {
                 app->section_index++;
-                view_port_update(app->viewport);
+            } else {
+                app->section_index = 0;
             }
+            view_port_update(app->viewport);
         } else {
             const MenuSection* section = &menu_sections[app->section_index];
-            if(section->entry_count == 0) return;
-            if(app->item_index + 1 < section->entry_count) {
+            size_t entry_count = section->entry_count;
+            if(entry_count == 0) return;
+            if(app->item_index + 1 < entry_count) {
                 app->item_index++;
-                if(app->section_index == MENU_SECTION_ATTACKS) {
-                    app->last_attack_index = app->item_index;
-                }
                 size_t visible_count = simple_app_menu_visible_count(app, app->section_index);
                 if(visible_count == 0) visible_count = 1;
                 if(app->item_index >= app->item_offset + visible_count) {
                     app->item_offset = app->item_index - visible_count + 1;
                 }
-                view_port_update(app->viewport);
+            } else {
+                app->item_index = 0;
+                app->item_offset = 0;
             }
+            if(app->section_index == MENU_SECTION_ATTACKS) {
+                app->last_attack_index = app->item_index;
+            }
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyOk) {
         if(app->menu_state == MenuStateSections) {
@@ -3687,6 +3813,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
                 if(app->item_offset > max_offset) {
                     app->item_offset = max_offset;
                 }
+            }
+            if(app->section_index == MENU_SECTION_SETUP) {
+                simple_app_request_led_status(app);
             }
             view_port_update(app->viewport);
             return;
@@ -3732,6 +3861,7 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         } else if(entry->action == MenuActionOpenLedSetup) {
             app->screen = ScreenSetupLed;
             app->led_setup_index = 0;
+            simple_app_request_led_status(app);
         } else if(entry->action == MenuActionOpenScannerSetup) {
             app->screen = ScreenSetupScanner;
             app->scanner_setup_index = 0;
@@ -5286,7 +5416,6 @@ static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
             return;
         }
         if(previous != app->led_enabled) {
-            simple_app_mark_config_dirty(app);
             simple_app_update_led_label(app);
             simple_app_send_led_power_command(app);
             if(app->viewport) {
@@ -5312,7 +5441,6 @@ static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
             return;
         }
         if(before != app->led_level) {
-            simple_app_mark_config_dirty(app);
             simple_app_update_led_label(app);
             simple_app_send_led_level_command(app);
             if(app->viewport) {
@@ -5654,7 +5782,7 @@ int32_t Lab_C5_app(void* p) {
     simple_app_reset_serial_log(app, "READY");
 
     furi_hal_serial_async_rx_start(app->serial, simple_app_serial_irq, app, false);
-    simple_app_apply_led_settings(app);
+    simple_app_request_led_status(app);
 
     app->gui = furi_record_open(RECORD_GUI);
     app->viewport = view_port_alloc();
