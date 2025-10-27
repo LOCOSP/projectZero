@@ -19,6 +19,7 @@
 #include "esp_err.h"
 
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -56,7 +57,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.5.6"
+#define JANOS_VERSION "0.5.7"
 
 
 #define NEOPIXEL_GPIO      27
@@ -293,6 +294,181 @@ int connectAttemptCount = 0;
 led_strip_handle_t strip;
 static bool last_password_wrong = false;
 
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} led_color_t;
+
+#define LED_BRIGHTNESS_MIN        1U
+#define LED_BRIGHTNESS_MAX        100U
+#define LED_BRIGHTNESS_DEFAULT    5U
+
+static const led_color_t LED_COLOR_IDLE = {0, 255, 0};
+
+static led_color_t led_current_color = {0, 0, 0};
+static bool led_initialized = false;
+static bool led_user_enabled = true;
+static uint8_t led_brightness_percent = LED_BRIGHTNESS_DEFAULT;
+
+#define LED_NVS_NAMESPACE "ledcfg"
+#define LED_NVS_KEY_ENABLED "enabled"
+#define LED_NVS_KEY_LEVEL   "level"
+
+static uint8_t led_scale_component(uint8_t value) {
+    if (value == 0) {
+        return 0;
+    }
+    uint32_t scaled = (uint32_t)value * led_brightness_percent + 99U;
+    scaled /= 100U;
+    if (scaled > 255U) {
+        scaled = 255U;
+    }
+    return (uint8_t)scaled;
+}
+
+static esp_err_t led_commit_color(uint8_t r, uint8_t g, uint8_t b) {
+    if (!led_initialized || strip == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err;
+    if (!led_user_enabled || (r == 0 && g == 0 && b == 0)) {
+        err = led_strip_clear(strip);
+    } else {
+        err = led_strip_set_pixel(strip, 0, led_scale_component(r), led_scale_component(g), led_scale_component(b));
+    }
+
+    if (err == ESP_OK) {
+        err = led_strip_refresh(strip);
+    }
+    return err;
+}
+
+static esp_err_t led_apply_current(void) {
+    return led_commit_color(led_current_color.r, led_current_color.g, led_current_color.b);
+}
+
+static esp_err_t led_set_color(uint8_t r, uint8_t g, uint8_t b) {
+    led_current_color = (led_color_t){r, g, b};
+    return led_commit_color(r, g, b);
+}
+
+static esp_err_t led_clear(void) {
+    led_current_color = (led_color_t){0, 0, 0};
+    return led_commit_color(0, 0, 0);
+}
+
+static esp_err_t led_set_idle(void) {
+    return led_set_color(LED_COLOR_IDLE.r, LED_COLOR_IDLE.g, LED_COLOR_IDLE.b);
+}
+
+static esp_err_t led_set_enabled(bool enabled) {
+    led_user_enabled = enabled;
+    if (!led_initialized) {
+        return ESP_OK;
+    }
+    return led_apply_current();
+}
+
+static bool led_is_enabled(void) {
+    return led_user_enabled;
+}
+
+static esp_err_t led_set_brightness(uint8_t percent) {
+    if (percent < LED_BRIGHTNESS_MIN) {
+        percent = LED_BRIGHTNESS_MIN;
+    } else if (percent > LED_BRIGHTNESS_MAX) {
+        percent = LED_BRIGHTNESS_MAX;
+    }
+
+    led_brightness_percent = percent;
+
+    if (!led_initialized) {
+        return ESP_OK;
+    }
+
+    if (!led_user_enabled) {
+        return led_commit_color(0, 0, 0);
+    }
+
+    return led_apply_current();
+}
+
+static void led_persist_state(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(LED_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "LED config save open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    esp_err_t write_err = nvs_set_u8(handle, LED_NVS_KEY_ENABLED, led_user_enabled ? 1U : 0U);
+    if (write_err == ESP_OK) {
+        write_err = nvs_set_u8(handle, LED_NVS_KEY_LEVEL, led_brightness_percent);
+    }
+    if (write_err == ESP_OK) {
+        write_err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+
+    if (write_err != ESP_OK) {
+        ESP_LOGW(TAG, "LED config save failed: %s", esp_err_to_name(write_err));
+    }
+}
+
+static void led_load_state_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(LED_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "LED config load open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t enabled_value = 0;
+    err = nvs_get_u8(handle, LED_NVS_KEY_ENABLED, &enabled_value);
+    if (err == ESP_OK) {
+        led_user_enabled = enabled_value != 0;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "LED enabled read failed: %s", esp_err_to_name(err));
+    }
+
+    uint8_t level_value = 0;
+    err = nvs_get_u8(handle, LED_NVS_KEY_LEVEL, &level_value);
+    if (err == ESP_OK) {
+        if (level_value >= LED_BRIGHTNESS_MIN && level_value <= LED_BRIGHTNESS_MAX) {
+            led_brightness_percent = level_value;
+        } else {
+            ESP_LOGW(TAG, "LED brightness %u out of range, keeping %u", level_value, led_brightness_percent);
+        }
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "LED brightness read failed: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
+}
+
+static void led_boot_sequence(void) {
+    led_user_enabled = true;
+    led_brightness_percent = LED_BRIGHTNESS_DEFAULT;
+    led_current_color = (led_color_t){0, 0, 0};
+
+    led_load_state_from_nvs();
+
+    if (!led_initialized) {
+        return;
+    }
+
+    (void)led_commit_color(0, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    (void)led_set_idle();
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
+
 // SD card HTML file management
 #define MAX_HTML_FILES 50
 #define MAX_HTML_FILENAME 64
@@ -329,6 +505,7 @@ static int cmd_list_sd(int argc, char **argv);
 static int cmd_select_html(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
+static int cmd_led(int argc, char **argv);
 static esp_err_t start_background_scan(void);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
@@ -691,17 +868,17 @@ static void wifi_event_handler(void *event_handler_arg,
                 }
                 
                 // Change LED to green for active sniffing
-                esp_err_t led_err = led_strip_set_pixel(strip, 0, 0, 255, 0); // Green
-                if (led_err == ESP_OK) {
-                    led_strip_refresh(strip);
+                esp_err_t led_err = led_set_color(0, 255, 0); // Green
+                if (led_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to set sniffer LED: %s", esp_err_to_name(led_err));
                 }
                 
                 MY_LOG_INFO(TAG, "Sniffer: Scan complete, now monitoring client traffic with dual-band channel hopping (2.4GHz + 5GHz)...");
             } else if (!wardrive_active) {
-                // Clear LED when normal scan is complete (ignore errors if LED is in invalid state)
-                esp_err_t led_err = led_strip_clear(strip);
-                if (led_err == ESP_OK) {
-                    led_strip_refresh(strip);
+                // Return LED to idle when normal scan is complete
+                esp_err_t led_err = led_set_idle();
+                if (led_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to restore idle LED after scan: %s", esp_err_to_name(led_err));
                 }
             }
             break;
@@ -724,9 +901,9 @@ static void wifi_event_handler(void *event_handler_arg,
                         MY_LOG_INFO(TAG, "Resuming deauth attack - password was incorrect.");
                         
                         // Set LED to red for deauth
-                        esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0);
-                        if (led_err == ESP_OK) {
-                            led_strip_refresh(strip);
+                        esp_err_t led_err = led_set_color(255, 0, 0);
+                        if (led_err != ESP_OK) {
+                            ESP_LOGW(TAG, "Failed to set LED for deauth resume: %s", esp_err_to_name(led_err));
                         }
                         
                         // Start deauth attack in background task
@@ -793,10 +970,10 @@ static void verify_password(const char* password) {
             MY_LOG_INFO(TAG, "Deauth attack task forcefully stopped.");
         }
         
-        // Clear LED
-        esp_err_t led_err = led_strip_clear(strip);
-        if (led_err == ESP_OK) {
-            led_strip_refresh(strip);
+        // Restore LED to idle
+        esp_err_t led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after stopping deauth: %s", esp_err_to_name(led_err));
         }
         
         MY_LOG_INFO(TAG, "Deauth attack stopped.");
@@ -1180,18 +1357,18 @@ static int cmd_scan_networks(int argc, char **argv) {
     operation_stop_requested = false;
     
     // Set LED (ignore errors if LED is in invalid state)
-    esp_err_t led_err = led_strip_set_pixel(strip, 0, 0, 255, 0);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_color(0, 255, 0);
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for scan: %s", esp_err_to_name(led_err));
     }
 
     esp_err_t err = start_background_scan();
     
     if (err != ESP_OK) {
-        // Clear LED (ignore errors if LED is in invalid state)
-        led_err = led_strip_clear(strip);
-        if (led_err == ESP_OK) {
-            led_strip_refresh(strip);
+        // Return LED to idle when scan failed
+        led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after scan failure: %s", esp_err_to_name(led_err));
         }
         
         if (err == ESP_ERR_INVALID_STATE) {
@@ -1292,9 +1469,9 @@ static void deauth_attack_task(void *pvParameters) {
             applicationState = IDLE;
             
             // Clean up after attack (ignore LED errors)
-            esp_err_t led_err = led_strip_clear(strip);
-            if (led_err == ESP_OK) {
-                led_strip_refresh(strip);
+            esp_err_t led_err = led_set_idle();
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to restore idle LED after deauth stop: %s", esp_err_to_name(led_err));
             }
             
             break;
@@ -1307,9 +1484,9 @@ static void deauth_attack_task(void *pvParameters) {
             periodic_rescan_in_progress = true;
             
             // Set LED to yellow during re-scan
-            esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 255, 0); // Yellow
-            if (led_err == ESP_OK) {
-                led_strip_refresh(strip);
+            esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to set LED for periodic scan: %s", esp_err_to_name(led_err));
             }
             
             // Temporarily pause deauth for scanning
@@ -1319,9 +1496,9 @@ static void deauth_attack_task(void *pvParameters) {
             }
             
             // Clear LED after re-scan (ignore errors if LED is in invalid state)
-            led_err = led_strip_clear(strip);
-            if (led_err == ESP_OK) {
-                led_strip_refresh(strip);
+            led_err = led_clear();
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to clear LED after periodic scan: %s", esp_err_to_name(led_err));
             }
             
             // Clear flag after re-scan completes
@@ -1330,11 +1507,9 @@ static void deauth_attack_task(void *pvParameters) {
         
         if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
             // Send deauth frames (silent mode - no UART spam)
-            ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 0, 255));
-            ESP_ERROR_CHECK(led_strip_refresh(strip));
+            ESP_ERROR_CHECK(led_set_color(0, 0, 255));
             wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
-            ESP_ERROR_CHECK(led_strip_clear(strip));
-            ESP_ERROR_CHECK(led_strip_refresh(strip));
+            ESP_ERROR_CHECK(led_clear());
         }
         
         // Delay and yield to allow UART console processing
@@ -1343,9 +1518,9 @@ static void deauth_attack_task(void *pvParameters) {
     }
     
     // Clean up LED after attack finishes naturally (ignore LED errors)
-    esp_err_t led_err = led_strip_clear(strip);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after deauth task: %s", esp_err_to_name(led_err));
     }
     
     deauth_attack_active = false;
@@ -1367,9 +1542,9 @@ static void blackout_attack_task(void *pvParameters) {
     MY_LOG_INFO(TAG, "Blackout attack task started.");
     
     // Set LED to orange for blackout attack
-    esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 165, 0); // Orange
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_color(255, 165, 0); // Orange
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for blackout attack start: %s", esp_err_to_name(led_err));
     }
     
     // Main loop: continuously scan and attack for 3 minutes each cycle
@@ -1438,18 +1613,18 @@ static void blackout_attack_task(void *pvParameters) {
         
         while (attack_cycles < MAX_ATTACK_CYCLES && blackout_attack_active && !operation_stop_requested) {
             // Flash LED during attack (orange)
-            esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 165, 0); // Orange
-            if (led_err == ESP_OK) {
-                led_strip_refresh(strip);
+            esp_err_t led_err = led_set_color(255, 165, 0); // Orange
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to set LED during blackout attack: %s", esp_err_to_name(led_err));
             }
             
             // Send deauth frames to all networks
             wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
             
             // Clear LED briefly
-            led_err = led_strip_clear(strip);
-            if (led_err == ESP_OK) {
-                led_strip_refresh(strip);
+            led_err = led_clear();
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to clear LED during blackout attack: %s", esp_err_to_name(led_err));
             }
             
             attack_cycles++;
@@ -1467,9 +1642,9 @@ static void blackout_attack_task(void *pvParameters) {
     }
     
     // Clean up LED after attack finishes
-    led_err = led_strip_clear(strip);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after blackout attack: %s", esp_err_to_name(led_err));
     }
     
     // Clean up
@@ -1509,9 +1684,9 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
         const wifi_ap_record_t *ap = &g_scan_results[idx];
         
         // Set LED
-        esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0);
-        if (led_err == ESP_OK) {
-            led_strip_refresh(strip);
+        esp_err_t led_err = led_set_color(255, 0, 0);
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set LED for SAE overflow: %s", esp_err_to_name(led_err));
         }
         
         MY_LOG_INFO(TAG,"WPA3 SAE Overflow Attack");
@@ -2112,12 +2287,10 @@ static int cmd_stop(int argc, char **argv) {
         }
     }
     
-    // Clear LED (ignore errors if LED is in invalid state)
-    esp_err_t led_err = led_strip_clear(strip);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
-    } else {
-        ESP_LOGW(TAG, "Failed to clear LED (state: %s), ignoring...", esp_err_to_name(led_err));
+    // Restore LED to idle (ignore errors if LED is in invalid state)
+    esp_err_t led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after stop (state: %s), ignoring...", esp_err_to_name(led_err));
     }
     
     MY_LOG_INFO(TAG, "All operations stopped.");
@@ -2315,6 +2488,11 @@ static int cmd_packet_monitor(int argc, char **argv) {
     }
 
     MY_LOG_INFO(TAG, "Packet monitor started on channel %ld. Type 'stop' to stop.", channel);
+
+    esp_err_t led_err = led_set_color(255, 255, 255); // White for packet monitor
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for packet monitor: %s", esp_err_to_name(led_err));
+    }
     return 0;
 }
 
@@ -2340,12 +2518,12 @@ static int cmd_start_sniffer(int argc, char **argv) {
     
     // Phase 1: Start network scan
     sniffer_active = true;
-    sniffer_scan_phase = true;
-    
-    // Set LED (ignore errors if LED is in invalid state)
-    esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 255, 0); // Yellow
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+   sniffer_scan_phase = true;
+   
+   // Set LED (ignore errors if LED is in invalid state)
+    esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
     }
     
     esp_err_t err = start_background_scan();
@@ -2353,10 +2531,10 @@ static int cmd_start_sniffer(int argc, char **argv) {
         sniffer_active = false;
         sniffer_scan_phase = false;
         
-        // Clear LED (ignore errors if LED is in invalid state)
-        led_err = led_strip_clear(strip);
-        if (led_err == ESP_OK) {
-            led_strip_refresh(strip);
+        // Return LED to idle (ignore errors if LED is in invalid state)
+        led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after sniffer failure: %s", esp_err_to_name(led_err));
         }
         
         MY_LOG_INFO(TAG, "Failed to start scan for sniffer: %s", esp_err_to_name(err));
@@ -2551,9 +2729,9 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
     sniffer_dog_active = true;
     
     // Set LED to red (aggressive mode)
-    esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0); // Red
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_color(255, 0, 0); // Red
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for Sniffer Dog: %s", esp_err_to_name(led_err));
     }
     
     // Set promiscuous filter
@@ -2584,10 +2762,10 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
         sniffer_dog_active = false;
         esp_wifi_set_promiscuous(false);
         
-        // Clear LED
-        led_err = led_strip_clear(strip);
-        if (led_err == ESP_OK) {
-            led_strip_refresh(strip);
+        // Return LED to idle
+        led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after Sniffer Dog failure: %s", esp_err_to_name(led_err));
         }
         
         return 1;
@@ -2607,6 +2785,78 @@ static int cmd_reboot(int argc, char **argv)
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
     return 0;
+}
+
+static int cmd_led(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100> | led read");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: led set <on|off>");
+            return 1;
+        }
+
+        if (strcasecmp(argv[2], "on") == 0) {
+            esp_err_t err = led_set_enabled(true);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to enable LED: %s", esp_err_to_name(err));
+                return 1;
+            }
+            led_persist_state();
+            MY_LOG_INFO(TAG, "LED turned on (brightness %u%%)", led_brightness_percent);
+            return 0;
+        } else if (strcasecmp(argv[2], "off") == 0) {
+            esp_err_t err = led_set_enabled(false);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to disable LED: %s", esp_err_to_name(err));
+                return 1;
+            }
+            led_persist_state();
+            MY_LOG_INFO(TAG, "LED turned off (previous brightness %u%% stored)", led_brightness_percent);
+            return 0;
+        }
+
+        MY_LOG_INFO(TAG, "Usage: led set <on|off>");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "level") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: led level <1-100>");
+            return 1;
+        }
+
+        int level = atoi(argv[2]);
+        if (level < (int)LED_BRIGHTNESS_MIN || level > (int)LED_BRIGHTNESS_MAX) {
+            MY_LOG_INFO(TAG, "Brightness must be between %u and %u", LED_BRIGHTNESS_MIN, LED_BRIGHTNESS_MAX);
+            return 1;
+        }
+
+        esp_err_t err = led_set_brightness((uint8_t)level);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set LED brightness: %s", esp_err_to_name(err));
+            return 1;
+        }
+        led_persist_state();
+
+        if (led_is_enabled()) {
+            MY_LOG_INFO(TAG, "LED brightness set to %d%%", level);
+        } else {
+            MY_LOG_INFO(TAG, "LED brightness set to %d%% (LED currently off)", level);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        MY_LOG_INFO(TAG, "LED status: %s, brightness %u%%", led_is_enabled() ? "on" : "off", led_brightness_percent);
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100> | led read");
+    return 1;
 }
 
 // Command: start_karma - Starts portal with SSID from probe list
@@ -2801,9 +3051,9 @@ static void wardrive_task(void *pvParameters) {
     MY_LOG_INFO(TAG, "Wardrive task started.");
     
     // Set LED to indicate wardrive mode
-    esp_err_t led_err = led_strip_set_pixel(strip, 0, 0, 255, 255); // Cyan
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_color(0, 255, 255); // Cyan
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for wardrive: %s", esp_err_to_name(led_err));
     }
     
     // Find the next file number by scanning existing files
@@ -2998,9 +3248,9 @@ static void wardrive_task(void *pvParameters) {
     }
     
     // Clear LED after wardrive finishes
-    led_err = led_strip_clear(strip);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after wardrive: %s", esp_err_to_name(led_err));
     }
     
     wardrive_active = false;
@@ -3952,6 +4202,11 @@ static int cmd_start_portal(int argc, char **argv) {
     MY_LOG_INFO(TAG, "Connect to '%s' WiFi network to access the portal", ssid);
     MY_LOG_INFO(TAG, "DNS server running on port 53 - all queries redirect to 172.0.0.1");
     MY_LOG_INFO(TAG, "HTTP server running on port 80");
+
+    esp_err_t led_err = led_set_color(255, 0, 255); // Purple for portal mode
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for portal mode: %s", esp_err_to_name(led_err));
+    }
     
     return 0;
 }
@@ -4114,6 +4369,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&karma_cmd));
 
+    const esp_console_cmd_t led_cmd = {
+        .command = "led",
+        .help = "Controls status LED: led set <on|off> | led level <1-100> | led read",
+        .hint = NULL,
+        .func = &cmd_led,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&led_cmd));
+
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
         .help = "Stop all running operations",
@@ -4199,9 +4463,13 @@ void app_main(void) {
     // 3. strip instance
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip));
 
-
-
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    led_initialized = true;
+    led_boot_sequence();
+    MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
+
+
 
     ESP_ERROR_CHECK(wifi_init_ap_sta()); 
 
@@ -4240,6 +4508,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  show_probes");
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
     MY_LOG_INFO(TAG,"  start_sniffer_dog");
+    MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
     MY_LOG_INFO(TAG,"  stop");
     MY_LOG_INFO(TAG,"  reboot");
 
@@ -4419,10 +4688,10 @@ static void sae_attack_task(void *pvParameters) {
                 // Clean up after attack
                 esp_wifi_set_promiscuous(false);
                 
-                // Clear LED (ignore errors if LED is in invalid state)
-                esp_err_t led_err = led_strip_clear(strip);
-                if (led_err == ESP_OK) {
-                    led_strip_refresh(strip);
+                // Restore LED to idle (ignore errors if LED is in invalid state)
+                esp_err_t led_err = led_set_idle();
+                if (led_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to restore idle LED after SAE stop: %s", esp_err_to_name(led_err));
                 }
                 
                 break;
@@ -4440,9 +4709,9 @@ static void sae_attack_task(void *pvParameters) {
     }
     
     // Clean up LED after attack finishes naturally (ignore LED errors)
-    esp_err_t led_err = led_strip_clear(strip);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after SAE task: %s", esp_err_to_name(led_err));
     }
     
     // Clean up after attack
@@ -5368,14 +5637,12 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     // Send deauth frame for more effective disconnection
 
     // Blue LED flash to indicate deauth sent
-    led_strip_set_pixel(strip, 0, 0, 0, 255); // Blue
-    led_strip_refresh(strip);
+    (void)led_set_color(0, 0, 255); // Blue
 
     wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
     deauth_sent_count++;
     
-    led_strip_set_pixel(strip, 0, 255, 0, 0); // Back to red
-    led_strip_refresh(strip);
+    (void)led_set_color(255, 0, 0); // Back to red
     
     // Log statistics for this AP-STA pair
     MY_LOG_INFO(TAG, "[SnifferDog #%lu] DEAUTH sent: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
