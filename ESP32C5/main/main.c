@@ -108,7 +108,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.0"
+#define JANOS_VERSION "1.5.1"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -4109,6 +4109,8 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     int64_t last_stats_time = esp_timer_get_time();
     int last_flush_count = 0;
+    int gps_fix_lost_count = 0;
+    #define WDP_GPS_FIX_LOST_THRESHOLD 3
 
     while (wardrive_promisc_active && !operation_stop_requested) {
         int ch_idx = wdp_ducb_select_channel();
@@ -4135,7 +4137,13 @@ static void wardrive_promisc_task(void *pvParameters) {
         }
 
         if (!current_gps.valid) {
-            MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
+            gps_fix_lost_count++;
+        } else {
+            gps_fix_lost_count = 0;
+        }
+
+        if (gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
+            MY_LOG_INFO(TAG, "GPS fix lost for %d cycles! Pausing wardrive...", gps_fix_lost_count);
             esp_wifi_set_promiscuous(false);
 
             while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
@@ -4156,6 +4164,7 @@ static void wardrive_promisc_task(void *pvParameters) {
             MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
                         current_gps.latitude, current_gps.longitude);
             esp_wifi_set_promiscuous(true);
+            gps_fix_lost_count = 0;
         }
 
         double reward = (double)wdp_dwell_new_networks;
