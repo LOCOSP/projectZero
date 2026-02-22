@@ -447,6 +447,63 @@ static const int dual_band_channels[] = {
 static const int dual_band_channels_count = sizeof(dual_band_channels) / sizeof(dual_band_channels[0]);
 
 // ============================================================================
+// Wardrive Promisc: Kismet-style tiered channel lists + D-UCB
+// ============================================================================
+
+static const uint8_t wdp_ch_24_primary[]   = {1, 6, 11};
+static const uint8_t wdp_ch_24_secondary[] = {2, 3, 4, 5, 7, 8, 9, 10, 12, 13};
+static const uint8_t wdp_ch_5_non_dfs[]    = {36, 40, 44, 48, 149, 153, 157, 161, 165};
+static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 169, 173, 177};
+
+#define WDP_CH_24_PRIMARY_COUNT   (sizeof(wdp_ch_24_primary) / sizeof(wdp_ch_24_primary[0]))
+#define WDP_CH_24_SECONDARY_COUNT (sizeof(wdp_ch_24_secondary) / sizeof(wdp_ch_24_secondary[0]))
+#define WDP_CH_5_NON_DFS_COUNT    (sizeof(wdp_ch_5_non_dfs) / sizeof(wdp_ch_5_non_dfs[0]))
+#define WDP_CH_5_DFS_COUNT        (sizeof(wdp_ch_5_dfs) / sizeof(wdp_ch_5_dfs[0]))
+#define WDP_TOTAL_CHANNELS        (WDP_CH_24_PRIMARY_COUNT + WDP_CH_24_SECONDARY_COUNT + WDP_CH_5_NON_DFS_COUNT + WDP_CH_5_DFS_COUNT)
+
+#define WDP_DUCB_GAMMA            0.99
+#define WDP_DUCB_C                1.0
+#define WDP_DWELL_PRIMARY_MS      500
+#define WDP_DWELL_DEFAULT_MS      400
+#define WDP_DWELL_DFS_MS          250
+#define WDP_MAX_NETWORKS          512
+#define WDP_STATS_INTERVAL_US     (30 * 1000000LL)
+#define WDP_FILE_FLUSH_INTERVAL   50
+
+typedef enum {
+    WDP_TIER_24_PRIMARY,
+    WDP_TIER_24_SECONDARY,
+    WDP_TIER_5_NON_DFS,
+    WDP_TIER_5_DFS,
+} wdp_channel_tier_t;
+
+typedef struct {
+    int channel;
+    wdp_channel_tier_t tier;
+    double discounted_reward;
+    double discounted_pulls;
+    int total_pulls;
+} wdp_ducb_channel_t;
+
+typedef struct {
+    uint8_t  bssid[6];
+    char     ssid[33];
+    uint8_t  channel;
+    int8_t   rssi;
+    wifi_auth_mode_t authmode;
+    bool     written_to_file;
+} wdp_network_t;
+
+static bool wardrive_promisc_active = false;
+static TaskHandle_t wardrive_promisc_task_handle = NULL;
+static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
+static int wdp_ducb_channel_count = 0;
+static double wdp_ducb_discounted_total = 0.0;
+static wdp_network_t *wdp_seen_networks = NULL;
+static volatile int wdp_seen_count = 0;
+static volatile int wdp_dwell_new_networks = 0;
+
+// ============================================================================
 // Radio Mode State (lazy initialization)
 // ============================================================================
 
@@ -1044,10 +1101,11 @@ static bool init_psram_buffers(void)
     hs_ap_targets = heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
     hs_clients = heap_caps_calloc(HS_MAX_CLIENTS, sizeof(hs_client_entry_t), MALLOC_CAP_SPIRAM);
     ducb_channels = heap_caps_calloc(dual_band_channels_count, sizeof(ducb_channel_t), MALLOC_CAP_SPIRAM);
+    wdp_seen_networks = heap_caps_calloc(WDP_MAX_NETWORKS, sizeof(wdp_network_t), MALLOC_CAP_SPIRAM);
     
     if (!sniffer_aps || !probe_requests || !bt_devices || !wardrive_scan_results ||
         !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids || !selected_stations ||
-        !hs_ap_targets || !hs_clients || !ducb_channels) {
+        !hs_ap_targets || !hs_clients || !ducb_channels || !wdp_seen_networks) {
         MY_LOG_INFO(TAG, "PSRAM allocation failed!");
         return false;
     }
@@ -1194,6 +1252,14 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
 static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel);
 static bool hs_save_handshake_to_sd(int ap_idx);
 static void gps_raw_task(void *pvParameters);
+// Wardrive promisc helpers
+static void wdp_ducb_init(void);
+static int wdp_ducb_select_channel(void);
+static void wdp_ducb_update(int channel_idx, double reward);
+static int wdp_get_dwell_ms(wdp_channel_tier_t tier);
+static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
+static void wardrive_promisc_task(void *pvParameters);
+static int cmd_start_wardrive_promisc(int argc, char **argv);
 // DNS server task
 static void dns_server_task(void *pvParameters);
 // Portal HTTP handlers
@@ -3816,6 +3882,443 @@ static void ducb_update(int channel_idx, double reward) {
 }
 
 // ============================================================================
+// Wardrive Promisc: D-UCB, Dedup, Promiscuous Callback, Task
+// ============================================================================
+
+static void wdp_ducb_init(void) {
+    wdp_ducb_channel_count = 0;
+    wdp_ducb_discounted_total = 0.0;
+
+    for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++) {
+        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_primary[i];
+        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_PRIMARY;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.5;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+        wdp_ducb_channel_count++;
+    }
+    for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++) {
+        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_secondary[i];
+        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_SECONDARY;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+        wdp_ducb_channel_count++;
+    }
+    for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
+        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
+        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+        wdp_ducb_channel_count++;
+    }
+    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
+        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
+        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+        wdp_ducb_channel_count++;
+    }
+}
+
+static int wdp_ducb_select_channel(void) {
+    wdp_ducb_discounted_total *= WDP_DUCB_GAMMA;
+    for (int i = 0; i < wdp_ducb_channel_count; i++) {
+        wdp_ducb_channels[i].discounted_reward *= WDP_DUCB_GAMMA;
+        wdp_ducb_channels[i].discounted_pulls *= WDP_DUCB_GAMMA;
+    }
+
+    int best_idx = 0;
+    double best_ucb = -1.0;
+
+    for (int i = 0; i < wdp_ducb_channel_count; i++) {
+        if (wdp_ducb_channels[i].discounted_pulls < 0.001) {
+            best_idx = i;
+            break;
+        }
+        double avg_reward = wdp_ducb_channels[i].discounted_reward / wdp_ducb_channels[i].discounted_pulls;
+        double exploration = WDP_DUCB_C * sqrt(log(wdp_ducb_discounted_total + 1.0) / wdp_ducb_channels[i].discounted_pulls);
+        double ucb = avg_reward + exploration;
+        if (ucb > best_ucb) {
+            best_ucb = ucb;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+static void wdp_ducb_update(int channel_idx, double reward) {
+    wdp_ducb_channels[channel_idx].discounted_pulls += 1.0;
+    wdp_ducb_channels[channel_idx].discounted_reward += reward;
+    wdp_ducb_channels[channel_idx].total_pulls++;
+    wdp_ducb_discounted_total += 1.0;
+}
+
+static int wdp_get_dwell_ms(wdp_channel_tier_t tier) {
+    switch (tier) {
+        case WDP_TIER_24_PRIMARY:   return WDP_DWELL_PRIMARY_MS;
+        case WDP_TIER_24_SECONDARY: return WDP_DWELL_DEFAULT_MS;
+        case WDP_TIER_5_NON_DFS:    return WDP_DWELL_DEFAULT_MS;
+        case WDP_TIER_5_DFS:        return WDP_DWELL_DFS_MS;
+        default:                    return WDP_DWELL_DEFAULT_MS;
+    }
+}
+
+static int wdp_find_bssid(const uint8_t *bssid) {
+    for (int i = 0; i < wdp_seen_count; i++) {
+        if (memcmp(wdp_seen_networks[i].bssid, bssid, 6) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!wardrive_promisc_active) return;
+    if (type != WIFI_PKT_MGMT) return;
+
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+
+    if (len < 36) return;
+
+    uint8_t frame_type = frame[0] & 0xFC;
+    if (frame_type != 0x80) return; // Only beacons
+
+    const uint8_t *ap_bssid = &frame[10]; // addr2 = transmitter = AP
+
+    const uint8_t *body = frame + 24 + 12;
+    int body_len = len - 24 - 12;
+    if (body_len < 2) return;
+
+    char ssid[33] = {0};
+    uint8_t beacon_channel = pkt->rx_ctrl.channel;
+    wifi_auth_mode_t authmode = WIFI_AUTH_OPEN;
+
+    int offset = 0;
+    while (offset + 2 <= body_len) {
+        uint8_t tag = body[offset];
+        uint8_t tag_len = body[offset + 1];
+        if (offset + 2 + tag_len > body_len) break;
+
+        if (tag == 0 && tag_len > 0 && tag_len <= 32) {
+            memcpy(ssid, &body[offset + 2], tag_len);
+            ssid[tag_len] = '\0';
+        } else if (tag == 3 && tag_len == 1) {
+            beacon_channel = body[offset + 2];
+        } else if (tag == 48) {
+            authmode = WIFI_AUTH_WPA2_PSK;
+        } else if (tag == 221) {
+            if (tag_len >= 4 && body[offset+2] == 0x00 && body[offset+3] == 0x50 &&
+                body[offset+4] == 0xF2 && body[offset+5] == 0x01) {
+                if (authmode == WIFI_AUTH_OPEN) authmode = WIFI_AUTH_WPA_PSK;
+            }
+        }
+        offset += 2 + tag_len;
+    }
+
+    int existing = wdp_find_bssid(ap_bssid);
+    if (existing >= 0) {
+        if (pkt->rx_ctrl.rssi > wdp_seen_networks[existing].rssi) {
+            wdp_seen_networks[existing].rssi = (int8_t)pkt->rx_ctrl.rssi;
+        }
+        return;
+    }
+
+    if (wdp_seen_count >= WDP_MAX_NETWORKS) return;
+
+    int idx = wdp_seen_count;
+    memcpy(wdp_seen_networks[idx].bssid, ap_bssid, 6);
+    strncpy(wdp_seen_networks[idx].ssid, ssid, 32);
+    wdp_seen_networks[idx].ssid[32] = '\0';
+    wdp_seen_networks[idx].channel = beacon_channel;
+    wdp_seen_networks[idx].rssi = (int8_t)pkt->rx_ctrl.rssi;
+    wdp_seen_networks[idx].authmode = authmode;
+    wdp_seen_networks[idx].written_to_file = false;
+    wdp_seen_count++;
+
+    wdp_dwell_new_networks++;
+
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             ap_bssid[0], ap_bssid[1], ap_bssid[2],
+             ap_bssid[3], ap_bssid[4], ap_bssid[5]);
+
+    char escaped_ssid[64];
+    escape_csv_field(ssid, escaped_ssid, sizeof(escaped_ssid));
+
+    const char *auth_str = get_auth_mode_wiggle(authmode);
+
+    char timestamp[32];
+    get_timestamp_string(timestamp, sizeof(timestamp));
+
+    if (current_gps.valid) {
+        printf("%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
+               mac_str, escaped_ssid, auth_str, timestamp,
+               beacon_channel, (int)pkt->rx_ctrl.rssi,
+               current_gps.latitude, current_gps.longitude,
+               current_gps.altitude, current_gps.accuracy);
+    } else {
+        printf("%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
+               mac_str, escaped_ssid, auth_str, timestamp,
+               beacon_channel, (int)pkt->rx_ctrl.rssi);
+    }
+}
+
+static void wardrive_promisc_task(void *pvParameters) {
+    (void)pvParameters;
+
+    MY_LOG_INFO(TAG, "Wardrive promisc task started.");
+
+    esp_err_t led_err = led_set_color(255, 0, 255); // Magenta
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for wardrive promisc: %s", esp_err_to_name(led_err));
+    }
+
+    int file_number = find_next_wardrive_file_number();
+    MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", file_number);
+
+    MY_LOG_INFO(TAG, "Waiting for GPS fix...");
+    if (!wait_for_gps_fix(120)) {
+        MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, not continuing without GPS data - please ensure clear view of the sky and try again.");
+        goto cleanup;
+    }
+    MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f",
+                current_gps.latitude, current_gps.longitude);
+
+    wdp_seen_count = 0;
+    wdp_dwell_new_networks = 0;
+    memset(wdp_seen_networks, 0, WDP_MAX_NETWORKS * sizeof(wdp_network_t));
+    wdp_ducb_init();
+
+    wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
+    };
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
+    esp_wifi_set_promiscuous(true);
+
+    MY_LOG_INFO(TAG, "Promiscuous wardrive started. Channels: %d (2.4 primary: %d, secondary: %d, 5GHz: %d, DFS: %d)",
+                wdp_ducb_channel_count,
+                (int)WDP_CH_24_PRIMARY_COUNT, (int)WDP_CH_24_SECONDARY_COUNT,
+                (int)WDP_CH_5_NON_DFS_COUNT, (int)WDP_CH_5_DFS_COUNT);
+    MY_LOG_INFO(TAG, "Use 'stop' command to stop.");
+
+    int64_t last_stats_time = esp_timer_get_time();
+    int last_flush_count = 0;
+
+    while (wardrive_promisc_active && !operation_stop_requested) {
+        int ch_idx = wdp_ducb_select_channel();
+        int channel = wdp_ducb_channels[ch_idx].channel;
+        int dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
+
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+
+        wdp_dwell_new_networks = 0;
+
+        vTaskDelay(pdMS_TO_TICKS(dwell_ms));
+
+        if (!wardrive_promisc_active || operation_stop_requested) break;
+
+        // Read GPS
+        int gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(10));
+        if (gps_len > 0) {
+            wardrive_gps_buffer[gps_len] = '\0';
+            char *line = strtok(wardrive_gps_buffer, "\r\n");
+            while (line != NULL) {
+                parse_gps_nmea(line);
+                line = strtok(NULL, "\r\n");
+            }
+        }
+
+        if (!current_gps.valid) {
+            MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
+            esp_wifi_set_promiscuous(false);
+
+            while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
+                gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer,
+                                          GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
+                if (gps_len > 0) {
+                    wardrive_gps_buffer[gps_len] = '\0';
+                    char *line = strtok(wardrive_gps_buffer, "\r\n");
+                    while (line != NULL) {
+                        parse_gps_nmea(line);
+                        line = strtok(NULL, "\r\n");
+                    }
+                }
+            }
+
+            if (!wardrive_promisc_active || operation_stop_requested) break;
+
+            MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
+                        current_gps.latitude, current_gps.longitude);
+            esp_wifi_set_promiscuous(true);
+        }
+
+        double reward = (double)wdp_dwell_new_networks;
+        wdp_ducb_update(ch_idx, reward);
+
+        // Flush new entries to SD file periodically
+        int current_count = wdp_seen_count;
+        if ((current_count - last_flush_count) >= WDP_FILE_FLUSH_INTERVAL ||
+            ((current_count > last_flush_count) && ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US))) {
+
+            char filename[64];
+            snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", file_number);
+
+            struct stat st;
+            if (stat("/sdcard/lab/wardrives", &st) != 0) {
+                MY_LOG_INFO(TAG, "Error: /sdcard/lab/wardrives directory not accessible");
+            } else {
+                FILE *file = fopen(filename, "a");
+                if (!file) file = fopen(filename, "w");
+                if (file) {
+                    fseek(file, 0, SEEK_END);
+                    if (ftell(file) == 0) {
+                        fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
+                        fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+                    }
+
+                    char timestamp[32];
+                    get_timestamp_string(timestamp, sizeof(timestamp));
+
+                    for (int i = 0; i < current_count; i++) {
+                        if (wdp_seen_networks[i].written_to_file) continue;
+
+                        char mac_str[18];
+                        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                                 wdp_seen_networks[i].bssid[0], wdp_seen_networks[i].bssid[1],
+                                 wdp_seen_networks[i].bssid[2], wdp_seen_networks[i].bssid[3],
+                                 wdp_seen_networks[i].bssid[4], wdp_seen_networks[i].bssid[5]);
+
+                        char escaped_ssid[64];
+                        escape_csv_field(wdp_seen_networks[i].ssid, escaped_ssid, sizeof(escaped_ssid));
+
+                        const char *auth_str = get_auth_mode_wiggle(wdp_seen_networks[i].authmode);
+
+                        if (current_gps.valid) {
+                            fprintf(file, "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
+                                    mac_str, escaped_ssid, auth_str, timestamp,
+                                    wdp_seen_networks[i].channel, (int)wdp_seen_networks[i].rssi,
+                                    current_gps.latitude, current_gps.longitude,
+                                    current_gps.altitude, current_gps.accuracy);
+                        } else {
+                            fprintf(file, "%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
+                                    mac_str, escaped_ssid, auth_str, timestamp,
+                                    wdp_seen_networks[i].channel, (int)wdp_seen_networks[i].rssi);
+                        }
+                        wdp_seen_networks[i].written_to_file = true;
+                    }
+
+                    fclose(file);
+                    sd_sync();
+                    last_flush_count = current_count;
+                    MY_LOG_INFO(TAG, "Flushed %d networks to %s", current_count, filename);
+                }
+            }
+        }
+
+        // Periodic stats
+        int64_t now = esp_timer_get_time();
+        if ((now - last_stats_time) >= WDP_STATS_INTERVAL_US) {
+            int top_ch = 0, top_pulls = 0;
+            for (int i = 0; i < wdp_ducb_channel_count; i++) {
+                if (wdp_ducb_channels[i].total_pulls > top_pulls) {
+                    top_pulls = wdp_ducb_channels[i].total_pulls;
+                    top_ch = wdp_ducb_channels[i].channel;
+                }
+            }
+            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, D-UCB best ch: %d (%d visits), GPS: %s",
+                        wdp_seen_count, top_ch, top_pulls,
+                        current_gps.valid ? "valid" : "no fix");
+            last_stats_time = now;
+        }
+    }
+
+    esp_wifi_set_promiscuous(false);
+
+cleanup:
+    led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after wardrive promisc: %s", esp_err_to_name(led_err));
+    }
+
+    MY_LOG_INFO(TAG, "Wardrive promisc stopped. Total unique networks: %d", wdp_seen_count);
+    wardrive_promisc_active = false;
+    wardrive_promisc_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static int cmd_start_wardrive_promisc(int argc, char **argv) {
+    (void)argc; (void)argv;
+    log_memory_info("start_wardrive_promisc");
+
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+
+    if (wardrive_promisc_active || wardrive_promisc_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Wardrive promisc already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start wardrive promisc while regular wardrive is running. Use 'stop' first.");
+        return 1;
+    }
+    if (handshake_attack_active || handshake_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start wardrive promisc while handshake attack is running. Use 'stop' first.");
+        return 1;
+    }
+    if (gps_raw_active || gps_raw_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start wardrive promisc while GPS raw reader is running. Use 'stop' first.");
+        return 1;
+    }
+
+    operation_stop_requested = false;
+
+    MY_LOG_INFO(TAG, "Starting promiscuous wardrive mode...");
+
+    int baud = gps_get_baud_for_module(current_gps_module);
+    esp_err_t ret = init_gps_uart(baud);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
+                GPS_TX_PIN, GPS_RX_PIN, baud);
+
+    ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "SD card initialized on pins MISO:%d MOSI:%d CLK:%d CS:%d",
+                SD_MISO_PIN, SD_MOSI_PIN, SD_CLK_PIN, SD_CS_PIN);
+
+    wardrive_promisc_active = true;
+    BaseType_t result = xTaskCreate(
+        wardrive_promisc_task,
+        "wdp_task",
+        8192,
+        NULL,
+        5,
+        &wardrive_promisc_task_handle
+    );
+
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create wardrive promisc task!");
+        wardrive_promisc_active = false;
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "Wardrive promisc task started. Use 'stop' to stop.");
+    return 0;
+}
+
+// ============================================================================
 // Sniffer Handshake: AP and Client Management
 // ============================================================================
 
@@ -5915,6 +6418,23 @@ static int cmd_stop(int argc, char **argv) {
             vTaskDelete(wardrive_task_handle);
             wardrive_task_handle = NULL;
             MY_LOG_INFO(TAG, "Wardrive task forcefully stopped.");
+        }
+    }
+    
+    // Stop wardrive promisc task if running
+    if (wardrive_promisc_active || wardrive_promisc_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping wardrive promisc task...");
+        wardrive_promisc_active = false;
+        esp_wifi_set_promiscuous(false);
+        
+        for (int i = 0; i < 20 && wardrive_promisc_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        if (wardrive_promisc_task_handle != NULL) {
+            vTaskDelete(wardrive_promisc_task_handle);
+            wardrive_promisc_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Wardrive promisc task forcefully stopped.");
         }
     }
     
@@ -11672,6 +12192,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cmd));
 
+    const esp_console_cmd_t wardrive_promisc_cmd = {
+        .command = "start_wardrive_promisc",
+        .help = "Promiscuous wardrive with D-UCB channel selection",
+        .hint = NULL,
+        .func = &cmd_start_wardrive_promisc,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_promisc_cmd));
+
     const esp_console_cmd_t portal_cmd = {
         .command = "start_portal",
         .help = "Starts captive portal with password form: start_portal <SSID>",
@@ -13928,6 +14457,9 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
             current_gps.valid = true;
             
             return true;
+        } else {
+            current_gps.valid = false;
+            return false;
         }
     }
     
