@@ -108,7 +108,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.1"
+#define JANOS_VERSION "1.5.2"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -4081,8 +4081,8 @@ static void wardrive_promisc_task(void *pvParameters) {
     int file_number = find_next_wardrive_file_number();
     MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", file_number);
 
-    MY_LOG_INFO(TAG, "Waiting for GPS fix...");
-    if (!wait_for_gps_fix(120)) {
+    MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout - use 'stop' to cancel)...");
+    if (!wait_for_gps_fix(0)) {
         MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, not continuing without GPS data - please ensure clear view of the sky and try again.");
         goto cleanup;
     }
@@ -14535,10 +14535,15 @@ static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode) {
 static bool wait_for_gps_fix(int timeout_seconds) {
     int elapsed = 0;
     current_gps.valid = false;
+    bool infinite = (timeout_seconds <= 0);
     
-    MY_LOG_INFO(TAG, "Waiting for GPS fix (timeout: %d seconds)...", timeout_seconds);
+    if (infinite) {
+        MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout, use 'stop' to cancel)...");
+    } else {
+        MY_LOG_INFO(TAG, "Waiting for GPS fix (timeout: %d seconds)...", timeout_seconds);
+    }
     
-    while (elapsed < timeout_seconds) {
+    while (infinite || elapsed < timeout_seconds) {
         // Check for stop request
         if (operation_stop_requested) {
             MY_LOG_INFO(TAG, "GPS wait: Stop requested, terminating...");
@@ -14562,7 +14567,11 @@ static bool wait_for_gps_fix(int timeout_seconds) {
         
         elapsed++;
         if (elapsed % 10 == 0) {  // Print status every 10 seconds
-            MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d/%d seconds)", elapsed, timeout_seconds);
+            if (infinite) {
+                MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d seconds)", elapsed);
+            } else {
+                MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d/%d seconds)", elapsed, timeout_seconds);
+            }
         }
     }
     
