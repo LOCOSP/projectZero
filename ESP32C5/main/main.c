@@ -4235,7 +4235,7 @@ static void wardrive_promisc_task(void *pvParameters) {
                 if (file) {
                     fseek(file, 0, SEEK_END);
                     if (ftell(file) == 0) {
-                        fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
+                        fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=MonsterC5,release=v1.0,device=MonsterC5,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
                         fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
                     }
 
