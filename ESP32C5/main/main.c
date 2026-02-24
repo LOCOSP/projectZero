@@ -108,7 +108,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.2"
+#define JANOS_VERSION "1.5.3"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -466,7 +466,8 @@ static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112
 #define WDP_DWELL_PRIMARY_MS      500
 #define WDP_DWELL_DEFAULT_MS      400
 #define WDP_DWELL_DFS_MS          250
-#define WDP_MAX_NETWORKS          512
+#define WDP_INITIAL_CAPACITY      256
+#define WDP_PSRAM_RESERVE_BYTES   (64 * 1024)
 #define WDP_STATS_INTERVAL_US     (30 * 1000000LL)
 #define WDP_FILE_FLUSH_INTERVAL   50
 
@@ -501,6 +502,8 @@ static int wdp_ducb_channel_count = 0;
 static double wdp_ducb_discounted_total = 0.0;
 static wdp_network_t *wdp_seen_networks = NULL;
 static volatile int wdp_seen_count = 0;
+static volatile int wdp_seen_capacity = 0;
+static volatile bool wdp_needs_grow = false;
 static volatile int wdp_dwell_new_networks = 0;
 
 // ============================================================================
@@ -1101,7 +1104,8 @@ static bool init_psram_buffers(void)
     hs_ap_targets = heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
     hs_clients = heap_caps_calloc(HS_MAX_CLIENTS, sizeof(hs_client_entry_t), MALLOC_CAP_SPIRAM);
     ducb_channels = heap_caps_calloc(dual_band_channels_count, sizeof(ducb_channel_t), MALLOC_CAP_SPIRAM);
-    wdp_seen_networks = heap_caps_calloc(WDP_MAX_NETWORKS, sizeof(wdp_network_t), MALLOC_CAP_SPIRAM);
+    wdp_seen_networks = heap_caps_calloc(WDP_INITIAL_CAPACITY, sizeof(wdp_network_t), MALLOC_CAP_SPIRAM);
+    wdp_seen_capacity = WDP_INITIAL_CAPACITY;
     
     if (!sniffer_aps || !probe_requests || !bt_devices || !wardrive_scan_results ||
         !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids || !selected_stations ||
@@ -4028,7 +4032,10 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         return;
     }
 
-    if (wdp_seen_count >= WDP_MAX_NETWORKS) return;
+    if (wdp_seen_count >= wdp_seen_capacity) {
+        wdp_needs_grow = true;
+        return;
+    }
 
     int idx = wdp_seen_count;
     memcpy(wdp_seen_networks[idx].bssid, ap_bssid, 6);
@@ -4068,6 +4075,33 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
+static bool wdp_grow_network_buffer(void) {
+    int new_capacity = wdp_seen_capacity * 2;
+    size_t new_size = (size_t)new_capacity * sizeof(wdp_network_t);
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    if (free_psram < new_size + WDP_PSRAM_RESERVE_BYTES) {
+        MY_LOG_INFO(TAG, "Cannot grow wardrive buffer: only %u bytes free PSRAM (need %u + %u reserve)",
+                    (unsigned)free_psram, (unsigned)new_size, (unsigned)WDP_PSRAM_RESERVE_BYTES);
+        return false;
+    }
+
+    wdp_network_t *new_buf = heap_caps_realloc(wdp_seen_networks, new_size, MALLOC_CAP_SPIRAM);
+    if (!new_buf) {
+        MY_LOG_INFO(TAG, "Failed to realloc wardrive buffer to %d entries", new_capacity);
+        return false;
+    }
+
+    memset(&new_buf[wdp_seen_capacity], 0, (size_t)(new_capacity - wdp_seen_capacity) * sizeof(wdp_network_t));
+    wdp_seen_networks = new_buf;
+    wdp_seen_capacity = new_capacity;
+    wdp_needs_grow = false;
+
+    MY_LOG_INFO(TAG, "Wardrive buffer grown to %d entries (%.1f KB PSRAM)",
+                new_capacity, (float)new_size / 1024.0f);
+    return true;
+}
+
 static void wardrive_promisc_task(void *pvParameters) {
     (void)pvParameters;
 
@@ -4091,7 +4125,8 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     wdp_seen_count = 0;
     wdp_dwell_new_networks = 0;
-    memset(wdp_seen_networks, 0, WDP_MAX_NETWORKS * sizeof(wdp_network_t));
+    wdp_needs_grow = false;
+    memset(wdp_seen_networks, 0, (size_t)wdp_seen_capacity * sizeof(wdp_network_t));
     wdp_ducb_init();
 
     wifi_promiscuous_filter_t filter = {
@@ -4124,6 +4159,19 @@ static void wardrive_promisc_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(dwell_ms));
 
         if (!wardrive_promisc_active || operation_stop_requested) break;
+
+        // Grow network buffer if needed (safe: promiscuous disabled during realloc)
+        if (wdp_needs_grow) {
+            esp_wifi_set_promiscuous(false);
+            if (wdp_grow_network_buffer()) {
+                MY_LOG_INFO(TAG, "Network buffer expanded, capacity now %d", wdp_seen_capacity);
+            } else {
+                MY_LOG_INFO(TAG, "Network buffer growth failed, continuing with %d/%d",
+                            wdp_seen_count, wdp_seen_capacity);
+                wdp_needs_grow = false;
+            }
+            esp_wifi_set_promiscuous(true);
+        }
 
         // Read GPS
         int gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(10));
