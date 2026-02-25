@@ -10300,7 +10300,7 @@ static int cmd_start_wardrive(int argc, char **argv) {
                     gps_external_position_command_name(current_gps_module));
     }
     
-    // Initialize SD card
+    // Initialize SD card main
     ret = init_sd_card();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
