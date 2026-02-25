@@ -108,7 +108,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.3"
+#define JANOS_VERSION "1.5.4"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -230,12 +230,19 @@ typedef struct {
 typedef enum {
     GPS_MODULE_ATGM336H = 0,
     GPS_MODULE_M5STACK_GPS_V11 = 1,
+    GPS_MODULE_EXTERNAL = 2,
+    GPS_MODULE_EXTERNAL_CAP = 3,
+    // Backward compatibility alias for previously exposed name.
+    GPS_MODULE_USB_TAB = GPS_MODULE_EXTERNAL,
+    GPS_MODULE_CAP = GPS_MODULE_EXTERNAL_CAP,
 } gps_module_t;
 
 // Wardrive state
 static bool wardrive_active = false;
 static int wardrive_file_counter = 1;
 static gps_data_t current_gps = {0};
+static gps_data_t external_gps_position = {0};
+static gps_data_t external_cap_gps_position = {0};
 static bool gps_uart_initialized = false;
 static gps_module_t current_gps_module = GPS_MODULE_ATGM336H;
 static volatile bool gps_raw_active = false;
@@ -1185,6 +1192,8 @@ static int cmd_start_handshake(int argc, char **argv);
 static int cmd_save_handshake(int argc, char **argv);
 static int cmd_start_gps_raw(int argc, char **argv);
 static int cmd_gps_set(int argc, char **argv);
+static int cmd_set_gps_position(int argc, char **argv);
+static int cmd_set_gps_position_cap(int argc, char **argv);
 static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_start_sniffer_noscan(int argc, char **argv);
@@ -1313,6 +1322,11 @@ static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi);
 // Wardrive functions
 static esp_err_t init_gps_uart(int baud_rate);
 static int gps_get_baud_for_module(gps_module_t module);
+static const char *gps_get_module_name(gps_module_t module);
+static bool gps_module_uses_external_feed(gps_module_t module);
+static bool gps_module_uses_external_cap_feed(gps_module_t module);
+static const char *gps_external_position_command_name(gps_module_t module);
+static void gps_sync_from_selected_external_source(void);
 static void gps_load_state_from_nvs(void);
 static void gps_save_state_to_nvs(void);
 static esp_err_t init_sd_card(void);
@@ -4106,6 +4120,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     (void)pvParameters;
 
     MY_LOG_INFO(TAG, "Wardrive promisc task started.");
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
 
     esp_err_t led_err = led_set_color(255, 0, 255); // Magenta
     if (led_err != ESP_OK) {
@@ -4148,6 +4163,22 @@ static void wardrive_promisc_task(void *pvParameters) {
     #define WDP_GPS_FIX_LOST_THRESHOLD 3
 
     while (wardrive_promisc_active && !operation_stop_requested) {
+        if (external_feed) {
+            gps_sync_from_selected_external_source();
+        }
+        if (external_feed && !current_gps.valid) {
+            MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
+            esp_wifi_set_promiscuous(false);
+            while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
+                gps_sync_from_selected_external_source();
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+            if (!wardrive_promisc_active || operation_stop_requested) break;
+            MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
+                        current_gps.latitude, current_gps.longitude);
+            esp_wifi_set_promiscuous(true);
+        }
+
         int ch_idx = wdp_ducb_select_channel();
         int channel = wdp_ducb_channels[ch_idx].channel;
         int dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
@@ -4173,14 +4204,17 @@ static void wardrive_promisc_task(void *pvParameters) {
             esp_wifi_set_promiscuous(true);
         }
 
-        // Read GPS
-        int gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(10));
-        if (gps_len > 0) {
-            wardrive_gps_buffer[gps_len] = '\0';
-            char *line = strtok(wardrive_gps_buffer, "\r\n");
-            while (line != NULL) {
-                parse_gps_nmea(line);
-                line = strtok(NULL, "\r\n");
+        // Read GPS source
+        int gps_len = 0;
+        if (!external_feed) {
+            gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(10));
+            if (gps_len > 0) {
+                wardrive_gps_buffer[gps_len] = '\0';
+                char *line = strtok(wardrive_gps_buffer, "\r\n");
+                while (line != NULL) {
+                    parse_gps_nmea(line);
+                    line = strtok(NULL, "\r\n");
+                }
             }
         }
 
@@ -4195,14 +4229,19 @@ static void wardrive_promisc_task(void *pvParameters) {
             esp_wifi_set_promiscuous(false);
 
             while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
-                gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer,
-                                          GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
-                if (gps_len > 0) {
-                    wardrive_gps_buffer[gps_len] = '\0';
-                    char *line = strtok(wardrive_gps_buffer, "\r\n");
-                    while (line != NULL) {
-                        parse_gps_nmea(line);
-                        line = strtok(NULL, "\r\n");
+                if (external_feed) {
+                    gps_sync_from_selected_external_source();
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                } else {
+                    gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer,
+                                              GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
+                    if (gps_len > 0) {
+                        wardrive_gps_buffer[gps_len] = '\0';
+                        char *line = strtok(wardrive_gps_buffer, "\r\n");
+                        while (line != NULL) {
+                            parse_gps_nmea(line);
+                            line = strtok(NULL, "\r\n");
+                        }
                     }
                 }
             }
@@ -4338,14 +4377,22 @@ static int cmd_start_wardrive_promisc(int argc, char **argv) {
 
     MY_LOG_INFO(TAG, "Starting promiscuous wardrive mode...");
 
-    int baud = gps_get_baud_for_module(current_gps_module);
-    esp_err_t ret = init_gps_uart(baud);
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
-        return 1;
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+
+    esp_err_t ret = ESP_OK;
+    if (!external_feed) {
+        int baud = gps_get_baud_for_module(current_gps_module);
+        ret = init_gps_uart(baud);
+        if (ret != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
+            return 1;
+        }
+        MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
+                    GPS_TX_PIN, GPS_RX_PIN, baud);
+    } else {
+        MY_LOG_INFO(TAG, "Using external GPS feed. Provide fixes via '%s'.",
+                    gps_external_position_command_name(current_gps_module));
     }
-    MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
-                GPS_TX_PIN, GPS_RX_PIN, baud);
 
     ret = init_sd_card();
     if (ret != ESP_OK) {
@@ -6653,7 +6700,9 @@ static const cli_hint_t k_cli_hints[] = {
     { "select_stations", " <MAC1> [MAC2] ..." },
     { "sniffer_debug", " <0|1>" },
     { "start_gps_raw", " [baud]" },
-    { "gps_set", " <m5|atgm>" },
+    { "gps_set", " <m5|atgm|external|cap>" },
+    { "set_gps_position", " <lat> <lon> [alt] [acc]" },
+    { "set_gps_position_cap", " <lat> <lon> [alt] [acc]" },
     { "start_portal", " <SSID>" },
     { "start_karma", " <index>" },
     { "vendor", " set <on|off> | read" },
@@ -9710,9 +9759,9 @@ static void gps_raw_task(void *pvParameters) {
 
 static int cmd_gps_set(int argc, char **argv) {
     if (argc < 2 || argv[1] == NULL) {
-        MY_LOG_INFO(TAG, "Usage: gps_set <m5|atgm>");
+        MY_LOG_INFO(TAG, "Usage: gps_set <m5|atgm|external|cap>");
         MY_LOG_INFO(TAG, "Current GPS module: %s (baud %d)",
-                    (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H",
+                    gps_get_module_name(current_gps_module),
                     gps_get_baud_for_module(current_gps_module));
         return 0;
     }
@@ -9722,16 +9771,188 @@ static int cmd_gps_set(int argc, char **argv) {
         selected = GPS_MODULE_M5STACK_GPS_V11;
     } else if (strcasecmp(argv[1], "atgm") == 0 || strcasecmp(argv[1], "atgm336h") == 0) {
         selected = GPS_MODULE_ATGM336H;
+    } else if (strcasecmp(argv[1], "external") == 0 || strcasecmp(argv[1], "ext") == 0 ||
+               strcasecmp(argv[1], "usb") == 0 || strcasecmp(argv[1], "tab") == 0 ||
+               strcasecmp(argv[1], "tab5") == 0) {
+        selected = GPS_MODULE_EXTERNAL;
+    } else if (strcasecmp(argv[1], "cap") == 0 || strcasecmp(argv[1], "external_cap") == 0 ||
+               strcasecmp(argv[1], "lora_cap") == 0 || strcasecmp(argv[1], "adv_cap") == 0) {
+        selected = GPS_MODULE_EXTERNAL_CAP;
     } else {
-        MY_LOG_INFO(TAG, "Unknown module '%s'. Use 'm5' or 'atgm'.", argv[1]);
+        MY_LOG_INFO(TAG, "Unknown module '%s'. Use 'm5', 'atgm', 'external' (usb alias) or 'cap'.", argv[1]);
         return 1;
     }
 
     current_gps_module = selected;
+    if (gps_module_uses_external_feed(current_gps_module)) {
+        gps_sync_from_selected_external_source();
+    }
     gps_save_state_to_nvs();
     MY_LOG_INFO(TAG, "GPS module set to %s (baud %d). Restart GPS tasks if running.",
-                (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H",
+                gps_get_module_name(current_gps_module),
                 gps_get_baud_for_module(current_gps_module));
+    return 0;
+}
+
+static int cmd_set_gps_position(int argc, char **argv) {
+    if (argc == 1) {
+        external_gps_position.valid = false;
+        if (current_gps_module == GPS_MODULE_EXTERNAL) {
+            gps_sync_from_selected_external_source();
+        }
+        MY_LOG_INFO(TAG, "External GPS fix cleared (no fix).");
+        return 0;
+    }
+
+    if (argc < 3 || argc > 5 || argv[1] == NULL || argv[2] == NULL) {
+        MY_LOG_INFO(TAG, "Usage: set_gps_position <lat> <lon> [alt] [acc]");
+        MY_LOG_INFO(TAG, "Usage: set_gps_position   (no args = lost fix)");
+        return 1;
+    }
+
+    char *endptr = NULL;
+    float lat = strtof(argv[1], &endptr);
+    if (endptr == argv[1] || (endptr != NULL && *endptr != '\0') || !isfinite(lat)) {
+        MY_LOG_INFO(TAG, "Invalid latitude: '%s'", argv[1]);
+        return 1;
+    }
+
+    endptr = NULL;
+    float lon = strtof(argv[2], &endptr);
+    if (endptr == argv[2] || (endptr != NULL && *endptr != '\0') || !isfinite(lon)) {
+        MY_LOG_INFO(TAG, "Invalid longitude: '%s'", argv[2]);
+        return 1;
+    }
+
+    if (lat < -90.0f || lat > 90.0f) {
+        MY_LOG_INFO(TAG, "Latitude out of range (-90..90): %.7f", lat);
+        return 1;
+    }
+    if (lon < -180.0f || lon > 180.0f) {
+        MY_LOG_INFO(TAG, "Longitude out of range (-180..180): %.7f", lon);
+        return 1;
+    }
+
+    float alt = external_gps_position.altitude;
+    float acc = (external_gps_position.accuracy > 0.0f) ? external_gps_position.accuracy : 5.0f;
+
+    if (argc >= 4 && argv[3] != NULL) {
+        endptr = NULL;
+        alt = strtof(argv[3], &endptr);
+        if (endptr == argv[3] || (endptr != NULL && *endptr != '\0') || !isfinite(alt)) {
+            MY_LOG_INFO(TAG, "Invalid altitude: '%s'", argv[3]);
+            return 1;
+        }
+    }
+
+    if (argc >= 5 && argv[4] != NULL) {
+        endptr = NULL;
+        acc = strtof(argv[4], &endptr);
+        if (endptr == argv[4] || (endptr != NULL && *endptr != '\0') || !isfinite(acc) || acc < 0.0f) {
+            MY_LOG_INFO(TAG, "Invalid accuracy: '%s' (must be >= 0)", argv[4]);
+            return 1;
+        }
+    }
+
+    external_gps_position.latitude = lat;
+    external_gps_position.longitude = lon;
+    external_gps_position.altitude = alt;
+    external_gps_position.accuracy = acc;
+    external_gps_position.valid = true;
+
+    if (current_gps_module == GPS_MODULE_EXTERNAL) {
+        gps_sync_from_selected_external_source();
+    }
+
+    MY_LOG_INFO(TAG, "External GPS updated: Lat=%.7f Lon=%.7f Alt=%.2fm Acc=%.2fm",
+                external_gps_position.latitude, external_gps_position.longitude,
+                external_gps_position.altitude, external_gps_position.accuracy);
+
+    if (current_gps_module != GPS_MODULE_EXTERNAL) {
+        MY_LOG_INFO(TAG, "Note: current module is %s. Run 'gps_set external' to use this feed in wardrive.",
+                    gps_get_module_name(current_gps_module));
+    }
+    return 0;
+}
+
+static int cmd_set_gps_position_cap(int argc, char **argv) {
+    if (argc == 1) {
+        external_cap_gps_position.valid = false;
+        if (gps_module_uses_external_cap_feed(current_gps_module)) {
+            gps_sync_from_selected_external_source();
+        }
+        MY_LOG_INFO(TAG, "External CAP GPS fix cleared (no fix).");
+        return 0;
+    }
+
+    if (argc < 3 || argc > 5 || argv[1] == NULL || argv[2] == NULL) {
+        MY_LOG_INFO(TAG, "Usage: set_gps_position_cap <lat> <lon> [alt] [acc]");
+        MY_LOG_INFO(TAG, "Usage: set_gps_position_cap   (no args = lost fix)");
+        return 1;
+    }
+
+    char *endptr = NULL;
+    float lat = strtof(argv[1], &endptr);
+    if (endptr == argv[1] || (endptr != NULL && *endptr != '\0') || !isfinite(lat)) {
+        MY_LOG_INFO(TAG, "Invalid latitude: '%s'", argv[1]);
+        return 1;
+    }
+
+    endptr = NULL;
+    float lon = strtof(argv[2], &endptr);
+    if (endptr == argv[2] || (endptr != NULL && *endptr != '\0') || !isfinite(lon)) {
+        MY_LOG_INFO(TAG, "Invalid longitude: '%s'", argv[2]);
+        return 1;
+    }
+
+    if (lat < -90.0f || lat > 90.0f) {
+        MY_LOG_INFO(TAG, "Latitude out of range (-90..90): %.7f", lat);
+        return 1;
+    }
+    if (lon < -180.0f || lon > 180.0f) {
+        MY_LOG_INFO(TAG, "Longitude out of range (-180..180): %.7f", lon);
+        return 1;
+    }
+
+    float alt = external_cap_gps_position.altitude;
+    float acc = (external_cap_gps_position.accuracy > 0.0f) ? external_cap_gps_position.accuracy : 5.0f;
+
+    if (argc >= 4 && argv[3] != NULL) {
+        endptr = NULL;
+        alt = strtof(argv[3], &endptr);
+        if (endptr == argv[3] || (endptr != NULL && *endptr != '\0') || !isfinite(alt)) {
+            MY_LOG_INFO(TAG, "Invalid altitude: '%s'", argv[3]);
+            return 1;
+        }
+    }
+
+    if (argc >= 5 && argv[4] != NULL) {
+        endptr = NULL;
+        acc = strtof(argv[4], &endptr);
+        if (endptr == argv[4] || (endptr != NULL && *endptr != '\0') || !isfinite(acc) || acc < 0.0f) {
+            MY_LOG_INFO(TAG, "Invalid accuracy: '%s' (must be >= 0)", argv[4]);
+            return 1;
+        }
+    }
+
+    external_cap_gps_position.latitude = lat;
+    external_cap_gps_position.longitude = lon;
+    external_cap_gps_position.altitude = alt;
+    external_cap_gps_position.accuracy = acc;
+    external_cap_gps_position.valid = true;
+
+    if (gps_module_uses_external_cap_feed(current_gps_module)) {
+        gps_sync_from_selected_external_source();
+    }
+
+    MY_LOG_INFO(TAG, "External CAP GPS updated: Lat=%.7f Lon=%.7f Alt=%.2fm Acc=%.2fm",
+                external_cap_gps_position.latitude, external_cap_gps_position.longitude,
+                external_cap_gps_position.altitude, external_cap_gps_position.accuracy);
+
+    if (!gps_module_uses_external_cap_feed(current_gps_module)) {
+        MY_LOG_INFO(TAG, "Note: current module is %s. Run 'gps_set cap' to use this feed in wardrive.",
+                    gps_get_module_name(current_gps_module));
+    }
     return 0;
 }
 
@@ -9763,6 +9984,8 @@ static void wardrive_task(void *pvParameters) {
     
     MY_LOG_INFO(TAG, "Wardrive started. Use 'stop' command to stop.");
     
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+
     // Main wardrive loop (runs until user stops)
     int scan_counter = 0;
     while (wardrive_active && !operation_stop_requested) {
@@ -9773,20 +9996,42 @@ static void wardrive_task(void *pvParameters) {
             wardrive_active = false;
             break;
         }
-        // Read GPS data
-        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
-        if (len > 0) {
-            wardrive_gps_buffer[len] = '\0';
-            char* line = strtok(wardrive_gps_buffer, "\r\n");
-            while (line != NULL) {
-                if (parse_gps_nmea(line)) {
-                    MY_LOG_INFO(TAG, "GPS: Lat=%.7f Lon=%.7f Alt=%.1fm Acc=%.1fm", 
-                               current_gps.latitude, current_gps.longitude, 
-                               current_gps.altitude, current_gps.accuracy);
+        // Read GPS from selected source or pause if external fix is lost.
+        if (external_feed) {
+            gps_sync_from_selected_external_source();
+            if (!current_gps.valid) {
+                MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
+                while (!current_gps.valid && wardrive_active && !operation_stop_requested) {
+                    gps_sync_from_selected_external_source();
+                    vTaskDelay(pdMS_TO_TICKS(200));
                 }
-                line = strtok(NULL, "\r\n");
+                if (operation_stop_requested || !wardrive_active) {
+                    break;
+                }
+                MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
+                            current_gps.latitude, current_gps.longitude);
+            }
+        } else {
+            int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+            if (len > 0) {
+                wardrive_gps_buffer[len] = '\0';
+                char* line = strtok(wardrive_gps_buffer, "\r\n");
+                while (line != NULL) {
+                    if (parse_gps_nmea(line)) {
+                        MY_LOG_INFO(TAG, "GPS: Lat=%.7f Lon=%.7f Alt=%.1fm Acc=%.1fm",
+                                   current_gps.latitude, current_gps.longitude,
+                                   current_gps.altitude, current_gps.accuracy);
+                    }
+                    line = strtok(NULL, "\r\n");
+                }
             }
         }
+
+        float gps_lat = current_gps.latitude;
+        float gps_lon = current_gps.longitude;
+        float gps_alt = current_gps.altitude;
+        float gps_acc = current_gps.accuracy;
+        bool gps_valid_for_cycle = current_gps.valid;
         
         // Scan WiFi networks
         wifi_scan_config_t scan_cfg = {
@@ -9896,13 +10141,12 @@ static void wardrive_task(void *pvParameters) {
             
             // Format line for Wiggle format
             char line[512];
-            if (current_gps.valid) {
+            if (gps_valid_for_cycle) {
                 snprintf(line, sizeof(line), 
                         "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
                         mac_str, escaped_ssid, auth_mode, timestamp,
                         ap->primary, ap->rssi,
-                        current_gps.latitude, current_gps.longitude,
-                        current_gps.altitude, current_gps.accuracy);
+                        gps_lat, gps_lon, gps_alt, gps_acc);
             } else {
                 snprintf(line, sizeof(line), 
                         "%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
@@ -9955,6 +10199,12 @@ static void wardrive_task(void *pvParameters) {
 static int cmd_start_gps_raw(int argc, char **argv) {
     log_memory_info("start_gps_raw");
 
+    if (gps_module_uses_external_feed(current_gps_module)) {
+        MY_LOG_INFO(TAG, "start_gps_raw is unavailable in external GPS modes. Use '%s' instead.",
+                    gps_external_position_command_name(current_gps_module));
+        return 1;
+    }
+
     int baud = gps_get_baud_for_module(current_gps_module);
     if (argc >= 2 && argv[1] != NULL) {
         char *endptr = NULL;
@@ -10004,7 +10254,7 @@ static int cmd_start_gps_raw(int argc, char **argv) {
 
     MY_LOG_INFO(TAG, "GPS raw reader started at %d baud (%s). Use 'stop' to stop.",
                 baud,
-                (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H");
+                gps_get_module_name(current_gps_module));
     return 0;
 }
 
@@ -10032,15 +10282,23 @@ static int cmd_start_wardrive(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "Starting wardrive mode...");
     
-    // Initialize GPS UART
-    int wardrive_baud = gps_get_baud_for_module(current_gps_module);
-    esp_err_t ret = init_gps_uart(wardrive_baud);
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
-        return 1;
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+
+    // Initialize GPS source
+    esp_err_t ret = ESP_OK;
+    if (!external_feed) {
+        int wardrive_baud = gps_get_baud_for_module(current_gps_module);
+        ret = init_gps_uart(wardrive_baud);
+        if (ret != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
+            return 1;
+        }
+        MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
+                    GPS_TX_PIN, GPS_RX_PIN, wardrive_baud);
+    } else {
+        MY_LOG_INFO(TAG, "Using external GPS feed. Provide fixes via '%s'.",
+                    gps_external_position_command_name(current_gps_module));
     }
-    MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
-                GPS_TX_PIN, GPS_RX_PIN, wardrive_baud);
     
     // Initialize SD card
     ret = init_sd_card();
@@ -12233,12 +12491,30 @@ static void register_commands(void)
 
     const esp_console_cmd_t gps_set_cmd = {
         .command = "gps_set",
-        .help = "Select GPS module: gps_set <m5|atgm>",
-        .hint = "<m5|atgm>",
+        .help = "Select GPS module: gps_set <m5|atgm|external|cap> (usb alias for external)",
+        .hint = "<m5|atgm|external|cap>",
         .func = &cmd_gps_set,
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&gps_set_cmd));
+
+    const esp_console_cmd_t set_gps_position_cmd = {
+        .command = "set_gps_position",
+        .help = "Set external GPS fix: set_gps_position <lat> <lon> [alt] [acc] | no args = lost fix",
+        .hint = "[lat lon [alt] [acc]]",
+        .func = &cmd_set_gps_position,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_gps_position_cmd));
+
+    const esp_console_cmd_t set_gps_position_cap_cmd = {
+        .command = "set_gps_position_cap",
+        .help = "Set external CAP GPS fix: set_gps_position_cap <lat> <lon> [alt] [acc] | no args = lost fix",
+        .hint = "[lat lon [alt] [acc]]",
+        .func = &cmd_set_gps_position_cap,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_gps_position_cap_cmd));
 
     const esp_console_cmd_t wardrive_cmd = {
         .command = "start_wardrive",
@@ -12592,7 +12868,7 @@ void app_main(void) {
     gps_load_state_from_nvs();
     led_load_state_from_nvs();
     MY_LOG_INFO(TAG, "GPS module: %s (baud %d)",
-                (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H",
+                gps_get_module_name(current_gps_module),
                 gps_get_baud_for_module(current_gps_module));
 
     //printf("Step 4: Init LED strip\n");
@@ -12698,7 +12974,9 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_sniffer_noscan");
       MY_LOG_INFO(TAG,"  start_sniffer_dog");
       MY_LOG_INFO(TAG,"  start_gps_raw");
-      MY_LOG_INFO(TAG,"  gps_set <m5|atgm>");
+      MY_LOG_INFO(TAG,"  gps_set <m5|atgm|external|cap>");
+      MY_LOG_INFO(TAG,"  set_gps_position <lat> <lon> [alt] [acc]");
+      MY_LOG_INFO(TAG,"  set_gps_position_cap <lat> <lon> [alt] [acc]");
       MY_LOG_INFO(TAG,"  start_wardrive");
       MY_LOG_INFO(TAG,"  stop");
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
@@ -14203,10 +14481,52 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
 
 // === WARDRIVE HELPER FUNCTIONS ===
 
+static const char *gps_get_module_name(gps_module_t module) {
+    switch (module) {
+        case GPS_MODULE_M5STACK_GPS_V11:
+            return "M5StackGPS1.1";
+        case GPS_MODULE_EXTERNAL:
+            return "External";
+        case GPS_MODULE_EXTERNAL_CAP:
+            return "ExternalCap";
+        case GPS_MODULE_ATGM336H:
+        default:
+            return "ATGM336H";
+    }
+}
+
+static bool gps_module_uses_external_feed(gps_module_t module) {
+    return (module == GPS_MODULE_EXTERNAL || module == GPS_MODULE_EXTERNAL_CAP);
+}
+
+static bool gps_module_uses_external_cap_feed(gps_module_t module) {
+    return module == GPS_MODULE_EXTERNAL_CAP;
+}
+
+static const char *gps_external_position_command_name(gps_module_t module) {
+    return gps_module_uses_external_cap_feed(module) ? "set_gps_position_cap" : "set_gps_position";
+}
+
+static void gps_sync_from_selected_external_source(void) {
+    if (!gps_module_uses_external_feed(current_gps_module)) {
+        return;
+    }
+
+    if (gps_module_uses_external_cap_feed(current_gps_module)) {
+        current_gps = external_cap_gps_position;
+    } else {
+        current_gps = external_gps_position;
+    }
+}
+
 static int gps_get_baud_for_module(gps_module_t module) {
     switch (module) {
         case GPS_MODULE_M5STACK_GPS_V11:
             return GPS_BAUD_M5STACK;
+        case GPS_MODULE_EXTERNAL:
+        case GPS_MODULE_EXTERNAL_CAP:
+            // In external mode wardrive does not read GPS UART. Keep safe fallback.
+            return GPS_BAUD_ATGM336H;
         case GPS_MODULE_ATGM336H:
         default:
             return GPS_BAUD_ATGM336H;
@@ -14285,7 +14605,7 @@ static void gps_load_state_from_nvs(void) {
     uint8_t module_val = (uint8_t)current_gps_module;
     err = nvs_get_u8(handle, GPS_NVS_KEY_MODULE, &module_val);
     nvs_close(handle);
-    if (err == ESP_OK && module_val <= GPS_MODULE_M5STACK_GPS_V11) {
+    if (err == ESP_OK && module_val <= GPS_MODULE_EXTERNAL_CAP) {
         current_gps_module = (gps_module_t)module_val;
     }
 }
@@ -14582,11 +14902,20 @@ static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode) {
 
 static bool wait_for_gps_fix(int timeout_seconds) {
     int elapsed = 0;
-    current_gps.valid = false;
     bool infinite = (timeout_seconds <= 0);
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+
+    if (!external_feed) {
+        current_gps.valid = false;
+    }
     
-    if (infinite) {
+    if (infinite && external_feed) {
+        MY_LOG_INFO(TAG, "Waiting for GPS fix (external feed, no timeout, use '%s' or 'stop')...",
+                    gps_external_position_command_name(current_gps_module));
+    } else if (infinite) {
         MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout, use 'stop' to cancel)...");
+    } else if (external_feed) {
+        MY_LOG_INFO(TAG, "Waiting for GPS fix (external feed, timeout: %d seconds)...", timeout_seconds);
     } else {
         MY_LOG_INFO(TAG, "Waiting for GPS fix (timeout: %d seconds)...", timeout_seconds);
     }
@@ -14597,28 +14926,44 @@ static bool wait_for_gps_fix(int timeout_seconds) {
             MY_LOG_INFO(TAG, "GPS wait: Stop requested, terminating...");
             return false;
         }
-        
-        // Read GPS data
-        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
-        if (len > 0) {
-            wardrive_gps_buffer[len] = '\0';
-            char* line = strtok(wardrive_gps_buffer, "\r\n");
-            while (line != NULL) {
-                if (parse_gps_nmea(line)) {
-                    if (current_gps.valid) {
-                        return true;  // GPS fix obtained
+
+        if (external_feed) {
+            gps_sync_from_selected_external_source();
+            if (current_gps.valid) {
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        } else {
+            // Read GPS data from UART/NMEA source
+            int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
+            if (len > 0) {
+                wardrive_gps_buffer[len] = '\0';
+                char* line = strtok(wardrive_gps_buffer, "\r\n");
+                while (line != NULL) {
+                    if (parse_gps_nmea(line)) {
+                        if (current_gps.valid) {
+                            return true;  // GPS fix obtained
+                        }
                     }
+                    line = strtok(NULL, "\r\n");
                 }
-                line = strtok(NULL, "\r\n");
             }
         }
         
         elapsed++;
         if (elapsed % 10 == 0) {  // Print status every 10 seconds
             if (infinite) {
-                MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d seconds)", elapsed);
+                if (external_feed) {
+                    MY_LOG_INFO(TAG, "Still waiting for GPS fix (external feed)... (%d seconds)", elapsed);
+                } else {
+                    MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d seconds)", elapsed);
+                }
             } else {
-                MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d/%d seconds)", elapsed, timeout_seconds);
+                if (external_feed) {
+                    MY_LOG_INFO(TAG, "Still waiting for GPS fix (external feed)... (%d/%d seconds)", elapsed, timeout_seconds);
+                } else {
+                    MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d/%d seconds)", elapsed, timeout_seconds);
+                }
             }
         }
     }
