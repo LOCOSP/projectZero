@@ -58,6 +58,8 @@ static _lock_t lvgl_api_lock;
 static lv_display_t *s_display = NULL;
 static lv_obj_t     *s_label_line1 = NULL;
 static lv_obj_t     *s_label_line2 = NULL;
+static lv_obj_t     *s_label_line3 = NULL;
+static lv_obj_t     *s_label_line4 = NULL;
 
 /* ── Flush callback: convert LVGL I1 bitmap → SSD1306 page format ───── */
 static void oled_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
@@ -125,7 +127,7 @@ static void lvgl_task(void *arg)
     }
 }
 
-/* ── Build the two-line UI ───────────────────────────────────────────── */
+/* ── Build the four-line UI ──────────────────────────────────────────── */
 static void build_ui(lv_display_t *disp)
 {
     lv_obj_t *scr = lv_display_get_screen_active(disp);
@@ -135,23 +137,41 @@ static void build_ui(lv_display_t *disp)
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(scr, 0, 0);
 
-    /* Line 1 – command / mode name (top, crisp 8px bitmap font) */
+    /* Line 1 – command / mode title (Y=0, clipped) */
     s_label_line1 = lv_label_create(scr);
     lv_label_set_long_mode(s_label_line1, LV_LABEL_LONG_CLIP);
     lv_obj_set_width(s_label_line1, OLED_H_RES);
     lv_obj_set_style_text_font(s_label_line1, &lv_font_unscii_8, 0);
     lv_obj_set_style_text_color(s_label_line1, lv_color_white(), 0);
     lv_obj_align(s_label_line1, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_label_set_text(s_label_line1, "JanOS");
+    lv_label_set_text(s_label_line1, "> JanOS");
 
-    /* Line 2 – SSID / parameter (below line 1) */
+    /* Line 2 – target / SSID (Y=14, circular scroll for long names) */
     s_label_line2 = lv_label_create(scr);
     lv_label_set_long_mode(s_label_line2, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_width(s_label_line2, OLED_H_RES);
     lv_obj_set_style_text_font(s_label_line2, &lv_font_unscii_8, 0);
     lv_obj_set_style_text_color(s_label_line2, lv_color_white(), 0);
-    lv_obj_align(s_label_line2, LV_ALIGN_TOP_LEFT, 0, 12);
-    lv_label_set_text(s_label_line2, "Ready");
+    lv_obj_align(s_label_line2, LV_ALIGN_TOP_LEFT, 0, 14);
+    lv_label_set_text(s_label_line2, "  Booting...");
+
+    /* Line 3 – detail info (Y=28, circular scroll) */
+    s_label_line3 = lv_label_create(scr);
+    lv_label_set_long_mode(s_label_line3, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(s_label_line3, OLED_H_RES);
+    lv_obj_set_style_text_font(s_label_line3, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(s_label_line3, lv_color_white(), 0);
+    lv_obj_align(s_label_line3, LV_ALIGN_TOP_LEFT, 0, 28);
+    lv_label_set_text(s_label_line3, "");
+
+    /* Line 4 – status footer (Y=48, clipped) */
+    s_label_line4 = lv_label_create(scr);
+    lv_label_set_long_mode(s_label_line4, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(s_label_line4, OLED_H_RES);
+    lv_obj_set_style_text_font(s_label_line4, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(s_label_line4, lv_color_white(), 0);
+    lv_obj_align(s_label_line4, LV_ALIGN_TOP_LEFT, 0, 48);
+    lv_label_set_text(s_label_line4, "");
 }
 
 /* ══════════════════════════════════════════════════════════════════════ */
@@ -251,6 +271,13 @@ void oled_display_init(void)
 
 void oled_display_update(const char *line1, const char *line2)
 {
+    /* Legacy 2-line call clears bottom two lines */
+    oled_display_update_full(line1, line2, "", "");
+}
+
+void oled_display_update_full(const char *line1, const char *line2,
+                              const char *line3, const char *line4)
+{
     if (!s_display) return;          /* init not called yet */
 
     _lock_acquire(&lvgl_api_lock);
@@ -260,5 +287,16 @@ void oled_display_update(const char *line1, const char *line2)
     if (line2 && s_label_line2) {
         lv_label_set_text(s_label_line2, line2);
     }
+    if (line3 && s_label_line3) {
+        lv_label_set_text(s_label_line3, line3);
+    }
+    if (line4 && s_label_line4) {
+        lv_label_set_text(s_label_line4, line4);
+    }
     _lock_release(&lvgl_api_lock);
+}
+
+void oled_display_clear(void)
+{
+    oled_display_update_full("", "", "", "");
 }
