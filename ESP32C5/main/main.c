@@ -46,6 +46,7 @@
 #include "esp_random.h"
 #include "mbedtls/ecp.h"
 #include "mbedtls/bignum.h"
+#include "mbedtls/base64.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
 #include "esp_timer.h"
@@ -349,6 +350,7 @@ static TaskHandle_t wardrive_task_handle = NULL;
 static TaskHandle_t handshake_attack_task_handle = NULL;
 static volatile bool handshake_attack_active = false;
 static bool handshake_selected_mode = false; // true if networks were selected, false for scan-all mode
+static bool handshake_serial_mode = false;   // true = dump pcap/hccapx via serial (base64) instead of SD
 static wifi_ap_record_t *handshake_targets = NULL;          // ~6.4 KB in PSRAM
 static int handshake_target_count = 0;
 static bool handshake_captured[MAX_AP_CNT]; // Track which networks have captured handshakes
@@ -1182,6 +1184,7 @@ static int cmd_unselect_stations(int argc, char **argv);
 static int cmd_start_beacon_spam(int argc, char **argv);
 static int cmd_start_evil_twin(int argc, char **argv);
 static int cmd_start_handshake(int argc, char **argv);
+static int cmd_start_handshake_serial(int argc, char **argv);
 static int cmd_save_handshake(int argc, char **argv);
 static int cmd_start_gps_raw(int argc, char **argv);
 static int cmd_gps_set(int argc, char **argv);
@@ -4826,16 +4829,138 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
     }
 }
 
+// ============================================================================
+// Serial PCAP/HCCAPX dump helpers (start_handshake_serial output)
+// ============================================================================
+
+/**
+ * @brief Base64-encode binary data and print over serial with markers.
+ *
+ * Output format:
+ *   <begin_marker>
+ *   <base64 lines, 76 chars each>
+ *   <end_marker>
+ */
+static void dump_base64_serial(const char *begin_marker, const char *end_marker,
+                               const uint8_t *data, size_t len) {
+    printf("%s\n", begin_marker);
+
+    // Calculate required buffer size for base64 encoding
+    size_t encoded_len = 0;
+    mbedtls_base64_encode(NULL, 0, &encoded_len, data, len);
+
+    uint8_t *encoded = malloc(encoded_len + 1);
+    if (!encoded) {
+        printf("ERROR: malloc failed for base64 (%u bytes)\n", (unsigned)encoded_len);
+        printf("%s\n", end_marker);
+        return;
+    }
+
+    size_t olen = 0;
+    int ret = mbedtls_base64_encode(encoded, encoded_len + 1, &olen, data, len);
+    if (ret != 0) {
+        printf("ERROR: base64 encode failed (%d)\n", ret);
+        free(encoded);
+        printf("%s\n", end_marker);
+        return;
+    }
+
+    // Print in 76-character lines (standard base64 line length)
+    for (size_t i = 0; i < olen; i += 76) {
+        size_t chunk = (olen - i > 76) ? 76 : (olen - i);
+        printf("%.*s\n", (int)chunk, (char *)(encoded + i));
+    }
+
+    free(encoded);
+    printf("%s\n", end_marker);
+}
+
+/**
+ * @brief Dump captured handshake data as base64 over serial.
+ *
+ * Outputs PCAP and HCCAPX buffers with markers that the Python app
+ * (loot_manager.py) can parse. Also prints SSID/AP metadata.
+ *
+ * Expected format parsed by Python side:
+ *   --- PCAP BEGIN ---
+ *   <base64 lines>
+ *   --- PCAP END ---
+ *   PCAP_SIZE: <N>
+ *   --- HCCAPX BEGIN ---
+ *   <base64 lines>
+ *   --- HCCAPX END ---
+ *   SSID: <ssid>  AP: <XX:XX:XX:XX:XX:XX>
+ */
+static void handshake_dump_serial(void) {
+    MY_LOG_INFO(TAG, "Dumping handshake data via serial (base64)...");
+
+    // Get PCAP buffer (contains all captured frames)
+    unsigned pcap_size = 0;
+    uint8_t *pcap_buf = attack_handshake_get_pcap(&pcap_size);
+
+    if (!pcap_buf || pcap_size == 0) {
+        MY_LOG_INFO(TAG, "No PCAP data captured - nothing to dump");
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "PCAP buffer: %u bytes", pcap_size);
+
+    // Dump PCAP as base64
+    dump_base64_serial("--- PCAP BEGIN ---", "--- PCAP END ---", pcap_buf, pcap_size);
+    printf("PCAP_SIZE: %u\n", pcap_size);
+
+    // Dump HCCAPX as base64 (if available)
+    hccapx_t *hccapx = (hccapx_t *)attack_handshake_get_hccapx();
+    if (hccapx && hccapx->essid_len > 0) {
+        dump_base64_serial("--- HCCAPX BEGIN ---", "--- HCCAPX END ---",
+                           (const uint8_t *)hccapx, sizeof(hccapx_t));
+
+        // Print SSID and AP MAC metadata (for Python-side filename generation)
+        char ssid[33] = {0};
+        memcpy(ssid, hccapx->essid, hccapx->essid_len);
+        printf("SSID: %s  AP: %02X:%02X:%02X:%02X:%02X:%02X\n",
+               ssid,
+               hccapx->mac_ap[0], hccapx->mac_ap[1], hccapx->mac_ap[2],
+               hccapx->mac_ap[3], hccapx->mac_ap[4], hccapx->mac_ap[5]);
+    }
+
+    // Also log all captured APs from sniffer mode
+    if (!handshake_selected_mode && hs_ap_count > 0) {
+        int captured = 0;
+        for (int i = 0; i < hs_ap_count; i++) {
+            if (hs_ap_targets[i].complete) {
+                MY_LOG_INFO(TAG, "Captured: SSID='%s' BSSID=%02X:%02X:%02X:%02X:%02X:%02X Ch=%d",
+                    hs_ap_targets[i].ssid,
+                    hs_ap_targets[i].bssid[0], hs_ap_targets[i].bssid[1],
+                    hs_ap_targets[i].bssid[2], hs_ap_targets[i].bssid[3],
+                    hs_ap_targets[i].bssid[4], hs_ap_targets[i].bssid[5],
+                    hs_ap_targets[i].channel);
+                captured++;
+            }
+        }
+        MY_LOG_INFO(TAG, "Total APs discovered: %d, handshakes captured: %d", hs_ap_count, captured);
+    }
+
+    MY_LOG_INFO(TAG, "Serial PCAP dump complete.");
+}
+
 // Cleanup function for handshake attack
 static void handshake_cleanup(void) {
     MY_LOG_INFO(TAG, "Handshake attack cleanup...");
     
     // Stop any active handshake attack (selected mode uses this)
     attack_handshake_stop();
-    
+
     // Disable promiscuous mode (sniffer mode uses this)
     esp_wifi_set_promiscuous(false);
-    
+
+    // If serial mode, dump PCAP/HCCAPX via serial BEFORE resetting state
+    // (hs_ap_targets still holds captured AP info at this point)
+    if (handshake_serial_mode) {
+        handshake_dump_serial();
+        handshake_serial_mode = false;
+    }
+
     // Reset state
     handshake_attack_active = false;
     handshake_attack_task_handle = NULL;
@@ -5100,33 +5225,71 @@ static void handshake_attack_task_sniffer(void) {
         double reward = (double)hs_dwell_new_clients + 3.0 * (double)hs_dwell_eapol_frames;
         ducb_update(ch_idx, reward);
         
-        // Check for completed handshakes and save
+        // Check for completed handshakes and save (SD or serial)
         for (int i = 0; i < hs_ap_count; i++) {
             hs_ap_target_t *ap = &hs_ap_targets[i];
             if (ap->complete && !ap->has_existing_file) {
                 MY_LOG_INFO(TAG, "Saving complete handshake for '%s'...", ap->ssid);
-                // Re-init HCCAPX for this AP before save
-                size_t ssid_len = strlen(ap->ssid);
-                hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
-                
-                if (hs_save_handshake_to_sd(i)) {
+
+                if (handshake_serial_mode) {
+                    // Serial mode: dump PCAP/HCCAPX via serial as base64
+                    // NOTE: dump BEFORE hccapx_serializer_init() which resets message_pair
+                    unsigned pcap_size = 0;
+                    uint8_t *pcap_buf = attack_handshake_get_pcap(&pcap_size);
+                    if (pcap_buf && pcap_size > 0) {
+                        dump_base64_serial("--- PCAP BEGIN ---", "--- PCAP END ---",
+                                           pcap_buf, pcap_size);
+                        printf("PCAP_SIZE: %u\n", pcap_size);
+                    }
+                    // Get HCCAPX before re-init (message_pair is still valid from capture)
+                    hccapx_t *hccapx = (hccapx_t *)attack_handshake_get_hccapx();
+                    if (hccapx) {
+                        dump_base64_serial("--- HCCAPX BEGIN ---", "--- HCCAPX END ---",
+                                           (const uint8_t *)hccapx, sizeof(hccapx_t));
+                    }
+                    // Print SSID/AP metadata from hs_ap_targets (always reliable)
+                    printf("SSID: %s  AP: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                           ap->ssid,
+                           ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                           ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+
                     ap->has_existing_file = true;
                     total_handshakes_captured++;
-                    // Tab5 parses: strstr("Handshake #") && strstr("captured")
-                    MY_LOG_INFO(TAG, "Handshake #%d captured! (APs: %d, Clients: %d)",
+                    MY_LOG_INFO(TAG, "Handshake #%d sent via serial! (APs: %d, Clients: %d)",
                                total_handshakes_captured, hs_ap_count, hs_client_count);
-                    
-                    // Re-init PCAP after save to free memory and start fresh
+
+                    // Re-init serializers for next AP
                     pcap_serializer_init();
-                    // Re-capture beacons for remaining APs
+                    hccapx_serializer_init((const uint8_t *)"", 0);
                     for (int j = 0; j < hs_ap_count; j++) {
                         if (!hs_ap_targets[j].complete && !hs_ap_targets[j].has_existing_file) {
-                            hs_ap_targets[j].beacon_captured = false; // Will be re-captured
+                            hs_ap_targets[j].beacon_captured = false;
                         }
                     }
                 } else {
-                    // Tab5 parses: strstr("No handshake for")
-                    MY_LOG_INFO(TAG, "No handshake for '%s' - save failed", ap->ssid);
+                    // SD mode: re-init HCCAPX for this AP, then save to SD
+                    size_t ssid_len = strlen(ap->ssid);
+                    hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
+
+                    if (hs_save_handshake_to_sd(i)) {
+                        ap->has_existing_file = true;
+                        total_handshakes_captured++;
+                        // Tab5 parses: strstr("Handshake #") && strstr("captured")
+                        MY_LOG_INFO(TAG, "Handshake #%d captured! (APs: %d, Clients: %d)",
+                                   total_handshakes_captured, hs_ap_count, hs_client_count);
+
+                        // Re-init PCAP after save to free memory and start fresh
+                        pcap_serializer_init();
+                        // Re-capture beacons for remaining APs
+                        for (int j = 0; j < hs_ap_count; j++) {
+                            if (!hs_ap_targets[j].complete && !hs_ap_targets[j].has_existing_file) {
+                                hs_ap_targets[j].beacon_captured = false; // Will be re-captured
+                            }
+                        }
+                    } else {
+                        // Tab5 parses: strstr("No handshake for")
+                        MY_LOG_INFO(TAG, "No handshake for '%s' - save failed", ap->ssid);
+                    }
                 }
             }
         }
@@ -5336,6 +5499,71 @@ static int cmd_save_handshake(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Make sure you captured all 4 messages of the handshake");
         return 1;
     }
+}
+
+// ============================================================================
+// start_handshake_serial — handshake capture with serial PCAP output (no SD)
+// ============================================================================
+
+static int cmd_start_handshake_serial(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+
+    // Enable AP mode for raw frame injection (deauth packets)
+    if (!ensure_ap_mode()) {
+        MY_LOG_INFO(TAG, "Failed to enable AP mode for deauth injection");
+        return 1;
+    }
+
+    // Check if handshake attack is already running
+    if (handshake_attack_active || handshake_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Handshake attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    // Reset stop flag
+    operation_stop_requested = false;
+
+    // Initialize state
+    handshake_target_count = 0;
+    handshake_current_index = 0;
+    memset(handshake_targets, 0, MAX_AP_CNT * sizeof(wifi_ap_record_t));
+    memset(handshake_captured, 0, sizeof(handshake_captured));
+
+    // Force sniffer + D-UCB mode (attack all visible networks, no selection needed)
+    handshake_selected_mode = false;
+    // Enable serial output mode — cleanup will dump PCAP/HCCAPX as base64
+    handshake_serial_mode = true;
+
+    MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - Serial PCAP Mode");
+    MY_LOG_INFO(TAG, "No SD card needed — PCAP/HCCAPX will be sent via serial (base64)");
+    MY_LOG_INFO(TAG, "Using Sniffer + D-UCB mode: all visible networks");
+    MY_LOG_INFO(TAG, "Will run until 'stop' command");
+    MY_LOG_INFO(TAG, "Python app will parse and save .pcap/.hccapx files automatically");
+
+    // Start handshake attack task
+    handshake_attack_active = true;
+    BaseType_t result = xTaskCreate(
+        handshake_attack_task,
+        "hs_serial",
+        12288,  // Stack size
+        NULL,
+        5,      // Priority
+        &handshake_attack_task_handle
+    );
+
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create handshake attack task!");
+        handshake_attack_active = false;
+        handshake_serial_mode = false;
+        return 1;
+    }
+
+    return 0;
 }
 
 // --------------- WPA-SEC commands ---------------
@@ -12176,6 +12404,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&save_handshake_cmd));
+
+    const esp_console_cmd_t handshake_serial_cmd = {
+        .command = "start_handshake_serial",
+        .help = "Captures WPA handshakes (sniffer mode) and dumps PCAP/HCCAPX as base64 via serial. No SD card needed.",
+        .hint = NULL,
+        .func = &cmd_start_handshake_serial,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&handshake_serial_cmd));
 
     const esp_console_cmd_t wpasec_key_cmd = {
         .command = "wpasec_key",
