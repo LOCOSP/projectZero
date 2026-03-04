@@ -129,6 +129,9 @@
 #define WPASEC_URL           "https://wpa-sec.stanev.org/"
 #define WPASEC_KEY_MAX_LEN   65
 
+#define DISPLAY_NVS_NAMESPACE "display"
+#define DISPLAY_NVS_KEY_MODE  "mode"
+
 
 
 #define NEOPIXEL_GPIO      27
@@ -1178,6 +1181,7 @@ static bool vendor_last_valid = false;
 static bool vendor_last_hit = false;
 static bool vendor_lookup_enabled = false;
 static size_t vendor_record_count = 0;
+static display_type_t display_forced_mode = DISPLAY_NONE; /* DISPLAY_NONE = auto */
 
 
 // Methods forward declarations
@@ -1229,6 +1233,7 @@ static void arp_ban_task(void *pvParameters);
 static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
+static int cmd_display(int argc, char **argv);
 static int cmd_download(int argc, char **argv);
 static int cmd_wpasec_key(int argc, char **argv);
 static int cmd_wpasec_upload(int argc, char **argv);
@@ -1258,6 +1263,10 @@ static bool check_handshake_file_exists(const char *ssid);
 static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid);
 static void handshake_cleanup(void);
 static void attack_network_with_burst(const wifi_ap_record_t *ap);
+static const char *display_mode_to_str(display_type_t mode);
+static bool display_mode_from_str(const char *s, display_type_t *out_mode);
+static void display_mode_load_from_nvs(void);
+static void display_mode_save_to_nvs(display_type_t mode);
 // D-UCB and sniffer handshake helpers
 static void ducb_init(void);
 static int ducb_select_channel(void);
@@ -3026,6 +3035,104 @@ static esp_err_t vendor_set_enabled(bool enabled) {
     vendor_record_count = 0;
     vendor_persist_state();
     return ESP_OK;
+}
+
+static const char *display_mode_to_str(display_type_t mode)
+{
+    switch (mode) {
+    case DISPLAY_SSD1306: return "ssd1306";
+    case DISPLAY_SH1107:  return "sh1107";
+    case DISPLAY_SH1106:  return "sh1106";
+    case DISPLAY_UNIT_LCD:return "unit_lcd";
+    case DISPLAY_NONE:
+    default:
+        return "auto";
+    }
+}
+
+static bool display_mode_from_str(const char *s, display_type_t *out_mode)
+{
+    if (!s || !out_mode) return false;
+    if (strcasecmp(s, "auto") == 0) {
+        *out_mode = DISPLAY_NONE;
+        return true;
+    }
+    if (strcasecmp(s, "ssd1306") == 0) {
+        *out_mode = DISPLAY_SSD1306;
+        return true;
+    }
+    if (strcasecmp(s, "sh1107") == 0) {
+        *out_mode = DISPLAY_SH1107;
+        return true;
+    }
+    if (strcasecmp(s, "sh1106") == 0) {
+        *out_mode = DISPLAY_SH1106;
+        return true;
+    }
+    if (strcasecmp(s, "unit_lcd") == 0 || strcasecmp(s, "lcd") == 0) {
+        *out_mode = DISPLAY_UNIT_LCD;
+        return true;
+    }
+    return false;
+}
+
+static void display_mode_save_to_nvs(display_type_t mode)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DISPLAY_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_u8(handle, DISPLAY_NVS_KEY_MODE, (uint8_t)mode);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS write failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static void display_mode_load_from_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DISPLAY_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS read open failed: %s", esp_err_to_name(err));
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+
+    uint8_t raw = (uint8_t)DISPLAY_NONE;
+    err = nvs_get_u8(handle, DISPLAY_NVS_KEY_MODE, &raw);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS get failed: %s", esp_err_to_name(err));
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+
+    switch ((display_type_t)raw) {
+    case DISPLAY_NONE:
+    case DISPLAY_SSD1306:
+    case DISPLAY_SH1107:
+    case DISPLAY_SH1106:
+    case DISPLAY_UNIT_LCD:
+        display_forced_mode = (display_type_t)raw;
+        break;
+    default:
+        display_forced_mode = DISPLAY_NONE;
+        break;
+    }
 }
 
 static bool boot_is_command_allowed(const char* command) {
@@ -9388,6 +9495,54 @@ static int cmd_vendor(int argc, char **argv) {
     return 1;
 }
 
+static int cmd_display(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        display_type_t detected = oled_display_get_type();
+        const char *detected_name = "none";
+        switch (detected) {
+            case DISPLAY_SSD1306: detected_name = "ssd1306"; break;
+            case DISPLAY_SH1107: detected_name = "sh1107"; break;
+            case DISPLAY_SH1106: detected_name = "sh1106"; break;
+            case DISPLAY_UNIT_LCD: detected_name = "unit_lcd"; break;
+            case DISPLAY_NONE:
+            default: detected_name = "none"; break;
+        }
+        MY_LOG_INFO(TAG, "Display mode: %s", display_mode_to_str(display_forced_mode));
+        MY_LOG_INFO(TAG, "Detected now: %s (addr raw 0x%02X / 7-bit 0x%02X)",
+                    detected_name,
+                    (int)oled_display_get_i2c_addr_raw(),
+                    (int)oled_display_get_i2c_addr_7bit());
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd>");
+            return 1;
+        }
+        display_type_t mode = DISPLAY_NONE;
+        if (!display_mode_from_str(argv[2], &mode)) {
+            MY_LOG_INFO(TAG, "Unknown mode '%s'. Use: auto|ssd1306|sh1107|sh1106|unit_lcd", argv[2]);
+            return 1;
+        }
+        display_forced_mode = mode;
+        oled_display_set_forced_type(display_forced_mode);
+        display_mode_save_to_nvs(display_forced_mode);
+        MY_LOG_INFO(TAG, "Display mode saved: %s", display_mode_to_str(display_forced_mode));
+        MY_LOG_INFO(TAG, "Reboot required to re-initialize display driver");
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
+    return 1;
+}
+
 // Command: start_karma - Starts portal with SSID from probe list
 static int cmd_start_karma(int argc, char **argv)
 {
@@ -12751,6 +12906,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&vendor_cmd));
 
+    const esp_console_cmd_t display_cmd = {
+        .command = "display",
+        .help = "Display mode: display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read",
+        .hint = NULL,
+        .func = &cmd_display,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&display_cmd));
+
     const esp_console_cmd_t boot_button_cmd = {
         .command = "boot_button",
         .help = "Configure boot button actions: boot_button read|list|set <short|long> <command>|status <short|long> <on|off>",
@@ -13037,17 +13201,90 @@ void app_main(void) {
     printf("PSRAM support disabled in config\n");
 #endif
 
-    // Initialize OLED display (SSD1306 128x64 via I2C + LVGL)
+    // NVS must be ready before loading persisted display mode.
+    ESP_ERROR_CHECK(nvs_flash_init());
+    display_mode_load_from_nvs();
+    oled_display_set_forced_type(display_forced_mode);
+    MY_LOG_INFO(TAG, "Display mode configured: %s", display_mode_to_str(display_forced_mode));
+
+    // Initialize display module (auto-detect SSD1306 / SH1107 / SH1106 / Unit LCD)
     oled_display_init();
+    {
+        const char *display_name = "NONE";
+        char display_desc[64];
+        int disp_addr7 = oled_display_get_i2c_addr_7bit();
+        int disp_addr_raw = oled_display_get_i2c_addr_raw();
+        snprintf(display_desc, sizeof(display_desc), "not detected");
+        switch (oled_display_get_type()) {
+            case DISPLAY_SSD1306:
+                display_name = "SSD1306";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1107:
+                display_name = "SH1107";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1106:
+                display_name = "SH1106";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_UNIT_LCD:
+                display_name = "UNIT_LCD";
+                snprintf(display_desc, sizeof(display_desc), "addr 0x%02X", disp_addr7);
+                break;
+            case DISPLAY_NONE:
+            default:
+                display_name = "NONE";
+                snprintf(display_desc, sizeof(display_desc), "check display wiring / I2C");
+                break;
+        }
+        MY_LOG_INFO(TAG, "Display auto-detect: %s (%s)", display_name, display_desc);
+    }
     oled_display_update_full("> JanOS v" JANOS_VERSION, "  Booting...", "", "");
     vTaskDelay(pdMS_TO_TICKS(80));
 
 //     printf("Step 3: Init NVS\n");
-    ESP_ERROR_CHECK(nvs_flash_init());
     ota_load_channel_from_nvs();
     wpasec_load_key_from_nvs();
     ota_mark_valid_if_pending();
     ota_log_boot_info();
+    {
+        const char *display_name = "NONE";
+        char display_desc[64];
+        int disp_addr7 = oled_display_get_i2c_addr_7bit();
+        int disp_addr_raw = oled_display_get_i2c_addr_raw();
+        snprintf(display_desc, sizeof(display_desc), "not detected");
+        switch (oled_display_get_type()) {
+            case DISPLAY_SSD1306:
+                display_name = "SSD1306";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1107:
+                display_name = "SH1107";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1106:
+                display_name = "SH1106";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_UNIT_LCD:
+                display_name = "UNIT_LCD";
+                snprintf(display_desc, sizeof(display_desc), "addr 0x%02X", disp_addr7);
+                break;
+            case DISPLAY_NONE:
+            default:
+                display_name = "NONE";
+                snprintf(display_desc, sizeof(display_desc), "check display wiring / I2C");
+                break;
+        }
+        MY_LOG_INFO(TAG, "POST Display auto-detect: %s (%s)", display_name, display_desc);
+    }
     //printf("NVS initialized OK\n");
 
     channel_time_load_state_from_nvs();
@@ -13122,6 +13359,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  channel_view");
       MY_LOG_INFO(TAG,"  deauth_detector");
       MY_LOG_INFO(TAG,"  download");
+      MY_LOG_INFO(TAG,"  display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
       MY_LOG_INFO(TAG,"  file_delete <path>");
       MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
       MY_LOG_INFO(TAG,"  list_dir <path>");
