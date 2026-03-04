@@ -4947,12 +4947,19 @@ static void handshake_dump_serial(void) {
 // Cleanup function for handshake attack
 static void handshake_cleanup(void) {
     MY_LOG_INFO(TAG, "Handshake attack cleanup...");
-    
+
     // Stop any active handshake attack (selected mode uses this)
     attack_handshake_stop();
 
     // Disable promiscuous mode (sniffer mode uses this)
     esp_wifi_set_promiscuous(false);
+
+    // Mark task as finished BEFORE serial dump — cmd_stop() waits for
+    // task_handle == NULL and will force-kill the task after 1s timeout.
+    // The base64 serial dump takes ~1s, so we must clear the handle first
+    // to prevent cmd_stop() from killing us mid-dump.
+    handshake_attack_active = false;
+    handshake_attack_task_handle = NULL;
 
     // If serial mode, dump PCAP/HCCAPX via serial BEFORE resetting state
     // (hs_ap_targets still holds captured AP info at this point)
@@ -4960,10 +4967,6 @@ static void handshake_cleanup(void) {
         handshake_dump_serial();
         handshake_serial_mode = false;
     }
-
-    // Reset state
-    handshake_attack_active = false;
-    handshake_attack_task_handle = NULL;
     handshake_target_count = 0;
     handshake_current_index = 0;
     memset(handshake_targets, 0, MAX_AP_CNT * sizeof(wifi_ap_record_t));
