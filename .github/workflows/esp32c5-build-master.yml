@@ -11,6 +11,7 @@ on:
     paths:
       - 'ESP32C5/main/main.c'
       - 'FLIPPER/**'
+      - '.github/workflows/**'
   release:
     types: [published, edited]
 
