@@ -13072,7 +13072,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  wpasec_upload");
 
     repl_config.prompt = ">";
-    repl_config.max_cmdline_length = 100;
+    repl_config.max_cmdline_length = 1024;  // must fit set_html chunks (~522 chars)
 
     esp_console_register_help_command();
     register_commands();
