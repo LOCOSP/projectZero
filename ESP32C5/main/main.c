@@ -1133,7 +1133,7 @@ static char *html_b64_buf = NULL;       // accumulator for base64 chunks
 static size_t html_b64_len = 0;        // current length in accumulator
 static size_t html_b64_cap = 0;        // allocated capacity
 static bool   html_b64_active = false; // true between set_html_begin / set_html_end
-#define HTML_B64_ALLOC     (128*1024)  // 128 KB fixed alloc — enough for ~96 KB HTML
+#define HTML_B64_ALLOC     (1024*1024) // 1 MB base64 buffer in PSRAM (~768 KB decoded HTML)
 #define HTML_MAX_DECODED   (800*1024)  // 800 KB max decoded HTML
 static bool sd_card_mounted = false;
 static sdmmc_card_t *sd_card_handle = NULL;
