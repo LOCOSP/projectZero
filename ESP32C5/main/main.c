@@ -79,6 +79,7 @@
 #include "frame_analyzer_parser.h"
 #include "frame_analyzer_types.h"
 #include "sniffer.h"
+#include "oled_display.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -127,6 +128,9 @@
 #define WPASEC_NVS_KEY       "api_key"
 #define WPASEC_URL           "https://wpa-sec.stanev.org/"
 #define WPASEC_KEY_MAX_LEN   65
+
+#define DISPLAY_NVS_NAMESPACE "display"
+#define DISPLAY_NVS_KEY_MODE  "mode"
 
 
 
@@ -298,6 +302,9 @@ static int sniffer_current_channel = 1;
 static int sniffer_channel_index = 0;
 static int64_t sniffer_last_channel_hop = 0;
 static const int sniffer_channel_hop_delay_ms = 250; // 250ms per channel like Marauder
+// Sniffer OLED shared state (callback -> task)
+static volatile uint32_t sniff_oled_packets = 0;
+static volatile bool sniff_oled_dirty = false;
 static TaskHandle_t sniffer_channel_task_handle = NULL;
 static uint32_t sniffer_packet_counter = 0;
 static uint32_t sniffer_last_debug_packet = 0;
@@ -336,6 +343,13 @@ static volatile bool sniffer_dog_active = false;
 static int sniffer_dog_current_channel = 1;
 static int sniffer_dog_channel_index = 0;
 static int64_t sniffer_dog_last_channel_hop = 0;
+// Sniffer Dog OLED shared state (callback -> task)
+static volatile char sd_oled_ap[18] = {0};
+static volatile char sd_oled_sta[18] = {0};
+static volatile int  sd_oled_ch = 0;
+static volatile int  sd_oled_rssi = 0;
+static volatile uint32_t sd_oled_count = 0;
+static volatile bool sd_oled_dirty = false;
 
 // Deauth detector task
 static TaskHandle_t deauth_detector_task_handle = NULL;
@@ -343,6 +357,13 @@ static volatile bool deauth_detector_active = false;
 static int deauth_detector_current_channel = 1;
 static int deauth_detector_channel_index = 0;
 static int64_t deauth_detector_last_channel_hop = 0;
+// Deauth detector OLED shared state (callback -> task)
+static volatile char dd_oled_ssid[22] = {0};
+static volatile char dd_oled_bssid[18] = {0};
+static volatile int  dd_oled_ch = 0;
+static volatile int  dd_oled_rssi = 0;
+static volatile uint32_t dd_oled_count = 0;
+static volatile bool dd_oled_dirty = false;
 // Deauth detector selected mode
 static bool deauth_detector_selected_mode = false;
 static int deauth_detector_selected_channels[MAX_AP_CNT];
@@ -434,6 +455,8 @@ static const uint8_t channels_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104
 // Portal state
 static httpd_handle_t portal_server = NULL;
 static volatile bool portal_active = false;
+static volatile bool karma_mode_active = false;
+static volatile bool rogueap_mode_active = false;
 static TaskHandle_t dns_server_task_handle = NULL;
 static int dns_server_socket = -1;
 static TaskHandle_t boot_button_task_handle = NULL;
@@ -855,6 +878,19 @@ static void beacon_spam_task(void *pvParameters) {
                     send_beacon_frame(frame_buffer, frame_size);
                 }
                 
+                {
+                    static int64_t bcn_oled_last_us = 0;
+                    int64_t bcn_now_us = esp_timer_get_time();
+                    if (bcn_now_us - bcn_oled_last_us > 400000) {
+                        bcn_oled_last_us = bcn_now_us;
+                        char bcn_l2[64], bcn_l3[64], bcn_l4[64];
+                        snprintf(bcn_l2, sizeof(bcn_l2), ">> %s", beacon_ssids[i]);
+                        snprintf(bcn_l3, sizeof(bcn_l3), "  Ch %d/13", current_channel);
+                        snprintf(bcn_l4, sizeof(bcn_l4), "  %d SSIDs TX", beacon_ssid_count);
+                        oled_display_update_full("> Beacon Spam", bcn_l2, bcn_l3, bcn_l4);
+                    }
+                }
+                
                 // Fast delay between beacons (10ms for faster transmission)
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
@@ -1177,6 +1213,7 @@ static bool vendor_last_valid = false;
 static bool vendor_last_hit = false;
 static bool vendor_lookup_enabled = false;
 static size_t vendor_record_count = 0;
+static display_type_t display_forced_mode = DISPLAY_NONE; /* DISPLAY_NONE = auto */
 
 
 // Methods forward declarations
@@ -1228,6 +1265,7 @@ static void arp_ban_task(void *pvParameters);
 static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
+static int cmd_display(int argc, char **argv);
 static int cmd_download(int argc, char **argv);
 static int cmd_wpasec_key(int argc, char **argv);
 static int cmd_wpasec_upload(int argc, char **argv);
@@ -1257,6 +1295,10 @@ static bool check_handshake_file_exists(const char *ssid);
 static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid);
 static void handshake_cleanup(void);
 static void attack_network_with_burst(const wifi_ap_record_t *ap);
+static const char *display_mode_to_str(display_type_t mode);
+static bool display_mode_from_str(const char *s, display_type_t *out_mode);
+static void display_mode_load_from_nvs(void);
+static void display_mode_save_to_nvs(display_type_t mode);
 // D-UCB and sniffer handshake helpers
 static void ducb_init(void);
 static int ducb_select_channel(void);
@@ -1465,6 +1507,7 @@ static void wifi_event_handler(void *event_handler_arg,
             // If portal is active (Evil Twin attack), shut it down after successful connection
             if (portal_active) {
                 MY_LOG_INFO(TAG, "Password verified! Shutting down Evil Twin portal...");
+                oled_display_update_full("> Evil Twin", "  PASSWORD OK!", "  Saving to SD", "  >> Success!");
                 portal_active = false;
                 
                 // Stop DNS server task
@@ -1529,6 +1572,15 @@ static void wifi_event_handler(void *event_handler_arg,
             // Increment connected clients counter
             portal_connected_clients++;
             MY_LOG_INFO(TAG, "Portal: Client count = %d", portal_connected_clients);
+            
+            // OLED update for portal/karma/rogueap client connect (not evil twin - that's handled in deauth task)
+            if (portal_active && !evilTwinSSID) {
+                const char *mode_name = karma_mode_active ? "> Karma Attack" :
+                                        rogueap_mode_active ? "> Rogue AP" : "> Captive Portal";
+                char p_l4[64];
+                snprintf(p_l4, sizeof(p_l4), "  Clients: %d", portal_connected_clients);
+                oled_display_update_full(mode_name, portalSSID ? portalSSID : "", "  Client joined!", p_l4);
+            }
             
             // During evil twin attack, switch to first selected network's channel
             if ((applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK) && 
@@ -1596,6 +1648,21 @@ static void wifi_event_handler(void *event_handler_arg,
             
             g_scan_done = true;
             g_scan_in_progress = false;
+
+            // Update OLED with scan results (only if not suppressed / in sniffer)
+            if (!suppress_scan_logs && !sniffer_active) {
+                char oled_l2[32];
+                snprintf(oled_l2, sizeof(oled_l2), "  Found %u APs", g_scan_count);
+                char oled_l3[32];
+                if (g_scan_start_time_us > 0) {
+                    int64_t elapsed_us = esp_timer_get_time() - g_scan_start_time_us;
+                    float elapsed_s = elapsed_us / 1000000.0f;
+                    snprintf(oled_l3, sizeof(oled_l3), "  %.1fs elapsed", elapsed_s);
+                } else {
+                    oled_l3[0] = '\0';
+                }
+                oled_display_update_full("> Scan Complete", oled_l2, oled_l3, "  > select next");
+            }
             
             // Only reset applicationState to IDLE if not in active attack mode
             if (applicationState != DEAUTH && applicationState != DEAUTH_EVIL_TWIN && applicationState != EVIL_TWIN_PASS_CHECK) {
@@ -1656,6 +1723,11 @@ static void wifi_event_handler(void *event_handler_arg,
                 ESP_LOGW(TAG, "Evil twin: connection failed, wrong password? Btw connectAttemptCount: %d", connectAttemptCount);
                 if (connectAttemptCount >= 3) {
                     ESP_LOGW(TAG, "Evil twin: Too many failed attempts, giving up and going to DEAUTH_EVIL_TWIN. Btw connectAttemptCount: %d ", connectAttemptCount);
+                    {
+                        char et_l2[64];
+                        snprintf(et_l2, sizeof(et_l2), ">> %s", evilTwinSSID ? evilTwinSSID : "?");
+                        oled_display_update_full("> Evil Twin", et_l2, "  Wrong password!", "  Resuming...");
+                    }
                     applicationState = DEAUTH_EVIL_TWIN; //go back to deauth
                     
                     // Mark password as wrong for portal feedback
@@ -2276,6 +2348,12 @@ static void verify_password(const char* password) {
     }
 
     MY_LOG_INFO(TAG, "Password received: %s", password);
+
+    {
+        char et_l2[64];
+        snprintf(et_l2, sizeof(et_l2), ">> %s", evilTwinSSID ? evilTwinSSID : "?");
+        oled_display_update_full("> Evil Twin", et_l2, "  Got password!", "  Verifying...");
+    }
 
     // Stop deauth attack BEFORE attempting to connect
     // This is crucial because deauth task switches channels which prevents stable STA connection
@@ -3012,6 +3090,104 @@ static esp_err_t vendor_set_enabled(bool enabled) {
     return ESP_OK;
 }
 
+static const char *display_mode_to_str(display_type_t mode)
+{
+    switch (mode) {
+    case DISPLAY_SSD1306: return "ssd1306";
+    case DISPLAY_SH1107:  return "sh1107";
+    case DISPLAY_SH1106:  return "sh1106";
+    case DISPLAY_UNIT_LCD:return "unit_lcd";
+    case DISPLAY_NONE:
+    default:
+        return "auto";
+    }
+}
+
+static bool display_mode_from_str(const char *s, display_type_t *out_mode)
+{
+    if (!s || !out_mode) return false;
+    if (strcasecmp(s, "auto") == 0) {
+        *out_mode = DISPLAY_NONE;
+        return true;
+    }
+    if (strcasecmp(s, "ssd1306") == 0) {
+        *out_mode = DISPLAY_SSD1306;
+        return true;
+    }
+    if (strcasecmp(s, "sh1107") == 0) {
+        *out_mode = DISPLAY_SH1107;
+        return true;
+    }
+    if (strcasecmp(s, "sh1106") == 0) {
+        *out_mode = DISPLAY_SH1106;
+        return true;
+    }
+    if (strcasecmp(s, "unit_lcd") == 0 || strcasecmp(s, "lcd") == 0) {
+        *out_mode = DISPLAY_UNIT_LCD;
+        return true;
+    }
+    return false;
+}
+
+static void display_mode_save_to_nvs(display_type_t mode)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DISPLAY_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_u8(handle, DISPLAY_NVS_KEY_MODE, (uint8_t)mode);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS write failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static void display_mode_load_from_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DISPLAY_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS read open failed: %s", esp_err_to_name(err));
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+
+    uint8_t raw = (uint8_t)DISPLAY_NONE;
+    err = nvs_get_u8(handle, DISPLAY_NVS_KEY_MODE, &raw);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS get failed: %s", esp_err_to_name(err));
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+
+    switch ((display_type_t)raw) {
+    case DISPLAY_NONE:
+    case DISPLAY_SSD1306:
+    case DISPLAY_SH1107:
+    case DISPLAY_SH1106:
+    case DISPLAY_UNIT_LCD:
+        display_forced_mode = (display_type_t)raw;
+        break;
+    default:
+        display_forced_mode = DISPLAY_NONE;
+        break;
+    }
+}
+
 static bool boot_is_command_allowed(const char* command) {
     if (command == NULL || command[0] == '\0') {
         return false;
@@ -3370,9 +3546,61 @@ static void print_scan_results(void) {
     MY_LOG_INFO(TAG, "Scan results printed.");
 }
 
+// --- OLED display helper functions ---
+
+/**
+ * Build a target summary for OLED line2.
+ * 0 selected → "  No target"
+ * 1 selected → ">> HomeNet"
+ * 2 selected → ">> Net1, Net2"
+ * 3+ selected → ">> Net1 +2 more"
+ */
+static void oled_build_target_summary(char *buf, size_t sz)
+{
+    if (g_selected_count == 0 || !g_scan_done) {
+        snprintf(buf, sz, "  No target");
+        return;
+    }
+    const char *first = (const char *)g_scan_results[g_selected_indices[0]].ssid;
+    if (g_selected_count == 1) {
+        snprintf(buf, sz, ">> %s", first);
+    } else if (g_selected_count == 2) {
+        const char *second = (const char *)g_scan_results[g_selected_indices[1]].ssid;
+        snprintf(buf, sz, ">> %s, %s", first, second);
+    } else {
+        snprintf(buf, sz, ">> %s +%d more", first, g_selected_count - 1);
+    }
+}
+
+/**
+ * Build channel/auth info for OLED line3 from selected networks.
+ * Single: "  Ch 6 WPA2 -45dB"
+ * Multi:  "  Ch 1,6,11"
+ */
+static void oled_build_channel_info(char *buf, size_t sz)
+{
+    if (g_selected_count == 0 || !g_scan_done) {
+        buf[0] = '\0';
+        return;
+    }
+    if (g_selected_count == 1) {
+        const wifi_ap_record_t *ap = &g_scan_results[g_selected_indices[0]];
+        const char *auth = authmode_to_string(ap->authmode);
+        snprintf(buf, sz, "  Ch %d %s %ddB", ap->primary, auth, ap->rssi);
+    } else {
+        int len = snprintf(buf, sz, "  Ch ");
+        for (int i = 0; i < g_selected_count && len < (int)sz - 4; i++) {
+            const wifi_ap_record_t *ap = &g_scan_results[g_selected_indices[i]];
+            if (i > 0) len += snprintf(buf + len, sz - len, ",");
+            len += snprintf(buf + len, sz - len, "%d", ap->primary);
+        }
+    }
+}
+
 // --- CLI: commands ---
 static int cmd_scan_networks(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> Scanning WiFi", "  All channels", "", "  Working...");
     log_memory_info("scan_networks");
     
     // Ensure WiFi is initialized
@@ -3441,6 +3669,7 @@ static int cmd_show_scan_results(int argc, char **argv) {
 }
 
 static int cmd_select_networks(int argc, char **argv) {
+    // Display will be updated after selection is done
     if (argc < 2) {
         ESP_LOGW(TAG,"Syntax: select_networks <index1> [index2] ...");
         return 1;
@@ -3499,6 +3728,17 @@ static int cmd_select_networks(int argc, char **argv) {
     vTaskDelay(pdMS_TO_TICKS(100));
     MY_LOG_INFO(TAG, "%s", buf);
     vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Update OLED with rich target summary
+    {
+        char oled_l1[20];
+        snprintf(oled_l1, sizeof(oled_l1), "> %d Target%s", g_selected_count, g_selected_count > 1 ? "s" : "");
+        char oled_target[48];
+        oled_build_target_summary(oled_target, sizeof(oled_target));
+        char oled_ch[32];
+        oled_build_channel_info(oled_ch, sizeof(oled_ch));
+        oled_display_update_full(oled_l1, oled_target, oled_ch, "  > ready");
+    }
 
     return 0;
 }
@@ -3593,6 +3833,10 @@ static void deauth_attack_task(void *pvParameters) {
             // Set flag to suppress logs during periodic re-scan
             periodic_rescan_in_progress = true;
             
+            if (applicationState == DEAUTH) {
+                oled_display_update_full("> Deauth Attack", "  Re-scanning...", "  Channel check", "  Please wait");
+            }
+            
             // Set LED to yellow during re-scan
             esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
             if (led_err != ESP_OK) {
@@ -3620,6 +3864,45 @@ static void deauth_attack_task(void *pvParameters) {
             ESP_ERROR_CHECK(led_set_color(0, 0, 255));
             wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
             ESP_ERROR_CHECK(led_clear());
+        }
+        
+        // Real-time OLED status update (rate-limited ~500ms)
+        {
+            static int64_t deauth_oled_last_us = 0;
+            static int deauth_oled_rotate = 0;
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - deauth_oled_last_us > 500000 && target_bssid_count > 0) {
+                deauth_oled_last_us = now_us;
+                if (applicationState == DEAUTH) {
+                    int idx = deauth_oled_rotate % target_bssid_count;
+                    char l2[64], l3[64], l4[64];
+                    snprintf(l2, sizeof(l2), ">> %s", target_bssids[idx].ssid);
+                    snprintf(l3, sizeof(l3), "  Ch %d  [%d/%d]", target_bssids[idx].channel, idx + 1, target_bssid_count);
+                    if (selected_stations_count > 0) {
+                        snprintf(l4, sizeof(l4), "  STA:%02X:%02X:%02X",
+                                 selected_stations[0].mac[3], selected_stations[0].mac[4], selected_stations[0].mac[5]);
+                    } else {
+                        snprintf(l4, sizeof(l4), "  Deauthing...");
+                    }
+                    oled_display_update_full("> Deauth Attack", l2, l3, l4);
+                    deauth_oled_rotate++;
+                } else if (applicationState == DEAUTH_EVIL_TWIN) {
+                    char l2[64], l4[64];
+                    snprintf(l2, sizeof(l2), ">> %s", target_bssids[0].ssid);
+                    if (last_password_wrong) {
+                        snprintf(l4, sizeof(l4), "  Clients: %d", portal_connected_clients);
+                        oled_display_update_full("> Evil Twin", l2, "  Wrong password!", l4);
+                    } else {
+                        snprintf(l4, sizeof(l4), "  Clients: %d", portal_connected_clients);
+                        oled_display_update_full("> Evil Twin", l2, "  Portal active", l4);
+                    }
+                } else if (applicationState == EVIL_TWIN_PASS_CHECK) {
+                    char l2[64], l4[64];
+                    snprintf(l2, sizeof(l2), ">> %s", evilTwinSSID ? evilTwinSSID : "?");
+                    snprintf(l4, sizeof(l4), "  Attempt %d/3", connectAttemptCount + 1);
+                    oled_display_update_full("> Evil Twin", l2, "  Connecting...", l4);
+                }
+            }
         }
         
         // Delay and yield to allow UART console processing
@@ -3660,6 +3943,7 @@ static void blackout_attack_task(void *pvParameters) {
     // Main loop: continuously scan and attack for 3 minutes each cycle
     while (blackout_attack_active && !operation_stop_requested) {
         MY_LOG_INFO(TAG, "Starting blackout cycle: scanning all networks...");
+        oled_display_update_full("> Blackout Mode", "  Scanning...", "  Finding nets", "  Please wait");
         
         // Start background scan with fast timings
         esp_err_t scan_result = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
@@ -3730,6 +4014,12 @@ static void blackout_attack_task(void *pvParameters) {
         
         MY_LOG_INFO(TAG, "Starting deauth attack on  %d networks (except whitelist) for 100 cycles...", g_selected_count);
         
+        {
+            char bo_l2[64];
+            snprintf(bo_l2, sizeof(bo_l2), "  Found %d nets", g_selected_count);
+            oled_display_update_full("> Blackout Mode", bo_l2, "  Mass deauth", "  Starting...");
+        }
+        
         // Attack all networks for exactly 3 minutes (1800 cycles at 100ms each)
         int attack_cycles = 0;
         const int MAX_ATTACK_CYCLES = 100;
@@ -3750,6 +4040,15 @@ static void blackout_attack_task(void *pvParameters) {
                 ESP_LOGW(TAG, "Failed to clear LED during blackout attack: %s", esp_err_to_name(led_err));
             }
             
+            if (attack_cycles % 5 == 0 && target_bssid_count > 0) {
+                int idx = attack_cycles % target_bssid_count;
+                char bo_l2[64], bo_l3[64], bo_l4[64];
+                snprintf(bo_l2, sizeof(bo_l2), ">> %s", target_bssids[idx].ssid);
+                snprintf(bo_l3, sizeof(bo_l3), "  %d nets Cyc%d", g_selected_count, attack_cycles);
+                snprintf(bo_l4, sizeof(bo_l4), "  Ch %d Active", target_bssids[idx].channel);
+                oled_display_update_full("> Blackout Mode", bo_l2, bo_l3, bo_l4);
+            }
+            
             attack_cycles++;
             vTaskDelay(pdMS_TO_TICKS(100)); // 100ms delay between attack cycles
         }
@@ -3760,6 +4059,7 @@ static void blackout_attack_task(void *pvParameters) {
         }
         
         MY_LOG_INFO(TAG, "3-minute attack cycle completed, starting new scan...");
+        oled_display_update_full("> Blackout Mode", "  Cycle done", "  New scan...", "");
         
         // Immediately start next scan cycle (no waiting)
     }
@@ -4131,12 +4431,15 @@ static void wardrive_promisc_task(void *pvParameters) {
     MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", file_number);
 
     MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout - use 'stop' to cancel)...");
+    oled_display_update_full("> Wardrive Pro", "  Waiting GPS...", "  No timeout", "  Use 'stop'");
     if (!wait_for_gps_fix(0)) {
         MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, not continuing without GPS data - please ensure clear view of the sky and try again.");
+        oled_display_update_full("> Wardrive Pro", "  No GPS fix!", "  Stopping...", "");
         goto cleanup;
     }
     MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f",
                 current_gps.latitude, current_gps.longitude);
+    oled_display_update_full("> Wardrive Pro", "  GPS fix OK!", "  D-UCB scanning", "");
 
     wdp_seen_count = 0;
     wdp_dwell_new_networks = 0;
@@ -4168,6 +4471,7 @@ static void wardrive_promisc_task(void *pvParameters) {
         }
         if (external_feed && !current_gps.valid) {
             MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
+            oled_display_update_full("> Wardrive Pro", "  GPS fix lost!", "  Pausing...", "");
             esp_wifi_set_promiscuous(false);
             while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
                 gps_sync_from_selected_external_source();
@@ -4176,6 +4480,7 @@ static void wardrive_promisc_task(void *pvParameters) {
             if (!wardrive_promisc_active || operation_stop_requested) break;
             MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
                         current_gps.latitude, current_gps.longitude);
+            oled_display_update_full("> Wardrive Pro", "  GPS recovered!", "  Resuming...", "");
             esp_wifi_set_promiscuous(true);
         }
 
@@ -4184,6 +4489,19 @@ static void wardrive_promisc_task(void *pvParameters) {
         int dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
 
         esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        
+        {
+            static int64_t wdp_oled_last_us = 0;
+            int64_t wdp_now_us = esp_timer_get_time();
+            if (wdp_now_us - wdp_oled_last_us > 2000000) {
+                wdp_oled_last_us = wdp_now_us;
+                char wdp_l2[64], wdp_l3[64], wdp_l4[64];
+                snprintf(wdp_l2, sizeof(wdp_l2), "  Ch %d  D-UCB", channel);
+                snprintf(wdp_l3, sizeof(wdp_l3), "  %d networks", wdp_seen_count);
+                snprintf(wdp_l4, sizeof(wdp_l4), "  GPS: %s", current_gps.valid ? "OK" : "LOST");
+                oled_display_update_full("> Wardrive Pro", wdp_l2, wdp_l3, wdp_l4);
+            }
+        }
 
         wdp_dwell_new_networks = 0;
 
@@ -4313,6 +4631,11 @@ static void wardrive_promisc_task(void *pvParameters) {
                     sd_sync();
                     last_flush_count = current_count;
                     MY_LOG_INFO(TAG, "Flushed %d networks to %s", current_count, filename);
+                    {
+                        char wdp_fl3[64];
+                        snprintf(wdp_fl3, sizeof(wdp_fl3), "  %d networks", current_count);
+                        oled_display_update_full("> Wardrive Pro", "  Flushed to SD", wdp_fl3, "  D-UCB active");
+                    }
                 }
             }
         }
@@ -4350,6 +4673,7 @@ cleanup:
 
 static int cmd_start_wardrive_promisc(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> Wardrive Pro", "  Promiscuous", "  GPS + SD log", "  Active...");
     log_memory_info("start_wardrive_promisc");
 
     if (!ensure_wifi_mode()) {
@@ -4938,22 +5262,34 @@ static void attack_network_with_burst(const wifi_ap_record_t *ap) {
     MY_LOG_INFO(TAG, "Burst attacking '%s' (Ch %d, RSSI: %d dBm)", 
                 ap->ssid, ap->primary, ap->rssi);
     
+    char burst_l2[64], burst_l3[64];
+    snprintf(burst_l2, sizeof(burst_l2), ">> %s", (const char *)ap->ssid);
+    snprintf(burst_l3, sizeof(burst_l3), "  Ch %d  %ddB", ap->primary, ap->rssi);
+    
     // Start attack on this network
     attack_handshake_start(ap, ATTACK_HANDSHAKE_METHOD_BROADCAST);
     
-    // Send initial burst (attack_handshake_start already sends first deauth)
-    // The timer will continue sending every 2s
-    
     // Wait and check for handshake - 3 deauth bursts with 3s wait each
     for (int burst = 0; burst < 3 && handshake_attack_active && !operation_stop_requested; burst++) {
+        {
+            char burst_l4[64];
+            snprintf(burst_l4, sizeof(burst_l4), "  Burst %d/3 ...", burst + 1);
+            oled_display_update_full("> WPA Capture", burst_l2, burst_l3, burst_l4);
+        }
+        
         // Wait 3 seconds for clients to reconnect after deauth
         for (int i = 0; i < 30 && handshake_attack_active && !operation_stop_requested; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
+            
+            if (i == 15) {
+                oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  Listening...");
+            }
             
             // Check if handshake captured
             if (attack_handshake_is_complete()) {
                 MY_LOG_INFO(TAG, "✓ Handshake captured for '%s' after burst #%d!", 
                            ap->ssid, burst + 1);
+                oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  >> CAPTURED!");
                 
                 // Wait 2s to capture any remaining frames
                 vTaskDelay(pdMS_TO_TICKS(2000));
@@ -4967,6 +5303,7 @@ static void attack_network_with_burst(const wifi_ap_record_t *ap) {
     
     // No handshake captured after 3 bursts
     MY_LOG_INFO(TAG, "✗ No handshake for '%s' after 3 bursts", ap->ssid);
+    oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  No handshake");
     attack_handshake_stop();
 }
 
@@ -4985,6 +5322,11 @@ static void handshake_attack_task_selected(void) {
         }
         if (all_captured) {
             MY_LOG_INFO(TAG, "All selected networks captured! Attack complete.");
+            {
+                char hs_l3[64];
+                snprintf(hs_l3, sizeof(hs_l3), "  %d handshakes", handshake_target_count);
+                oled_display_update_full("> WPA Capture", "  All done!", hs_l3, "  Complete!");
+            }
             break;
         }
         
@@ -5004,6 +5346,14 @@ static void handshake_attack_task_selected(void) {
             attacked_count++;
             MY_LOG_INFO(TAG, ">>> [%d/%d] Attacking '%s' (Ch %d, RSSI: %d dBm) <<<",
                        i + 1, handshake_target_count, (const char*)ap->ssid, ap->primary, ap->rssi);
+            
+            {
+                char hs_l1[64], hs_l2[64], hs_l3[64];
+                snprintf(hs_l1, sizeof(hs_l1), "> WPA [%d/%d]", i + 1, handshake_target_count);
+                snprintf(hs_l2, sizeof(hs_l2), ">> %s", (const char *)ap->ssid);
+                snprintf(hs_l3, sizeof(hs_l3), "  Ch %d  %ddB", ap->primary, ap->rssi);
+                oled_display_update_full(hs_l1, hs_l2, hs_l3, "  Attacking...");
+            }
             
             attack_network_with_burst(ap);
             
@@ -5027,7 +5377,18 @@ static void handshake_attack_task_selected(void) {
         }
         if (all_done) {
             MY_LOG_INFO(TAG, "All selected networks captured!");
+            {
+                char hs_l3[64];
+                snprintf(hs_l3, sizeof(hs_l3), "  %d handshakes", handshake_target_count);
+                oled_display_update_full("> WPA Capture", "  All done!", hs_l3, "  Complete!");
+            }
             break;
+        }
+        {
+            char hs_l3[64], hs_l4[64];
+            snprintf(hs_l3, sizeof(hs_l3), "  Cap:%d Rem:%d", captured_count, remaining);
+            snprintf(hs_l4, sizeof(hs_l4), "  Next cycle...");
+            oled_display_update_full("> WPA Capture", "  Cycle done", hs_l3, hs_l4);
         }
         MY_LOG_INFO(TAG, "%d networks remaining, repeating...", remaining);
         vTaskDelay(pdMS_TO_TICKS(3000));
@@ -5083,6 +5444,14 @@ static void handshake_attack_task_sniffer(void) {
         // Switch channel
         esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
         
+        {
+            char hss_l2[64], hss_l3[64], hss_l4[64];
+            snprintf(hss_l2, sizeof(hss_l2), "  Scan Ch %d", channel);
+            snprintf(hss_l3, sizeof(hss_l3), "  AP:%d Cli:%d", hs_ap_count, hs_client_count);
+            snprintf(hss_l4, sizeof(hss_l4), "  Cap:%d D-UCB", total_handshakes_captured);
+            oled_display_update_full("> WPA Sniffer", hss_l2, hss_l3, hss_l4);
+        }
+        
         // Reset per-dwell counters
         hs_dwell_new_clients = 0;
         hs_dwell_eapol_frames = 0;
@@ -5121,6 +5490,14 @@ static void handshake_attack_task_sniffer(void) {
                        ap->ssid, ap->channel,
                        client->mac[0], client->mac[1], client->mac[2],
                        client->mac[3], client->mac[4], client->mac[5]);
+            
+            {
+                char hss_l2[64], hss_l3[64];
+                snprintf(hss_l2, sizeof(hss_l2), ">> %s", ap->ssid);
+                snprintf(hss_l3, sizeof(hss_l3), "  Deauth %02X:%02X:%02X",
+                         client->mac[3], client->mac[4], client->mac[5]);
+                oled_display_update_full("> WPA Sniffer", hss_l2, hss_l3, "  Hunting...");
+            }
             
             // Re-init HCCAPX serializer for this AP (so save works correctly)
             {
@@ -5162,6 +5539,12 @@ static void handshake_attack_task_sniffer(void) {
                     // Tab5 parses: strstr("Handshake #") && strstr("captured")
                     MY_LOG_INFO(TAG, "Handshake #%d captured! (APs: %d, Clients: %d)",
                                total_handshakes_captured, hs_ap_count, hs_client_count);
+                    {
+                        char hss_l2[64], hss_l4[64];
+                        snprintf(hss_l2, sizeof(hss_l2), ">> %s", ap->ssid);
+                        snprintf(hss_l4, sizeof(hss_l4), "  >> Saved! #%d", total_handshakes_captured);
+                        oled_display_update_full("> WPA Sniffer", hss_l2, "  Handshake OK!", hss_l4);
+                    }
                     
                     // Re-init PCAP after save to free memory and start fresh
                     pcap_serializer_init();
@@ -5247,11 +5630,25 @@ static void handshake_attack_task(void *pvParameters) {
 }
 
 static int cmd_start_deauth(int argc, char **argv) {
+    {
+        char oled_target[48];
+        oled_build_target_summary(oled_target, sizeof(oled_target));
+        char oled_ch[32];
+        oled_build_channel_info(oled_ch, sizeof(oled_ch));
+        oled_display_update_full("> Deauth Attack", oled_target, oled_ch, "  Active...");
+    }
     onlyDeauth = 1;
     return cmd_start_evil_twin(argc, argv);
 }
 
 static int cmd_start_handshake(int argc, char **argv) {
+    {
+        char oled_target[48];
+        oled_build_target_summary(oled_target, sizeof(oled_target));
+        char oled_ch[32];
+        oled_build_channel_info(oled_ch, sizeof(oled_ch));
+        oled_display_update_full("> WPA Capture", oled_target, "  Deauth+Capture", "  Hunting...");
+    }
     // Ensure WiFi is initialized
     if (!ensure_wifi_mode()) {
         return 1;
@@ -5369,6 +5766,7 @@ static int cmd_start_handshake(int argc, char **argv) {
 }
 
 static int cmd_save_handshake(int argc, char **argv) {
+    oled_display_update_full("> Save Capture", "  Writing PCAP", "  /lab/handshakes", "  SD Card...");
     // Avoid compiler warnings
     (void)argc; (void)argv;
     
@@ -5599,6 +5997,7 @@ static int wpasec_upload_file(const char *filepath, const char *filename) {
 
 static int cmd_wpasec_upload(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> WPA-sec", "  Sending PCAPs", "  wpa-sec.stanev", "  Uploading...");
 
     // 1. Check WiFi STA is connected
     wifi_ap_record_t ap_info;
@@ -5697,6 +6096,9 @@ static int cmd_wpasec_upload(int argc, char **argv) {
 static int cmd_start_sae_overflow(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    oled_display_update_full("> SAE Flood",
+        (g_selected_count > 0) ? (const char *)g_scan_results[g_selected_indices[0]].ssid : "  No target",
+        "  WPA3 Overflow", "  Flooding...");
     
     // Ensure WiFi is initialized
     if (!ensure_wifi_mode()) {
@@ -5765,6 +6167,7 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
 static int cmd_start_blackout(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    oled_display_update_full("> Blackout Mode", "  All networks", "  Mass deauth", "  Active...");
     log_memory_info("start_blackout");
     
     // Ensure WiFi is initialized
@@ -5851,6 +6254,11 @@ static void boot_button_task(void *arg) {
 static int cmd_start_evil_twin(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    if (!onlyDeauth) {
+        char oled_target[48];
+        oled_build_target_summary(oled_target, sizeof(oled_target));
+        oled_display_update_full("> Evil Twin", oled_target, "  Captive portal", "  Waiting pwd..");
+    }
     log_memory_info("start_evil_twin");
     
     // Ensure WiFi is initialized
@@ -6129,6 +6537,13 @@ static int cmd_start_evil_twin(int argc, char **argv) {
  * Starts beacon spam attack with multiple fake SSIDs
  */
 static int cmd_start_beacon_spam(int argc, char **argv) {
+    {
+        char oled_l3[24];
+        snprintf(oled_l3, sizeof(oled_l3), "  %d fake SSIDs", argc - 1 > 0 ? argc - 1 : 0);
+        oled_display_update_full("> Beacon Spam",
+            argc >= 2 ? argv[1] : "  No SSIDs",
+            oled_l3, "  Broadcast...");
+    }
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: start_beacon_spam \"SSID1\" \"SSID2\" ...");
         return 1;
@@ -6250,6 +6665,7 @@ static int cmd_start_beacon_spam(int argc, char **argv) {
 
 static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
     
     // Set global stop flags
@@ -6546,6 +6962,8 @@ static int cmd_stop(int argc, char **argv) {
     if (portal_active) {
         MY_LOG_INFO(TAG, "Stopping portal...");
         portal_active = false;
+        karma_mode_active = false;
+        rogueap_mode_active = false;
         
         // Stop DNS server task
         if (dns_server_task_handle != NULL) {
@@ -6909,6 +7327,9 @@ static int cmd_wifi_disconnect(int argc, char **argv) {
 }
 
 static int cmd_wifi_connect(int argc, char **argv) {
+    oled_display_update_full("> WiFi Connect",
+        argc >= 2 ? argv[1] : "  No SSID",
+        "  STA Mode", "  Connecting...");
     if (argc < 3 || argc > 9) {
         MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
@@ -7082,6 +7503,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
 }
 
 static int cmd_ota_check(int argc, char **argv) {
+    oled_display_update_full("> OTA Update", "  Checking...", "  github.com", "  v" JANOS_VERSION " current");
     const char *tag = NULL;
     bool force_latest = false;
 
@@ -7319,6 +7741,7 @@ static int cmd_ota_boot(int argc, char **argv) {
 
 static int cmd_list_hosts(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> ARP Scan", "  Scanning LAN", "", "  Working...");
     
     // Check if connected to AP
     wifi_ap_record_t ap_info;
@@ -7589,10 +8012,10 @@ static void arp_ban_task(void *pvParameters) {
     uint8_t fake_mac[6] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00 };
     
     MY_LOG_INFO(TAG, "ARP ban: Poisoning both victim and router");
+    uint32_t arp_cycle = 0;
     
     while (arp_ban_active) {
         // Packet 1: To VICTIM - "Gateway IP is at fake MAC"
-        // Victim will try to send packets to gateway via fake MAC -> nowhere
         send_arp_reply(lwip_netif,
                        arp_ban_target_mac,       // Eth dst: victim
                        fake_mac,                  // Eth src: fake
@@ -7604,7 +8027,6 @@ static void arp_ban_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(50));  // Small delay between packets
         
         // Packet 2: To ROUTER - "Victim IP is at fake MAC"
-        // Router will try to send packets to victim via fake MAC -> nowhere
         send_arp_reply(lwip_netif,
                        arp_ban_gateway_mac,       // Eth dst: router
                        fake_mac,                  // Eth src: fake
@@ -7612,6 +8034,19 @@ static void arp_ban_task(void *pvParameters) {
                        arp_ban_target_ip.addr,    // ARP sender IP: victim (spoofed!)
                        arp_ban_gateway_mac,       // ARP target MAC: router
                        arp_ban_gateway_ip.addr);  // ARP target IP: router
+        
+        arp_cycle++;
+        if (arp_cycle % 4 == 0) {
+            char arp_l2[64], arp_l3[64], arp_l4[64];
+            snprintf(arp_l2, sizeof(arp_l2), "  %02X:%02X:%02X:%02X",
+                     arp_ban_target_mac[2], arp_ban_target_mac[3],
+                     arp_ban_target_mac[4], arp_ban_target_mac[5]);
+            snprintf(arp_l3, sizeof(arp_l3), "  %d.%d.%d.%d",
+                     ip4_addr1(&arp_ban_target_ip), ip4_addr2(&arp_ban_target_ip),
+                     ip4_addr3(&arp_ban_target_ip), ip4_addr4(&arp_ban_target_ip));
+            snprintf(arp_l4, sizeof(arp_l4), "  Poison #%lu", (unsigned long)arp_cycle);
+            oled_display_update_full("> ARP Ban", arp_l2, arp_l3, arp_l4);
+        }
         
         vTaskDelay(pdMS_TO_TICKS(450)); // Total ~500ms cycle
     }
@@ -7622,6 +8057,9 @@ static void arp_ban_task(void *pvParameters) {
 }
 
 static int cmd_arp_ban(int argc, char **argv) {
+    oled_display_update_full("> ARP Ban",
+        argc >= 2 ? argv[1] : "  No MAC",
+        "  Poison active", "  Blocking...");
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: arp_ban <MAC> [IP]");
         MY_LOG_INFO(TAG, "Example: arp_ban AA:BB:CC:DD:EE:FF 192.168.1.50");
@@ -7826,6 +8264,13 @@ static void packet_monitor_task(void *pvParameters) {
 
         printf("%" PRIu32 "pkts\n", diff);
         fflush(stdout);
+        
+        {
+            char pm_l3[64], pm_l4[64];
+            snprintf(pm_l3, sizeof(pm_l3), "  %" PRIu32 " pkts/sec", diff);
+            snprintf(pm_l4, sizeof(pm_l4), "  Total: %" PRIu32, current);
+            oled_display_update_full("> Pkt Monitor", "  Listening...", pm_l3, pm_l4);
+        }
     }
 
     packet_monitor_shutdown();
@@ -7836,6 +8281,11 @@ static void packet_monitor_task(void *pvParameters) {
 }
 
 static int cmd_packet_monitor(int argc, char **argv) {
+    {
+        char oled_ch[24];
+        snprintf(oled_ch, sizeof(oled_ch), "  Channel %s", argc >= 2 ? argv[1] : "?");
+        oled_display_update_full("> Pkt Monitor", oled_ch, "", "  Listening...");
+    }
     log_memory_info("packet_monitor");
     
     // Ensure WiFi is initialized
@@ -8002,7 +8452,11 @@ static void channel_view_task(void *pvParameters) {
     const TickType_t scan_delay = pdMS_TO_TICKS(CHANNEL_VIEW_SCAN_DELAY_MS);
     const TickType_t wait_slice = pdMS_TO_TICKS(100);
 
+    int cv_scan_num = 0;
+    
     while (channel_view_active && !operation_stop_requested) {
+        oled_display_update_full("> Channel View", "  Scanning...", "  All channels", "  Analyzing...");
+        
         esp_err_t err = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
         if (err != ESP_OK) {
             MY_LOG_INFO(TAG, "channel_view_error:scan_start %s", esp_err_to_name(err));
@@ -8025,6 +8479,24 @@ static void channel_view_task(void *pvParameters) {
             esp_wifi_scan_stop();
         } else {
             channel_view_publish_counts();
+            cv_scan_num++;
+            
+            // Find busiest channel
+            int busiest_ch = 0, busiest_count = 0;
+            for (uint16_t ci = 0; ci < g_scan_count; ci++) {
+                int ch = g_scan_results[ci].primary;
+                int cnt = 0;
+                for (uint16_t cj = 0; cj < g_scan_count; cj++) {
+                    if (g_scan_results[cj].primary == ch) cnt++;
+                }
+                if (cnt > busiest_count) { busiest_count = cnt; busiest_ch = ch; }
+            }
+            
+            char cv_l2[64], cv_l3[64], cv_l4[64];
+            snprintf(cv_l2, sizeof(cv_l2), "  Found %d APs", g_scan_count);
+            snprintf(cv_l3, sizeof(cv_l3), "  Busy: Ch%d (%d)", busiest_ch, busiest_count);
+            snprintf(cv_l4, sizeof(cv_l4), "  Scan #%d", cv_scan_num);
+            oled_display_update_full("> Channel View", cv_l2, cv_l3, cv_l4);
         }
 
         if (!channel_view_active || operation_stop_requested) {
@@ -8071,6 +8543,7 @@ static void channel_view_stop(void) {
 static int cmd_channel_view(int argc, char **argv) {
     (void)argc;
     (void)argv;
+    oled_display_update_full("> Channel View", "  WiFi spectrum", "  All channels", "  Analyzing...");
     log_memory_info("channel_view");
 
     // Ensure WiFi is initialized
@@ -8138,6 +8611,15 @@ static int cmd_channel_view(int argc, char **argv) {
 
 static int cmd_start_sniffer(int argc, char **argv) {
     (void)argc; (void)argv;
+    {
+        char oled_target[48];
+        if (g_selected_count > 0 && g_scan_done) {
+            oled_build_target_summary(oled_target, sizeof(oled_target));
+        } else {
+            snprintf(oled_target, sizeof(oled_target), "  All networks");
+        }
+        oled_display_update_full("> Sniffer", oled_target, "  Promiscuous", "  Capturing...");
+    }
     log_memory_info("start_sniffer");
     
     // Ensure WiFi is initialized
@@ -8242,6 +8724,11 @@ static int cmd_start_sniffer(int argc, char **argv) {
 
 static int cmd_start_sniffer_noscan(int argc, char **argv) {
     (void)argc; (void)argv;
+    {
+        char oled_l3[32];
+        snprintf(oled_l3, sizeof(oled_l3), "  %u networks", g_scan_count);
+        oled_display_update_full("> Sniffer", "  Prior scan data", oled_l3, "  Capturing...");
+    }
     log_memory_info("start_sniffer_noscan");
     
     // Ensure WiFi is initialized
@@ -8625,6 +9112,7 @@ static int cmd_sniffer_debug(int argc, char **argv) {
 
 static int cmd_start_sniffer_dog(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> Sniff Dog", "  Hunt AP-STA", "  Auto deauth", "  Active...");
     log_memory_info("start_sniffer_dog");
     
     // Ensure WiFi is initialized
@@ -8701,6 +9189,7 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
 }
 
 static int cmd_deauth_detector(int argc, char **argv) {
+    oled_display_update_full("> Deauth Detect", "  Monitoring...", "  All channels", "  Passive scan");
     log_memory_info("deauth_detector");
     
     // Ensure WiFi is initialized
@@ -8943,6 +9432,7 @@ static int cmd_download(int argc, char **argv) {
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    oled_display_update_full("> Reboot", "  Unmount SD...", "", "  Restarting...");
     MY_LOG_INFO(TAG,"Restart...");
     safe_restart();  // unmount SD card before restart
     return 0;
@@ -9243,9 +9733,60 @@ static int cmd_vendor(int argc, char **argv) {
     return 1;
 }
 
+static int cmd_display(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        display_type_t detected = oled_display_get_type();
+        const char *detected_name = "none";
+        switch (detected) {
+            case DISPLAY_SSD1306: detected_name = "ssd1306"; break;
+            case DISPLAY_SH1107: detected_name = "sh1107"; break;
+            case DISPLAY_SH1106: detected_name = "sh1106"; break;
+            case DISPLAY_UNIT_LCD: detected_name = "unit_lcd"; break;
+            case DISPLAY_NONE:
+            default: detected_name = "none"; break;
+        }
+        MY_LOG_INFO(TAG, "Display mode: %s", display_mode_to_str(display_forced_mode));
+        MY_LOG_INFO(TAG, "Detected now: %s (addr raw 0x%02X / 7-bit 0x%02X)",
+                    detected_name,
+                    (int)oled_display_get_i2c_addr_raw(),
+                    (int)oled_display_get_i2c_addr_7bit());
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd>");
+            return 1;
+        }
+        display_type_t mode = DISPLAY_NONE;
+        if (!display_mode_from_str(argv[2], &mode)) {
+            MY_LOG_INFO(TAG, "Unknown mode '%s'. Use: auto|ssd1306|sh1107|sh1106|unit_lcd", argv[2]);
+            return 1;
+        }
+        display_forced_mode = mode;
+        oled_display_set_forced_type(display_forced_mode);
+        display_mode_save_to_nvs(display_forced_mode);
+        MY_LOG_INFO(TAG, "Display mode saved: %s", display_mode_to_str(display_forced_mode));
+        MY_LOG_INFO(TAG, "Reboot required to re-initialize display driver");
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
+    return 1;
+}
+
 // Command: start_karma - Starts portal with SSID from probe list
 static int cmd_start_karma(int argc, char **argv)
 {
+    oled_display_update_full("> Karma Attack",
+        argc >= 2 ? argv[1] : "  No index",
+        "  Fake AP up", "  Capturing...");
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: start_karma <index>");
         MY_LOG_INFO(TAG, "Example: start_karma 2");
@@ -9301,6 +9842,14 @@ static int cmd_start_karma(int argc, char **argv)
     }
     
     MY_LOG_INFO(TAG, "Starting Karma attack with SSID: %s", selected_ssid);
+    
+    {
+        char karma_l2[64];
+        snprintf(karma_l2, sizeof(karma_l2), ">> %s", selected_ssid);
+        oled_display_update_full("> Karma Attack", karma_l2, "  Fake AP up", "  Capturing...");
+    }
+    
+    karma_mode_active = true;
     
     // Prepare arguments for cmd_start_portal
     char *portal_argv[2];
@@ -9800,6 +10349,7 @@ static int cmd_set_gps_position(int argc, char **argv) {
         if (current_gps_module == GPS_MODULE_EXTERNAL) {
             gps_sync_from_selected_external_source();
         }
+        oled_display_update_full("> GPS External", "  Fix cleared", "", "  No fix");
         MY_LOG_INFO(TAG, "External GPS fix cleared (no fix).");
         return 0;
     }
@@ -9868,6 +10418,13 @@ static int cmd_set_gps_position(int argc, char **argv) {
                 external_gps_position.latitude, external_gps_position.longitude,
                 external_gps_position.altitude, external_gps_position.accuracy);
 
+    {
+        char oled_lat[20], oled_lon[20];
+        snprintf(oled_lat, sizeof(oled_lat), "  Lat %.4f", lat);
+        snprintf(oled_lon, sizeof(oled_lon), "  Lon %.4f", lon);
+        oled_display_update_full("> GPS External", oled_lat, oled_lon, "  Fix set");
+    }
+
     if (current_gps_module != GPS_MODULE_EXTERNAL) {
         MY_LOG_INFO(TAG, "Note: current module is %s. Run 'gps_set external' to use this feed in wardrive.",
                     gps_get_module_name(current_gps_module));
@@ -9881,6 +10438,7 @@ static int cmd_set_gps_position_cap(int argc, char **argv) {
         if (gps_module_uses_external_cap_feed(current_gps_module)) {
             gps_sync_from_selected_external_source();
         }
+        oled_display_update_full("> GPS CAP Feed", "  Fix cleared", "", "  No fix");
         MY_LOG_INFO(TAG, "External CAP GPS fix cleared (no fix).");
         return 0;
     }
@@ -9949,6 +10507,13 @@ static int cmd_set_gps_position_cap(int argc, char **argv) {
                 external_cap_gps_position.latitude, external_cap_gps_position.longitude,
                 external_cap_gps_position.altitude, external_cap_gps_position.accuracy);
 
+    {
+        char oled_lat[20], oled_lon[20];
+        snprintf(oled_lat, sizeof(oled_lat), "  Lat %.4f", external_cap_gps_position.latitude);
+        snprintf(oled_lon, sizeof(oled_lon), "  Lon %.4f", external_cap_gps_position.longitude);
+        oled_display_update_full("> GPS CAP Feed", oled_lat, oled_lon, "  Fix set");
+    }
+
     if (!gps_module_uses_external_cap_feed(current_gps_module)) {
         MY_LOG_INFO(TAG, "Note: current module is %s. Run 'gps_set cap' to use this feed in wardrive.",
                     gps_get_module_name(current_gps_module));
@@ -9974,12 +10539,15 @@ static void wardrive_task(void *pvParameters) {
     
     // Wait for GPS fix before starting
     MY_LOG_INFO(TAG, "Waiting for GPS fix...");
+    oled_display_update_full("> Wardrive", "  Waiting GPS...", "  Fix needed", "");
     if (!wait_for_gps_fix(120)) {  // Wait up to 120 seconds for GPS fix
         MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, not continuing without GPS data - please ensure clear view of the sky and try again.");
+        oled_display_update_full("> Wardrive", "  No GPS fix!", "  Stopping...", "");
         operation_stop_requested = true;
     } else {
         MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f", 
                    current_gps.latitude, current_gps.longitude);
+        oled_display_update_full("> Wardrive", "  GPS fix OK!", "  Starting scans", "");
     }
     
     MY_LOG_INFO(TAG, "Wardrive started. Use 'stop' command to stop.");
@@ -10001,6 +10569,7 @@ static void wardrive_task(void *pvParameters) {
             gps_sync_from_selected_external_source();
             if (!current_gps.valid) {
                 MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
+                oled_display_update_full("> Wardrive", "  GPS fix lost!", "  Pausing...", "");
                 while (!current_gps.valid && wardrive_active && !operation_stop_requested) {
                     gps_sync_from_selected_external_source();
                     vTaskDelay(pdMS_TO_TICKS(200));
@@ -10010,6 +10579,7 @@ static void wardrive_task(void *pvParameters) {
                 }
                 MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
                             current_gps.latitude, current_gps.longitude);
+                oled_display_update_full("> Wardrive", "  GPS recovered!", "  Resuming...", "");
             }
         } else {
             int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
@@ -10169,6 +10739,14 @@ static void wardrive_task(void *pvParameters) {
         
         scan_counter++;
         
+        {
+            char wd_l2[64], wd_l3[64], wd_l4[64];
+            snprintf(wd_l2, sizeof(wd_l2), "  Scan #%d", scan_counter);
+            snprintf(wd_l3, sizeof(wd_l3), "  %d nets logged", scan_count);
+            snprintf(wd_l4, sizeof(wd_l4), "  w%d.log", wardrive_file_counter);
+            oled_display_update_full("> Wardrive", wd_l2, wd_l3, wd_l4);
+        }
+        
         // Check for stop command
         if (operation_stop_requested || !wardrive_active) {
             MY_LOG_INFO(TAG, "Wardrive: Stop requested, terminating...");
@@ -10197,6 +10775,10 @@ static void wardrive_task(void *pvParameters) {
 }
 
 static int cmd_start_gps_raw(int argc, char **argv) {
+    {
+        const char *mod = gps_get_module_name(current_gps_module);
+        oled_display_update_full("> GPS Raw", "  NMEA output", mod, "  Streaming...");
+    }
     log_memory_info("start_gps_raw");
 
     if (gps_module_uses_external_feed(current_gps_module)) {
@@ -10260,6 +10842,7 @@ static int cmd_start_gps_raw(int argc, char **argv) {
 
 static int cmd_start_wardrive(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> Wardrive", "  GPS + WiFi", "  Logging to SD", "  Active...");
     log_memory_info("start_wardrive");
     
     // Ensure WiFi is initialized
@@ -10919,6 +11502,9 @@ static void dns_server_task(void *pvParameters) {
 
 // Start portal command
 static int cmd_start_portal(int argc, char **argv) {
+    oled_display_update_full("> Captive Portal",
+        argc >= 2 ? argv[1] : "  No SSID",
+        "  Password trap", "  Waiting...");
     log_memory_info("start_portal");
     
     // Ensure WiFi is initialized
@@ -11177,6 +11763,10 @@ static int cmd_start_portal(int argc, char **argv) {
 
 // Start password-protected rogue AP with captive portal and optional deauth
 static int cmd_start_rogueap(int argc, char **argv) {
+    oled_display_update_full("> Rogue AP",
+        argc >= 2 ? argv[1] : "  No SSID",
+        "  WPA2 + Portal", "  Active...");
+    rogueap_mode_active = true;
     log_memory_info("start_rogueap");
     
     // Validate arguments
@@ -11933,6 +12523,13 @@ static void bt_scan_task(void *pvParameters)
                 led_clear();
             }
         }
+        if (i % 10 == 0) {
+            char ble_l2[64], ble_l3[64], ble_l4[64];
+            snprintf(ble_l2, sizeof(ble_l2), "  Scanning %d/10s", i / 10);
+            snprintf(ble_l3, sizeof(ble_l3), "  %d devices", bt_device_count);
+            snprintf(ble_l4, sizeof(ble_l4), "  AT:%d ST:%d", bt_airtag_count, bt_smarttag_count);
+            oled_display_update_full("> BLE Scan", ble_l2, ble_l3, ble_l4);
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     
@@ -11941,6 +12538,13 @@ static void bt_scan_task(void *pvParameters)
     
     bt_stop_scan();
     bt_scan_active = false;
+    
+    {
+        char ble_l3[64], ble_l4[64];
+        snprintf(ble_l3, sizeof(ble_l3), "  %d devices", bt_device_count);
+        snprintf(ble_l4, sizeof(ble_l4), "  AT:%d ST:%d", bt_airtag_count, bt_smarttag_count);
+        oled_display_update_full("> BLE Scan", "  Scan done!", ble_l3, ble_l4);
+    }
     
     // Print results
     MY_LOG_INFO(TAG, "");
@@ -11987,8 +12591,11 @@ static void bt_airtag_scan_task(void *pvParameters)
     MY_LOG_INFO(TAG, "Use 'stop' command to stop scanning.");
     MY_LOG_INFO(TAG, "");
     
+    int at_cycle = 0;
+    
     while (bt_airtag_scan_active && !operation_stop_requested) {
         bt_reset_counters();
+        at_cycle++;
         
         int rc = bt_start_scan();
         if (rc != 0) {
@@ -12008,6 +12615,12 @@ static void bt_airtag_scan_task(void *pvParameters)
                     led_clear();
                 }
             }
+            if (i % 20 == 0) {
+                char at_l2[64], at_l4[64];
+                snprintf(at_l2, sizeof(at_l2), "  Cycle #%d", at_cycle);
+                snprintf(at_l4, sizeof(at_l4), "  AT:%d ST:%d", bt_airtag_count, bt_smarttag_count);
+                oled_display_update_full("> AirTag Scan", at_l2, "  Scanning...", at_l4);
+            }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         
@@ -12019,6 +12632,12 @@ static void bt_airtag_scan_task(void *pvParameters)
         
         // Output in requested format: airtag_count,smarttag_count
         printf("%d,%d\n", bt_airtag_count, bt_smarttag_count);
+        
+        {
+            char at_l3[64];
+            snprintf(at_l3, sizeof(at_l3), "  AT:%d ST:%d", bt_airtag_count, bt_smarttag_count);
+            oled_display_update_full("> AirTag Scan", "  Cycle done", at_l3, "  Next cycle...");
+        }
         
         // Immediately start next scan cycle (no wait)
     }
@@ -12109,6 +12728,11 @@ static void bt_tracking_task(void *pvParameters)
  */
 static int cmd_scan_bt(int argc, char **argv)
 {
+    if (argc > 1) {
+        oled_display_update_full("> BLE Track", argv[1], "  Tracking MAC", "  Scanning...");
+    } else {
+        oled_display_update_full("> BLE Scan", "  Discovering...", "  10s scan time", "  Working...");
+    }
     log_memory_info("scan_bt");
     
     // Ensure BLE is initialized (may reboot if WiFi was active)
@@ -12182,6 +12806,7 @@ static int cmd_scan_bt(int argc, char **argv)
 static int cmd_scan_airtag(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    oled_display_update_full("> AirTag Scan", "  Apple+Samsung", "  Continuous", "  Scanning...");
     log_memory_info("scan_airtag");
     
     // Ensure BLE is initialized (may reboot if WiFi was active)
@@ -12570,6 +13195,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&vendor_cmd));
 
+    const esp_console_cmd_t display_cmd = {
+        .command = "display",
+        .help = "Display mode: display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read",
+        .hint = NULL,
+        .func = &cmd_display,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&display_cmd));
+
     const esp_console_cmd_t boot_button_cmd = {
         .command = "boot_button",
         .help = "Configure boot button actions: boot_button read|list|set <short|long> <command>|status <short|long> <on|off>",
@@ -12856,17 +13490,97 @@ void app_main(void) {
     printf("PSRAM support disabled in config\n");
 #endif
 
-//     printf("Step 3: Init NVS\n");
+    // NVS must be ready before loading persisted display mode.
     ESP_ERROR_CHECK(nvs_flash_init());
+    display_mode_load_from_nvs();
+    oled_display_set_forced_type(display_forced_mode);
+    MY_LOG_INFO(TAG, "Display mode configured: %s", display_mode_to_str(display_forced_mode));
+
+    // Initialize display module (auto-detect SSD1306 / SH1107 / SH1106 / Unit LCD)
+    oled_display_init();
+    {
+        const char *display_name = "NONE";
+        char display_desc[64];
+        int disp_addr7 = oled_display_get_i2c_addr_7bit();
+        int disp_addr_raw = oled_display_get_i2c_addr_raw();
+        snprintf(display_desc, sizeof(display_desc), "not detected");
+        switch (oled_display_get_type()) {
+            case DISPLAY_SSD1306:
+                display_name = "SSD1306";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1107:
+                display_name = "SH1107";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1106:
+                display_name = "SH1106";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_UNIT_LCD:
+                display_name = "UNIT_LCD";
+                snprintf(display_desc, sizeof(display_desc), "addr 0x%02X", disp_addr7);
+                break;
+            case DISPLAY_NONE:
+            default:
+                display_name = "NONE";
+                snprintf(display_desc, sizeof(display_desc), "check display wiring / I2C");
+                break;
+        }
+        MY_LOG_INFO(TAG, "Display auto-detect: %s (%s)", display_name, display_desc);
+    }
+    oled_display_update_full("> JanOS v" JANOS_VERSION, "  Booting...", "", "");
+    vTaskDelay(pdMS_TO_TICKS(80));
+
+//     printf("Step 3: Init NVS\n");
     ota_load_channel_from_nvs();
     wpasec_load_key_from_nvs();
     ota_mark_valid_if_pending();
     ota_log_boot_info();
+    {
+        const char *display_name = "NONE";
+        char display_desc[64];
+        int disp_addr7 = oled_display_get_i2c_addr_7bit();
+        int disp_addr_raw = oled_display_get_i2c_addr_raw();
+        snprintf(display_desc, sizeof(display_desc), "not detected");
+        switch (oled_display_get_type()) {
+            case DISPLAY_SSD1306:
+                display_name = "SSD1306";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1107:
+                display_name = "SH1107";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1106:
+                display_name = "SH1106";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_UNIT_LCD:
+                display_name = "UNIT_LCD";
+                snprintf(display_desc, sizeof(display_desc), "addr 0x%02X", disp_addr7);
+                break;
+            case DISPLAY_NONE:
+            default:
+                display_name = "NONE";
+                snprintf(display_desc, sizeof(display_desc), "check display wiring / I2C");
+                break;
+        }
+        MY_LOG_INFO(TAG, "POST Display auto-detect: %s (%s)", display_name, display_desc);
+    }
     //printf("NVS initialized OK\n");
 
     channel_time_load_state_from_nvs();
     gps_load_state_from_nvs();
     led_load_state_from_nvs();
+    oled_display_update_full(NULL, "  NVS: OK", "  Init LED...", "");
+    vTaskDelay(pdMS_TO_TICKS(60));
     MY_LOG_INFO(TAG, "GPS module: %s (baud %d)",
                 gps_get_module_name(current_gps_module),
                 gps_get_baud_for_module(current_gps_module));
@@ -12903,6 +13617,8 @@ void app_main(void) {
     }
     //printf("Step 6: Vendor load state\n");
     MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
+    oled_display_update_full(NULL, "  NVS: OK", "  LED: OK", "  Init SD...");
+    vTaskDelay(pdMS_TO_TICKS(60));
     vendor_load_state_from_nvs();
     vendor_last_valid = false;
     vendor_last_hit = false;
@@ -12932,6 +13648,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  channel_view");
       MY_LOG_INFO(TAG,"  deauth_detector");
       MY_LOG_INFO(TAG,"  download");
+      MY_LOG_INFO(TAG,"  display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
       MY_LOG_INFO(TAG,"  file_delete <path>");
       MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
       MY_LOG_INFO(TAG,"  list_dir <path>");
@@ -13052,17 +13769,24 @@ void app_main(void) {
                 fclose(wf);
             }
         }
+        oled_display_update_full(NULL, "  SD: mounted", "  All systems OK", "");
     } else {
         MY_LOG_INFO(TAG, "");
         MY_LOG_INFO(TAG, "SD init error: %s", esp_err_to_name(sd_init_ret));
         MY_LOG_INFO(TAG, "SD Card not detected. Custom portals won't be available, results won't be written to files.");
         MY_LOG_INFO(TAG, "");
+        oled_display_update_full(NULL, "  SD: MISSING!", "  No file save", "");
     }
+    vTaskDelay(pdMS_TO_TICKS(400));
     
     // Load BSSID whitelist from SD card
     load_whitelist_from_sd();
     vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
+    oled_display_update_full("> JanOS v" JANOS_VERSION,
+                            sd_init_ret == ESP_OK ? "  SD: OK" : "  SD: MISSING!",
+                            "",
+                            "  > Ready _");
     vTaskDelay(pdMS_TO_TICKS(100));
     
 }
@@ -13250,6 +13974,13 @@ static void sae_attack_task(void *pvParameters) {
         }
         
         inject_sae_commit_frame();
+        
+        if (frame_count_check % 20 == 0) {
+            char sae_l2[64], sae_l3[64];
+            snprintf(sae_l2, sizeof(sae_l2), ">> %s", (const char *)ap_record->ssid);
+            snprintf(sae_l3, sizeof(sae_l3), "  Frames: %d", frame_count_check);
+            oled_display_update_full("> SAE Flood", sae_l2, sae_l3, "  WPA3 Overflow");
+        }
         
         // Delay to allow UART console processing (50ms gives better responsiveness)
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -13769,6 +14500,8 @@ static void sniffer_channel_hop(void) {
 
 // Task that handles time-based channel hopping (independent of packet flow)
 static void sniffer_channel_task(void *pvParameters) {
+    int64_t sniff_oled_last_us = 0;
+    
     while (sniffer_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
         
@@ -13781,8 +14514,18 @@ static void sniffer_channel_task(void *pvParameters) {
         bool time_expired = (current_time - sniffer_last_channel_hop >= sniffer_channel_hop_delay_ms);
         
         if (time_expired) {
-            //MY_LOG_INFO(TAG, "Sniffer: Time-based channel hop (250ms expired)");
             sniffer_channel_hop();
+        }
+        
+        // OLED update (~500ms)
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - sniff_oled_last_us > 500000) {
+            sniff_oled_last_us = now_us;
+            char l2[64], l3[64], l4[64];
+            snprintf(l2, sizeof(l2), "  Ch %d hopping", sniffer_current_channel);
+            snprintf(l3, sizeof(l3), "  AP:%d Probes:%d", sniffer_ap_count, probe_request_count);
+            snprintf(l4, sizeof(l4), "  Pkts: %lu", (unsigned long)sniff_oled_packets);
+            oled_display_update_full("> Sniffer", l2, l3, l4);
         }
     }
     
@@ -13792,6 +14535,8 @@ static void sniffer_channel_task(void *pvParameters) {
 
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
     sniffer_packet_counter++;
+    sniff_oled_packets = sniffer_packet_counter;
+    sniff_oled_dirty = true;
     
     if (!sniffer_active || sniffer_scan_phase) {
         return; // No debug logging here - too frequent
@@ -14202,6 +14947,7 @@ static void sniffer_dog_channel_hop(void) {
 // Task that handles channel hopping for sniffer_dog
 static void sniffer_dog_task(void *pvParameters) {
     (void)pvParameters;
+    int64_t sd_oled_last_us = 0;
     
     while (sniffer_dog_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
@@ -14216,6 +14962,24 @@ static void sniffer_dog_task(void *pvParameters) {
         
         if (time_expired) {
             sniffer_dog_channel_hop();
+        }
+        
+        // OLED update (~500ms)
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - sd_oled_last_us > 500000) {
+            sd_oled_last_us = now_us;
+            if (sd_oled_dirty) {
+                sd_oled_dirty = false;
+                char l2[64], l3[64], l4[64];
+                snprintf(l2, sizeof(l2), "AP %s", (const char *)sd_oled_ap);
+                snprintf(l3, sizeof(l3), "ST %s", (const char *)sd_oled_sta);
+                snprintf(l4, sizeof(l4), "Ch%d #%lu %ddB", sd_oled_ch, (unsigned long)sd_oled_count, sd_oled_rssi);
+                oled_display_update_full("> Sniff Dog", l2, l3, l4);
+            } else {
+                char l3[64];
+                snprintf(l3, sizeof(l3), "  Ch %d scanning", sniffer_dog_current_channel);
+                oled_display_update_full("> Sniff Dog", "  Hunting...", l3, "  0 deauths");
+            }
         }
     }
     
@@ -14341,6 +15105,16 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
     deauth_sent_count++;
     
+    // Update shared OLED state for task to render
+    snprintf((char *)sd_oled_ap, sizeof(sd_oled_ap), "%02X:%02X:%02X:%02X:%02X:%02X",
+             ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
+    snprintf((char *)sd_oled_sta, sizeof(sd_oled_sta), "%02X:%02X:%02X:%02X:%02X:%02X",
+             sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
+    sd_oled_ch = sniffer_dog_current_channel;
+    sd_oled_rssi = pkt->rx_ctrl.rssi;
+    sd_oled_count = deauth_sent_count;
+    sd_oled_dirty = true;
+    
     (void)led_set_color(255, 0, 0); // Back to red
     
     // Log statistics for this AP-STA pair
@@ -14396,6 +15170,7 @@ static void deauth_detector_task(void *pvParameters) {
     (void)pvParameters;
     
     log_memory_info("deauth_detector_task");
+    int64_t dd_oled_last_us = 0;
     
     while (deauth_detector_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
@@ -14412,6 +15187,24 @@ static void deauth_detector_task(void *pvParameters) {
             deauth_detector_channel_hop();
             // Reset LED to yellow after channel hop (in case it was red from deauth detection)
             (void)led_set_color(255, 255, 0);
+        }
+        
+        // OLED update (~500ms)
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - dd_oled_last_us > 500000) {
+            dd_oled_last_us = now_us;
+            if (dd_oled_dirty) {
+                dd_oled_dirty = false;
+                char l2[64], l3[64], l4[64];
+                snprintf(l2, sizeof(l2), ">> %s", (const char *)dd_oled_ssid);
+                snprintf(l3, sizeof(l3), "  %s", (const char *)dd_oled_bssid);
+                snprintf(l4, sizeof(l4), "Ch%d %ddB #%lu", dd_oled_ch, dd_oled_rssi, (unsigned long)dd_oled_count);
+                oled_display_update_full("> Deauth Detect", l2, l3, l4);
+            } else {
+                char l3[64];
+                snprintf(l3, sizeof(l3), "  Ch %d scanning", deauth_detector_current_channel);
+                oled_display_update_full("> Deauth Detect", "  Monitoring...", l3, "  No attacks yet");
+            }
         }
     }
     
@@ -14468,6 +15261,15 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
         (void)led_set_color(255, 0, 0); // Red flash
         last_led_flash_time = now;
     }
+    
+    // Update shared OLED state for task to render
+    snprintf((char *)dd_oled_ssid, sizeof(dd_oled_ssid), "%s", ap_name);
+    snprintf((char *)dd_oled_bssid, sizeof(dd_oled_bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+             bssid_mac[0], bssid_mac[1], bssid_mac[2], bssid_mac[3], bssid_mac[4], bssid_mac[5]);
+    dd_oled_ch = deauth_detector_current_channel;
+    dd_oled_rssi = rssi;
+    dd_oled_count++;
+    dd_oled_dirty = true;
     
     // Print detection: CHANNEL | AP NAME (MAC) | RSSI
     MY_LOG_INFO(TAG, "[DEAUTH] CH: %d | AP: %s (%02X:%02X:%02X:%02X:%02X:%02X) | RSSI: %d",
@@ -15046,6 +15848,11 @@ static void save_evil_twin_password(const char* ssid, const char* password) {
 
 // Save portal form data to SD card
 static void save_portal_data(const char* ssid, const char* form_data) {
+    {
+        const char *mode_name = karma_mode_active ? "> Karma Attack" :
+                                rogueap_mode_active ? "> Rogue AP" : "> Captive Portal";
+        oled_display_update_full(mode_name, ssid ? ssid : "", "  Data received!", "  Saving to SD");
+    }
     // Initialize SD card if not already mounted
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
