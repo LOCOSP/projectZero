@@ -1128,12 +1128,12 @@ static void led_boot_sequence(void) {
 static char (*sd_html_files)[MAX_HTML_FILENAME] = NULL;     // ~3.2 KB in PSRAM
 static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
-// Chunked base64 HTML transfer buffer
+// Chunked base64 HTML transfer buffer (allocated in PSRAM to avoid DRAM fragmentation)
 static char *html_b64_buf = NULL;       // accumulator for base64 chunks
 static size_t html_b64_len = 0;        // current length in accumulator
 static size_t html_b64_cap = 0;        // allocated capacity
 static bool   html_b64_active = false; // true between set_html_begin / set_html_end
-#define HTML_B64_INIT_CAP  4096        // initial alloc (grows as needed)
+#define HTML_B64_ALLOC     (128*1024)  // 128 KB fixed alloc — enough for ~96 KB HTML
 #define HTML_MAX_DECODED   (800*1024)  // 800 KB max decoded HTML
 static bool sd_card_mounted = false;
 static sdmmc_card_t *sd_card_handle = NULL;
@@ -11101,12 +11101,17 @@ static int cmd_set_html_begin(int argc, char **argv)
 
     // Free any previous accumulator
     if (html_b64_buf) {
-        free(html_b64_buf);
+        heap_caps_free(html_b64_buf);
         html_b64_buf = NULL;
     }
     html_b64_len = 0;
-    html_b64_cap = HTML_B64_INIT_CAP;
-    html_b64_buf = (char *)malloc(html_b64_cap);
+    html_b64_cap = HTML_B64_ALLOC;
+    // Allocate in PSRAM to avoid DRAM heap fragmentation
+    html_b64_buf = (char *)heap_caps_malloc(html_b64_cap, MALLOC_CAP_SPIRAM);
+    if (!html_b64_buf) {
+        // Fallback to internal RAM if no PSRAM
+        html_b64_buf = (char *)malloc(html_b64_cap);
+    }
     if (!html_b64_buf) {
         MY_LOG_INFO(TAG, "set_html_begin: malloc failed (%u)", (unsigned)html_b64_cap);
         html_b64_active = false;
@@ -11114,7 +11119,8 @@ static int cmd_set_html_begin(int argc, char **argv)
     }
     html_b64_buf[0] = '\0';
     html_b64_active = true;
-    MY_LOG_INFO(TAG, "set_html_begin: ready to receive base64 chunks");
+    MY_LOG_INFO(TAG, "set_html_begin: ready to receive base64 chunks (%uKB buffer)",
+                (unsigned)(html_b64_cap / 1024));
     return 0;
 }
 
@@ -11135,16 +11141,10 @@ static int cmd_set_html(int argc, char **argv)
     // Concatenate all argv fragments (esp_console may split on spaces)
     for (int i = 1; i < argc; i++) {
         size_t frag_len = strlen(argv[i]);
-        // Grow buffer if needed
-        while (html_b64_len + frag_len + 1 > html_b64_cap) {
-            size_t new_cap = html_b64_cap * 2;
-            char *tmp = (char *)realloc(html_b64_buf, new_cap);
-            if (!tmp) {
-                MY_LOG_INFO(TAG, "set_html: realloc failed at %u bytes", (unsigned)new_cap);
-                return 1;
-            }
-            html_b64_buf = tmp;
-            html_b64_cap = new_cap;
+        if (html_b64_len + frag_len + 1 > html_b64_cap) {
+            MY_LOG_INFO(TAG, "set_html: buffer full (%u/%u bytes)",
+                        (unsigned)html_b64_len, (unsigned)html_b64_cap);
+            return 1;
         }
         memcpy(html_b64_buf + html_b64_len, argv[i], frag_len);
         html_b64_len += frag_len;
@@ -11165,6 +11165,8 @@ static int cmd_set_html_end(int argc, char **argv)
     }
     html_b64_active = false;
 
+    MY_LOG_INFO(TAG, "set_html_end: decoding %u base64 bytes...", (unsigned)html_b64_len);
+
     // Calculate decoded size
     size_t decoded_len = 0;
     int ret = mbedtls_base64_decode(NULL, 0, &decoded_len,
@@ -11172,22 +11174,25 @@ static int cmd_set_html_end(int argc, char **argv)
     // mbedtls returns MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL when just probing size — that's OK
     if (decoded_len == 0) {
         MY_LOG_INFO(TAG, "set_html_end: base64 decode size probe failed");
-        free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
+        heap_caps_free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
         return 1;
     }
     if (decoded_len > HTML_MAX_DECODED) {
         MY_LOG_INFO(TAG, "set_html_end: HTML too large (%u bytes, max %u)",
                     (unsigned)decoded_len, (unsigned)HTML_MAX_DECODED);
-        free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
+        heap_caps_free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
         return 1;
     }
 
-    // Allocate decoded buffer (+1 for NUL)
-    char *decoded = (char *)malloc(decoded_len + 1);
+    // Allocate decoded buffer in PSRAM (+1 for NUL)
+    char *decoded = (char *)heap_caps_malloc(decoded_len + 1, MALLOC_CAP_SPIRAM);
+    if (!decoded) {
+        decoded = (char *)malloc(decoded_len + 1);
+    }
     if (!decoded) {
         MY_LOG_INFO(TAG, "set_html_end: malloc failed for decoded HTML (%u bytes)",
                     (unsigned)decoded_len);
-        free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
+        heap_caps_free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
         return 1;
     }
 
@@ -11195,21 +11200,22 @@ static int cmd_set_html_end(int argc, char **argv)
     ret = mbedtls_base64_decode((unsigned char *)decoded, decoded_len + 1, &olen,
                                  (const unsigned char *)html_b64_buf, html_b64_len);
     // Free accumulator — no longer needed
-    free(html_b64_buf);
+    heap_caps_free(html_b64_buf);
     html_b64_buf = NULL;
     html_b64_len = 0;
     html_b64_cap = 0;
 
     if (ret != 0) {
         MY_LOG_INFO(TAG, "set_html_end: base64 decode error (%d)", ret);
-        free(decoded);
+        heap_caps_free(decoded);
         return 1;
     }
     decoded[olen] = '\0';
 
-    // Swap into custom_portal_html
+    // Swap into custom_portal_html (free works for both PSRAM and internal)
     if (custom_portal_html) {
         free(custom_portal_html);
+        custom_portal_html = NULL;
     }
     custom_portal_html = decoded;
 
