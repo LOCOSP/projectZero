@@ -1128,6 +1128,13 @@ static void led_boot_sequence(void) {
 static char (*sd_html_files)[MAX_HTML_FILENAME] = NULL;     // ~3.2 KB in PSRAM
 static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
+// Chunked base64 HTML transfer buffer
+static char *html_b64_buf = NULL;       // accumulator for base64 chunks
+static size_t html_b64_len = 0;        // current length in accumulator
+static size_t html_b64_cap = 0;        // allocated capacity
+static bool   html_b64_active = false; // true between set_html_begin / set_html_end
+#define HTML_B64_INIT_CAP  4096        // initial alloc (grows as needed)
+#define HTML_MAX_DECODED   (800*1024)  // 800 KB max decoded HTML
 static bool sd_card_mounted = false;
 static sdmmc_card_t *sd_card_handle = NULL;
 #define MAX_SSID_PRESETS 64
@@ -1268,6 +1275,9 @@ static int cmd_list_sd(int argc, char **argv);
 static int cmd_list_dir(int argc, char **argv);
 static int cmd_list_ssid(int argc, char **argv);
 static int cmd_select_html(int argc, char **argv);
+static int cmd_set_html(int argc, char **argv);
+static int cmd_set_html_begin(int argc, char **argv);
+static int cmd_set_html_end(int argc, char **argv);
 static int cmd_show_pass(int argc, char **argv);
 static int cmd_file_delete(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
@@ -7966,7 +7976,9 @@ static const cli_hint_t k_cli_hints[] = {
     { "list_dir", " [path]" },
     { "file_delete", " <path>" },
     { "select_html", " <index>" },
-    { "set_html", " <html>" },
+    { "set_html", " <base64_chunk>" },
+    { "set_html_begin", "" },
+    { "set_html_end", "" },
     { "wpasec_key", " set <key> | read" },
     { "wpasec_upload", "" },
     { "wigle_key", " set <api_name> <api_token> | read" },
@@ -11075,44 +11087,134 @@ static int cmd_select_html(int argc, char **argv)
     return 0;
 }
 
-// Command: set_html - Sets custom HTML from command line argument
+// ----------------------------------------------------------------
+// Chunked base64 HTML transfer protocol:
+//   set_html_begin           — clear buffer, start accumulating
+//   set_html <base64_chunk>  — append chunk to accumulator
+//   set_html_end             — decode accumulated base64 → custom_portal_html
+// ----------------------------------------------------------------
+
+// Command: set_html_begin — initialise the base64 accumulator
+static int cmd_set_html_begin(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    // Free any previous accumulator
+    if (html_b64_buf) {
+        free(html_b64_buf);
+        html_b64_buf = NULL;
+    }
+    html_b64_len = 0;
+    html_b64_cap = HTML_B64_INIT_CAP;
+    html_b64_buf = (char *)malloc(html_b64_cap);
+    if (!html_b64_buf) {
+        MY_LOG_INFO(TAG, "set_html_begin: malloc failed (%u)", (unsigned)html_b64_cap);
+        html_b64_active = false;
+        return 1;
+    }
+    html_b64_buf[0] = '\0';
+    html_b64_active = true;
+    MY_LOG_INFO(TAG, "set_html_begin: ready to receive base64 chunks");
+    return 0;
+}
+
+// Command: set_html <chunk> — append a base64 chunk to the accumulator
 static int cmd_set_html(int argc, char **argv)
 {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: set_html <html_string>");
-        MY_LOG_INFO(TAG, "Example: set_html <!DOCTYPE html><html>...</html>");
+        MY_LOG_INFO(TAG, "Usage: set_html <base64_chunk>");
+        MY_LOG_INFO(TAG, "       Use set_html_begin first, then set_html chunks, then set_html_end");
         return 1;
     }
-    
-    // Concatenate all arguments (HTML may contain spaces)
-    size_t total_len = 0;
-    for (int i = 1; i < argc; i++) {
-        total_len += strlen(argv[i]) + 1; // +1 for space
-    }
-    
-    // Free previous custom HTML if exists
-    if (custom_portal_html != NULL) {
-        free(custom_portal_html);
-        custom_portal_html = NULL;
-    }
-    
-    // Allocate and build the HTML string
-    custom_portal_html = (char*)malloc(total_len + 1);
-    if (custom_portal_html == NULL) {
-        MY_LOG_INFO(TAG, "Failed to allocate memory for HTML.");
+
+    if (!html_b64_active || !html_b64_buf) {
+        MY_LOG_INFO(TAG, "set_html: no transfer in progress — call set_html_begin first");
         return 1;
     }
-    
-    custom_portal_html[0] = '\0';
+
+    // Concatenate all argv fragments (esp_console may split on spaces)
     for (int i = 1; i < argc; i++) {
-        strcat(custom_portal_html, argv[i]);
-        if (i < argc - 1) {
-            strcat(custom_portal_html, " ");
+        size_t frag_len = strlen(argv[i]);
+        // Grow buffer if needed
+        while (html_b64_len + frag_len + 1 > html_b64_cap) {
+            size_t new_cap = html_b64_cap * 2;
+            char *tmp = (char *)realloc(html_b64_buf, new_cap);
+            if (!tmp) {
+                MY_LOG_INFO(TAG, "set_html: realloc failed at %u bytes", (unsigned)new_cap);
+                return 1;
+            }
+            html_b64_buf = tmp;
+            html_b64_cap = new_cap;
         }
+        memcpy(html_b64_buf + html_b64_len, argv[i], frag_len);
+        html_b64_len += frag_len;
+        html_b64_buf[html_b64_len] = '\0';
     }
-    
+    return 0;   // silent success — avoid flooding serial with ACKs
+}
+
+// Command: set_html_end — decode accumulated base64 and set custom_portal_html
+static int cmd_set_html_end(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    if (!html_b64_active || !html_b64_buf || html_b64_len == 0) {
+        MY_LOG_INFO(TAG, "set_html_end: no data received — nothing to decode");
+        html_b64_active = false;
+        return 1;
+    }
+    html_b64_active = false;
+
+    // Calculate decoded size
+    size_t decoded_len = 0;
+    int ret = mbedtls_base64_decode(NULL, 0, &decoded_len,
+                                     (const unsigned char *)html_b64_buf, html_b64_len);
+    // mbedtls returns MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL when just probing size — that's OK
+    if (decoded_len == 0) {
+        MY_LOG_INFO(TAG, "set_html_end: base64 decode size probe failed");
+        free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
+        return 1;
+    }
+    if (decoded_len > HTML_MAX_DECODED) {
+        MY_LOG_INFO(TAG, "set_html_end: HTML too large (%u bytes, max %u)",
+                    (unsigned)decoded_len, (unsigned)HTML_MAX_DECODED);
+        free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
+        return 1;
+    }
+
+    // Allocate decoded buffer (+1 for NUL)
+    char *decoded = (char *)malloc(decoded_len + 1);
+    if (!decoded) {
+        MY_LOG_INFO(TAG, "set_html_end: malloc failed for decoded HTML (%u bytes)",
+                    (unsigned)decoded_len);
+        free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
+        return 1;
+    }
+
+    size_t olen = 0;
+    ret = mbedtls_base64_decode((unsigned char *)decoded, decoded_len + 1, &olen,
+                                 (const unsigned char *)html_b64_buf, html_b64_len);
+    // Free accumulator — no longer needed
+    free(html_b64_buf);
+    html_b64_buf = NULL;
+    html_b64_len = 0;
+    html_b64_cap = 0;
+
+    if (ret != 0) {
+        MY_LOG_INFO(TAG, "set_html_end: base64 decode error (%d)", ret);
+        free(decoded);
+        return 1;
+    }
+    decoded[olen] = '\0';
+
+    // Swap into custom_portal_html
+    if (custom_portal_html) {
+        free(custom_portal_html);
+    }
+    custom_portal_html = decoded;
+
     MY_LOG_INFO(TAG, "Custom HTML set (%u bytes). Portal/Evil Twin/Karma will use this HTML.",
-                (unsigned int)strlen(custom_portal_html));
+                (unsigned)olen);
     return 0;
 }
 
@@ -14272,14 +14374,32 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&select_html_cmd));
 
+    const esp_console_cmd_t set_html_begin_cmd = {
+        .command = "set_html_begin",
+        .help = "Start chunked HTML transfer (base64). Follow with set_html <chunk> then set_html_end",
+        .hint = NULL,
+        .func = &cmd_set_html_begin,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_html_begin_cmd));
+
     const esp_console_cmd_t set_html_cmd = {
         .command = "set_html",
-        .help = "Set custom portal HTML from string: set_html <html>",
+        .help = "Append base64 chunk during HTML transfer: set_html <base64_chunk>",
         .hint = NULL,
         .func = &cmd_set_html,
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&set_html_cmd));
+
+    const esp_console_cmd_t set_html_end_cmd = {
+        .command = "set_html_end",
+        .help = "Finish chunked HTML transfer — decode and activate custom portal HTML",
+        .hint = NULL,
+        .func = &cmd_set_html_end,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_html_end_cmd));
 
     // BLE Scanner commands
     const esp_console_cmd_t scan_bt_cmd = {
