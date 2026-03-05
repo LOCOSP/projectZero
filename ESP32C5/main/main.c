@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <limits.h>
 
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
@@ -48,6 +49,7 @@
 #include "mbedtls/bignum.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
+#include "mbedtls/base64.h"
 #include "esp_timer.h"
 #include "esp_app_format.h"
 
@@ -128,6 +130,13 @@
 #define WPASEC_NVS_KEY       "api_key"
 #define WPASEC_URL           "https://wpa-sec.stanev.org/"
 #define WPASEC_KEY_MAX_LEN   65
+
+// WiGLE cloud upload
+#define WIGLE_NVS_NAMESPACE "wigle"
+#define WIGLE_NVS_KEY_NAME  "api_name"
+#define WIGLE_NVS_KEY_TOKEN "api_token"
+#define WIGLE_URL           "https://api.wigle.net/api/v2/file/upload"
+#define WIGLE_KEY_MAX_LEN   65
 
 #define DISPLAY_NVS_NAMESPACE "display"
 #define DISPLAY_NVS_KEY_MODE  "mode"
@@ -259,6 +268,8 @@ static volatile int wifi_connect_result = 0;
 
 // WPA-SEC API key (loaded from NVS on boot)
 static char wpasec_api_key[WPASEC_KEY_MAX_LEN] = "";
+static char wigle_api_name[WIGLE_KEY_MAX_LEN] = "";
+static char wigle_api_token[WIGLE_KEY_MAX_LEN] = "";
 
 // ARP ban state
 static volatile bool arp_ban_active = false;
@@ -1269,6 +1280,8 @@ static int cmd_display(int argc, char **argv);
 static int cmd_download(int argc, char **argv);
 static int cmd_wpasec_key(int argc, char **argv);
 static int cmd_wpasec_upload(int argc, char **argv);
+static int cmd_wigle_key(int argc, char **argv);
+static int cmd_wigle_upload(int argc, char **argv);
 static int cmd_channel_time(int argc, char **argv);
 static int cmd_ota_check(int argc, char **argv);
 static int cmd_ota_list(int argc, char **argv);
@@ -1380,6 +1393,11 @@ static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 static int find_next_wardrive_file_number(void);
+static bool wigle_split_key_pair(const char *input,
+                                 char *api_name,
+                                 size_t api_name_sz,
+                                 char *api_token,
+                                 size_t api_token_sz);
 // Portal data logging functions
 static void save_evil_twin_password(const char* ssid, const char* password);
 static void save_portal_data(const char* ssid, const char* form_data);
@@ -2460,6 +2478,44 @@ static bool wpasec_save_key_to_nvs(const char *key) {
     }
 
     err = nvs_set_str(handle, WPASEC_NVS_KEY, key);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static void wigle_load_key_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIGLE_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    size_t name_len = sizeof(wigle_api_name);
+    size_t token_len = sizeof(wigle_api_token);
+    err = nvs_get_str(handle, WIGLE_NVS_KEY_NAME, wigle_api_name, &name_len);
+    if (err != ESP_OK) {
+        wigle_api_name[0] = '\0';
+    }
+    err = nvs_get_str(handle, WIGLE_NVS_KEY_TOKEN, wigle_api_token, &token_len);
+    if (err != ESP_OK) {
+        wigle_api_token[0] = '\0';
+    }
+    nvs_close(handle);
+}
+
+static bool wigle_save_key_to_nvs(const char *api_name, const char *api_token) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIGLE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = nvs_set_str(handle, WIGLE_NVS_KEY_NAME, api_name);
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, WIGLE_NVS_KEY_TOKEN, api_token);
+    }
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
@@ -5785,6 +5841,121 @@ static int cmd_save_handshake(int argc, char **argv) {
 
 // --------------- WPA-SEC commands ---------------
 
+static bool wigle_split_key_pair(const char *input,
+                                 char *api_name,
+                                 size_t api_name_sz,
+                                 char *api_token,
+                                 size_t api_token_sz) {
+    if (!input || !api_name || !api_token || api_name_sz == 0 || api_token_sz == 0) {
+        return false;
+    }
+
+    const char *start = input;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+
+    const char *sep = strchr(start, ':');
+    if (!sep || sep == start) {
+        return false;
+    }
+
+    const char *name_end = sep;
+    while (name_end > start && isspace((unsigned char)*(name_end - 1))) {
+        name_end--;
+    }
+
+    const char *token_start = sep + 1;
+    while (*token_start && isspace((unsigned char)*token_start)) {
+        token_start++;
+    }
+
+    const char *token_end = token_start + strlen(token_start);
+    while (token_end > token_start && isspace((unsigned char)*(token_end - 1))) {
+        token_end--;
+    }
+
+    size_t name_len = (size_t)(name_end - start);
+    size_t token_len = (size_t)(token_end - token_start);
+    if (name_len == 0 || token_len == 0) {
+        return false;
+    }
+    if (name_len >= api_name_sz || token_len >= api_token_sz) {
+        return false;
+    }
+
+    memcpy(api_name, start, name_len);
+    api_name[name_len] = '\0';
+    memcpy(api_token, token_start, token_len);
+    api_token[token_len] = '\0';
+    return true;
+}
+
+static bool wigle_is_upload_candidate(const char *filename) {
+    if (!filename) {
+        return false;
+    }
+    size_t len = strlen(filename);
+    if (len > 4 && strcasecmp(filename + len - 4, ".log") == 0) {
+        return true;
+    }
+    if (len > 4 && strcasecmp(filename + len - 4, ".txt") == 0) {
+        return true;
+    }
+    if (len > 4 && strcasecmp(filename + len - 4, ".csv") == 0) {
+        return true;
+    }
+    return false;
+}
+
+static const char *wigle_basename(const char *path) {
+    if (!path) {
+        return NULL;
+    }
+    const char *base = path;
+    const char *slash = strrchr(path, '/');
+    const char *bslash = strrchr(path, '\\');
+    if (slash && bslash) {
+        base = (slash > bslash) ? (slash + 1) : (bslash + 1);
+    } else if (slash) {
+        base = slash + 1;
+    } else if (bslash) {
+        base = bslash + 1;
+    }
+    return base;
+}
+
+static bool wigle_resolve_upload_target(const char *arg, char *out_path, size_t out_path_sz, char *out_name, size_t out_name_sz) {
+    if (!arg || !out_path || !out_name || out_path_sz == 0 || out_name_sz == 0) {
+        return false;
+    }
+
+    const char *name = wigle_basename(arg);
+    if (!name || name[0] == '\0' || !wigle_is_upload_candidate(name)) {
+        return false;
+    }
+
+    if (strchr(arg, '/') || strchr(arg, '\\')) {
+        if (strncmp(arg, "/sdcard/", 8) == 0) {
+            snprintf(out_path, out_path_sz, "%s", arg);
+        } else if (strncmp(arg, "sdcard/", 7) == 0) {
+            snprintf(out_path, out_path_sz, "/%s", arg);
+        } else {
+            return false;
+        }
+    } else {
+        snprintf(out_path, out_path_sz, "/sdcard/lab/wardrives/%s", name);
+    }
+
+    snprintf(out_name, out_name_sz, "%s", name);
+
+    struct stat st;
+    if (stat(out_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    return true;
+}
+
 static int cmd_wpasec_key(int argc, char **argv) {
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: wpasec_key set <key> | wpasec_key read");
@@ -6088,6 +6259,435 @@ static int cmd_wpasec_upload(int argc, char **argv) {
     closedir(dir);
 
     MY_LOG_INFO(TAG, "Done: %d uploaded, %d duplicate, %d failed", uploaded, duplicates, failed);
+    return (failed > 0) ? 1 : 0;
+}
+
+/**
+ * @brief Upload a single Wardrive file (.log/.txt/.csv) to api.wigle.net
+ *
+ * @return 0 on success, 1 on duplicate/skipped, 2 on auth error, -1 on error
+ */
+static int wigle_upload_file(const char *filepath, const char *filename) {
+    const size_t CHUNK_SIZE = 2048;
+    const size_t HDR_BUF_SZ = 640;
+    const size_t RESP_BUF_SZ = 640;
+    int result = -1;
+    FILE *f = NULL;
+    esp_tls_t *tls = NULL;
+    uint8_t *chunk_buf = NULL;
+    char *http_headers = NULL;
+    char *resp_buf = NULL;
+
+    f = fopen(filepath, "rb");
+    if (!f) {
+        MY_LOG_INFO(TAG, "  Failed to open: %s", filepath);
+        goto cleanup;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (file_size <= 0 || file_size > 16L * 1024L * 1024L) {
+        MY_LOG_INFO(TAG, "  Invalid file size: %ld bytes", file_size);
+        goto cleanup;
+    }
+
+    char auth_plain[2 * WIGLE_KEY_MAX_LEN + 2];
+    int auth_plain_len = snprintf(auth_plain, sizeof(auth_plain), "%s:%s", wigle_api_name, wigle_api_token);
+    if (auth_plain_len <= 0 || auth_plain_len >= (int)sizeof(auth_plain)) {
+        MY_LOG_INFO(TAG, "  WiGLE credentials are too long");
+        goto cleanup;
+    }
+
+    unsigned char auth_b64[220];
+    size_t auth_b64_len = 0;
+    int b64_ret = mbedtls_base64_encode(auth_b64, sizeof(auth_b64) - 1, &auth_b64_len,
+                                        (const unsigned char *)auth_plain, (size_t)auth_plain_len);
+    if (b64_ret != 0 || auth_b64_len == 0 || auth_b64_len >= sizeof(auth_b64)) {
+        MY_LOG_INFO(TAG, "  Failed to build WiGLE auth header");
+        goto cleanup;
+    }
+    auth_b64[auth_b64_len] = '\0';
+
+    char boundary[40];
+    snprintf(boundary, sizeof(boundary), "----WiGLE%lu", (unsigned long)(esp_timer_get_time() / 1000));
+
+    char body_start[256];
+    int start_len = snprintf(body_start, sizeof(body_start),
+                             "--%s\r\n"
+                             "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+                             "Content-Type: text/csv\r\n\r\n",
+                             boundary, filename);
+    if (start_len <= 0 || start_len >= (int)sizeof(body_start)) {
+        MY_LOG_INFO(TAG, "  Failed to build multipart header");
+        goto cleanup;
+    }
+
+    char body_end[64];
+    int end_len = snprintf(body_end, sizeof(body_end), "\r\n--%s--\r\n", boundary);
+    if (end_len <= 0 || end_len >= (int)sizeof(body_end)) {
+        MY_LOG_INFO(TAG, "  Failed to build multipart footer");
+        goto cleanup;
+    }
+
+    int64_t body_total_len_64 = (int64_t)start_len + (int64_t)file_size + (int64_t)end_len;
+    if (body_total_len_64 <= 0 || body_total_len_64 > INT_MAX) {
+        MY_LOG_INFO(TAG, "  File too large for HTTP content-length: %ld bytes", file_size);
+        goto cleanup;
+    }
+    int body_total_len = (int)body_total_len_64;
+
+    http_headers = (char *)heap_caps_malloc(HDR_BUF_SZ, MALLOC_CAP_8BIT);
+    resp_buf = (char *)heap_caps_malloc(RESP_BUF_SZ, MALLOC_CAP_8BIT);
+    chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!chunk_buf) {
+        chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (!http_headers || !resp_buf || !chunk_buf) {
+        MY_LOG_INFO(TAG, "  Buffer allocation failed (hdr/resp/chunk)");
+        goto cleanup;
+    }
+
+    int hdr_len = snprintf(http_headers, HDR_BUF_SZ,
+                           "POST /api/v2/file/upload HTTP/1.1\r\n"
+                           "Host: api.wigle.net\r\n"
+                           "Authorization: Basic %s\r\n"
+                           "Content-Type: multipart/form-data; boundary=%s\r\n"
+                           "Content-Length: %d\r\n"
+                           "User-Agent: projectZero-wigle\r\n"
+                           "Connection: close\r\n"
+                           "\r\n",
+                           (const char *)auth_b64, boundary, body_total_len);
+    if (hdr_len <= 0 || hdr_len >= (int)HDR_BUF_SZ) {
+        MY_LOG_INFO(TAG, "  Failed to build HTTP headers");
+        goto cleanup;
+    }
+
+    esp_tls_cfg_t tls_cfg = {
+        .crt_bundle_attach = NULL,
+        .timeout_ms = 20000,
+    };
+
+    tls = esp_tls_init();
+    if (!tls) {
+        MY_LOG_INFO(TAG, "  TLS init failed");
+        goto cleanup;
+    }
+
+    int ret = esp_tls_conn_http_new_sync(WIGLE_URL, &tls_cfg, tls);
+    if (ret < 0) {
+        MY_LOG_INFO(TAG, "  TLS connection failed");
+        goto cleanup;
+    }
+
+    if (wpasec_tls_write_all(tls, http_headers, hdr_len) < 0 ||
+        wpasec_tls_write_all(tls, body_start, start_len) < 0) {
+        MY_LOG_INFO(TAG, "  Failed to send request headers/body start");
+        goto cleanup;
+    }
+
+    while (1) {
+        size_t bytes_read = fread(chunk_buf, 1, CHUNK_SIZE, f);
+        if (bytes_read > 0) {
+            if (wpasec_tls_write_all(tls, (const char *)chunk_buf, (int)bytes_read) < 0) {
+                MY_LOG_INFO(TAG, "  Failed to send file chunk");
+                goto cleanup;
+            }
+        }
+        if (bytes_read < CHUNK_SIZE) {
+            if (ferror(f)) {
+                MY_LOG_INFO(TAG, "  Read error while streaming file");
+                goto cleanup;
+            }
+            break;
+        }
+    }
+
+    if (wpasec_tls_write_all(tls, body_end, end_len) < 0) {
+        MY_LOG_INFO(TAG, "  Failed to send multipart footer");
+        goto cleanup;
+    }
+
+    memset(resp_buf, 0, RESP_BUF_SZ);
+    int total_read = 0;
+    while (total_read < (int)RESP_BUF_SZ - 1) {
+        ret = esp_tls_conn_read(tls, resp_buf + total_read, RESP_BUF_SZ - 1 - total_read);
+        if (ret <= 0) break;
+        total_read += ret;
+    }
+    resp_buf[total_read] = '\0';
+
+    int status = 0;
+    if (total_read > 12 && strncmp(resp_buf, "HTTP/", 5) == 0) {
+        const char *sp = strchr(resp_buf, ' ');
+        if (sp) {
+            status = atoi(sp + 1);
+        }
+    }
+
+    bool duplicate = (strstr(resp_buf, "already") != NULL ||
+                      strstr(resp_buf, "Already") != NULL ||
+                      strstr(resp_buf, "duplicate") != NULL ||
+                      strstr(resp_buf, "Duplicate") != NULL);
+    bool success_false = (strstr(resp_buf, "\"success\":false") != NULL ||
+                          strstr(resp_buf, "\"success\": false") != NULL);
+
+    if (status == 200 || status == 201 || status == 202) {
+        if (duplicate) {
+            result = 1;
+            goto cleanup;
+        }
+        if (success_false) {
+            MY_LOG_INFO(TAG, "  WiGLE API returned success=false");
+            result = -1;
+            goto cleanup;
+        }
+        result = 0;
+        goto cleanup;
+    }
+
+    if (status == 401 || status == 403) {
+        result = 2;
+        goto cleanup;
+    }
+    if (status == 409) {
+        result = 1;
+        goto cleanup;
+    }
+
+    MY_LOG_INFO(TAG, "  HTTP error %d", status);
+    result = -1;
+
+cleanup:
+    if (f) {
+        fclose(f);
+    }
+    if (tls) {
+        esp_tls_conn_destroy(tls);
+    }
+    if (chunk_buf) {
+        free(chunk_buf);
+    }
+    if (http_headers) {
+        free(http_headers);
+    }
+    if (resp_buf) {
+        free(resp_buf);
+    }
+    return result;
+}
+
+static int cmd_wigle_key(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read");
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
+            MY_LOG_INFO(TAG, "WiGLE key: not set");
+            MY_LOG_INFO(TAG, "Set via: wigle_key set <api_name> <api_token>");
+            MY_LOG_INFO(TAG, "Or place api_name:api_token in /sdcard/lab/wigle.txt and reboot.");
+        } else {
+            MY_LOG_INFO(TAG, "WiGLE key: %.4s****:%.4s****", wigle_api_name, wigle_api_token);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        char api_name[WIGLE_KEY_MAX_LEN] = {0};
+        char api_token[WIGLE_KEY_MAX_LEN] = {0};
+
+        if (argc >= 4) {
+            if (strlen(argv[2]) >= sizeof(api_name) || strlen(argv[3]) >= sizeof(api_token)) {
+                MY_LOG_INFO(TAG, "Invalid key length (max %d chars each)", WIGLE_KEY_MAX_LEN - 1);
+                return 1;
+            }
+            snprintf(api_name, sizeof(api_name), "%s", argv[2]);
+            snprintf(api_token, sizeof(api_token), "%s", argv[3]);
+        } else if (argc == 3) {
+            if (!wigle_split_key_pair(argv[2], api_name, sizeof(api_name), api_token, sizeof(api_token))) {
+                MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token>");
+                MY_LOG_INFO(TAG, "Or:    wigle_key set <api_name:api_token>");
+                return 1;
+            }
+        } else {
+            MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token>");
+            MY_LOG_INFO(TAG, "Or:    wigle_key set <api_name:api_token>");
+            return 0;
+        }
+
+        if (api_name[0] == '\0' || api_token[0] == '\0') {
+            MY_LOG_INFO(TAG, "WiGLE API name/token must not be empty");
+            return 1;
+        }
+
+        if (wigle_save_key_to_nvs(api_name, api_token)) {
+            snprintf(wigle_api_name, sizeof(wigle_api_name), "%s", api_name);
+            snprintf(wigle_api_token, sizeof(wigle_api_token), "%s", api_token);
+            MY_LOG_INFO(TAG, "WiGLE key saved: %.4s****:%.4s****", wigle_api_name, wigle_api_token);
+        } else {
+            MY_LOG_INFO(TAG, "Failed to save WiGLE key to NVS");
+            return 1;
+        }
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read");
+    return 0;
+}
+
+static int cmd_wigle_upload(int argc, char **argv) {
+    oled_display_update_full("> WiGLE", "  Sending files", "  api.wigle.net", "  Uploading...");
+
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "WIFI NOT CONNECTED");
+        MY_LOG_INFO(TAG, "Not connected to any AP. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
+        MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
+        MY_LOG_INFO(TAG, "Use 'wigle_key set <api_name> <api_token>' or /sdcard/lab/wigle.txt");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    int uploaded = 0;
+    int skipped = 0;
+    int failed = 0;
+    bool auth_failed = false;
+
+    // If files are passed as args, upload only those selected files.
+    if (argc > 1) {
+        int total_files = argc - 1;
+        MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to api.wigle.net...", total_files);
+
+        for (int i = 1; i < argc; i++) {
+            const char *arg = argv[i];
+            char filepath[280];
+            char upload_name[128];
+
+            if (!wigle_resolve_upload_target(arg, filepath, sizeof(filepath), upload_name, sizeof(upload_name))) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (invalid/missing file)", i, total_files, arg ? arg : "(null)");
+                failed++;
+                continue;
+            }
+
+            struct stat st;
+            long fsize = 0;
+            if (stat(filepath, &st) == 0) {
+                fsize = (long)st.st_size;
+            }
+
+            int result = wigle_upload_file(filepath, upload_name);
+            if (result == 0) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
+                uploaded++;
+            } else if (result == 1) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (duplicate)", i, total_files, upload_name, fsize);
+                skipped++;
+            } else if (result == 2) {
+                MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", i, total_files, upload_name, fsize);
+                failed++;
+                auth_failed = true;
+                break;
+            } else {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", i, total_files, upload_name, fsize);
+                failed++;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+
+        MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+        if (auth_failed) {
+            return 1;
+        }
+        return (failed > 0) ? 1 : 0;
+    }
+
+    DIR *dir = opendir("/sdcard/lab/wardrives");
+    if (dir == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        return 1;
+    }
+
+    struct dirent *entry;
+    int total_files = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wigle_is_upload_candidate(entry->d_name)) {
+            total_files++;
+        }
+    }
+
+    if (total_files == 0) {
+        MY_LOG_INFO(TAG, "No Wardrive files (.log/.txt/.csv) found in /sdcard/lab/wardrives/");
+        MY_LOG_INFO(TAG, "Done: 0 uploaded, 0 skipped, 0 failed");
+        closedir(dir);
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to api.wigle.net...", total_files);
+
+    rewinddir(dir);
+    int current = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (!wigle_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        current++;
+        char filepath[280];
+        snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
+
+        struct stat st;
+        long fsize = 0;
+        if (stat(filepath, &st) == 0) {
+            fsize = (long)st.st_size;
+        }
+
+        int result = wigle_upload_file(filepath, entry->d_name);
+        if (result == 0) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
+            uploaded++;
+        } else if (result == 1) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (duplicate)", current, total_files, entry->d_name, fsize);
+            skipped++;
+        } else if (result == 2) {
+            MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", current, total_files, entry->d_name, fsize);
+            failed++;
+            auth_failed = true;
+            break;
+        } else {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
+            failed++;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    closedir(dir);
+
+    MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+    if (auth_failed) {
+        return 1;
+    }
     return (failed > 0) ? 1 : 0;
 }
 
@@ -7138,6 +7738,8 @@ static const cli_hint_t k_cli_hints[] = {
     { "set_html", " <html>" },
     { "wpasec_key", " set <key> | read" },
     { "wpasec_upload", "" },
+    { "wigle_key", " set <api_name> <api_token> | read" },
+    { "wigle_upload", " [file1 file2 ...]" },
 };
 
 static const char *lookup_cli_hint(const char *command) {
@@ -13078,6 +13680,24 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wpasec_upload_cmd));
 
+    const esp_console_cmd_t wigle_key_cmd = {
+        .command = "wigle_key",
+        .help = "Set/read WiGLE API credentials: wigle_key set <api_name> <api_token> | wigle_key read",
+        .hint = NULL,
+        .func = &cmd_wigle_key,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wigle_key_cmd));
+
+    const esp_console_cmd_t wigle_upload_cmd = {
+        .command = "wigle_upload",
+        .help = "Upload Wardrive files to WiGLE: wigle_upload [file1 file2 ...] (no args = upload all)",
+        .hint = NULL,
+        .func = &cmd_wigle_upload,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wigle_upload_cmd));
+
        const esp_console_cmd_t sae_overflow_cmd = {
         .command = "sae_overflow",
         .help = "Starts SAE WPA3 Client Overflow attack.",
@@ -13538,6 +14158,7 @@ void app_main(void) {
 //     printf("Step 3: Init NVS\n");
     ota_load_channel_from_nvs();
     wpasec_load_key_from_nvs();
+    wigle_load_key_from_nvs();
     ota_mark_valid_if_pending();
     ota_log_boot_info();
     {
@@ -13641,6 +14262,8 @@ void app_main(void) {
 
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    // Keep REPL stable for heavier TLS-based commands triggered directly from CLI.
+    repl_config.task_stack_size = 8192;
      MY_LOG_INFO(TAG,"");
     MY_LOG_INFO(TAG,"Available commands:");
       MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
@@ -13699,6 +14322,8 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
       MY_LOG_INFO(TAG,"  wpasec_key set <key> | wpasec_key read");
       MY_LOG_INFO(TAG,"  wpasec_upload");
+      MY_LOG_INFO(TAG,"  wigle_key set <api_name> <api_token> | wigle_key read");
+      MY_LOG_INFO(TAG,"  wigle_upload");
 
     repl_config.prompt = ">";
     repl_config.max_cmdline_length = 100;
@@ -13764,6 +14389,32 @@ void app_main(void) {
                         } else {
                             MY_LOG_INFO(TAG, "Failed to save wpa-sec key from SD card to NVS.");
                         }
+                    }
+                }
+                fclose(wf);
+            }
+        }
+        // Check for WiGLE API credentials file on SD card (format: api_name:api_token)
+        {
+            FILE *wf = fopen("/sdcard/lab/wigle.txt", "r");
+            if (wf) {
+                static char line[256];
+                memset(line, 0, sizeof(line));
+                if (fgets(line, sizeof(line), wf)) {
+                    static char api_name[WIGLE_KEY_MAX_LEN];
+                    static char api_token[WIGLE_KEY_MAX_LEN];
+                    memset(api_name, 0, sizeof(api_name));
+                    memset(api_token, 0, sizeof(api_token));
+                    if (wigle_split_key_pair(line, api_name, sizeof(api_name), api_token, sizeof(api_token))) {
+                        if (wigle_save_key_to_nvs(api_name, api_token)) {
+                            snprintf(wigle_api_name, sizeof(wigle_api_name), "%s", api_name);
+                            snprintf(wigle_api_token, sizeof(wigle_api_token), "%s", api_token);
+                            MY_LOG_INFO(TAG, "WiGLE key updated from SD card into NVS.");
+                        } else {
+                            MY_LOG_INFO(TAG, "Failed to save WiGLE key from SD card to NVS.");
+                        }
+                    } else {
+                        MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wigle.txt format. Expected: api_name:api_token");
                     }
                 }
                 fclose(wf);
