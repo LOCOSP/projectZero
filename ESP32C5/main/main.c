@@ -11020,9 +11020,17 @@ static int cmd_start_portal(int argc, char **argv) {
         return 0;
     }
     
-    const char *ssid = argv[1];
+    // Concatenate all arguments to support SSIDs with spaces
+    // e.g. start_portal Darmowy Internet → "Darmowy Internet"
+    static char ssid_buf[33]; // 32 chars max + NUL
+    ssid_buf[0] = '\0';
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) strncat(ssid_buf, " ", sizeof(ssid_buf) - strlen(ssid_buf) - 1);
+        strncat(ssid_buf, argv[i], sizeof(ssid_buf) - strlen(ssid_buf) - 1);
+    }
+    const char *ssid = ssid_buf;
     size_t ssid_len = strlen(ssid);
-    
+
     // Validate SSID length (WiFi SSID max is 32 characters)
     if (ssid_len == 0 || ssid_len > 32) {
         MY_LOG_INFO(TAG, "SSID length must be between 1 and 32 characters");
