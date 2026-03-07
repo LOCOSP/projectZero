@@ -111,7 +111,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.4"
+#define JANOS_VERSION "1.5.5"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -8068,6 +8068,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
         esp_netif_ip_info_t ip_info = { 0 };
         bool has_ip = wait_for_sta_ip_info(&ip_info, 5000);
         MY_LOG_INFO(TAG, "SUCCESS: Connected to '%s'", ssid);
+        save_evil_twin_password(ssid, password);
         if (has_ip) {
             if (use_static_ip) {
                 MY_LOG_INFO(TAG, "Static IP: " IPSTR ", Netmask: " IPSTR ", GW: " IPSTR,
@@ -16465,8 +16466,25 @@ static void save_evil_twin_password(const char* ssid, const char* password) {
         return;
     }
     
+    // Check for duplicate before writing
+    char match_line[256];
+    snprintf(match_line, sizeof(match_line), "\"%s\", \"%s\"", ssid, password);
+    
+    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "r");
+    if (file != NULL) {
+        char line[256];
+        while (fgets(line, sizeof(line), file) != NULL) {
+            if (strstr(line, match_line) != NULL) {
+                fclose(file);
+                MY_LOG_INFO(TAG, "Credentials already in eviltwin.txt, skipping");
+                return;
+            }
+        }
+        fclose(file);
+    }
+    
     // Try to open file for appending (use short name without underscore for FAT compatibility)
-    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "a");
+    file = fopen("/sdcard/lab/eviltwin.txt", "a");
     if (file == NULL) {
         MY_LOG_INFO(TAG, "Failed to open eviltwin.txt for append, errno: %d (%s). Trying to create...", errno, strerror(errno));
         
