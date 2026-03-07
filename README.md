@@ -103,6 +103,7 @@ Enrich CLI/Flipper listings with manufacturer names by feeding a compact OUI dat
 
 - `/lab/white.txt` - whitelist BSSIDs (colon or dash separated) respected by Blackout and Sniffer Dog.
 - `/lab/wardrives/wXXXX.log` - Wigle-compatible wardrive logs incremented automatically.
+- `/lab/wigle.txt` - WiGLE API credentials loaded on boot in format `api_name:api_token` (single line, no quotes), e.g. `your_wigle_user:your_wigle_api_token`.
 - `/lab/htmls/*.html` - captive portal templates discovered by `list_sd`.
 - `/lab/portals.txt` - persistent CSV-like log of every POST field the captive portal receives.
 - `/lab/oui_wifi.bin` - vendor lookup table streamed on demand.
