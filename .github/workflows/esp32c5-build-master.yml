@@ -324,100 +324,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  pages:
-    name: Pages Web Flasher
-    needs: [release, firmware, fap]
-    if: ${{ needs.release.result == 'success' }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    outputs:
-      page_url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
-        with:
-          enablement: true
-
-      - name: Resolve release tag
-        id: meta
-        env:
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ inputs.release_tag }}
-          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
-        run: |
-          set -euo pipefail
-          TAG="${EVENT_TAG:-}"
-          if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
-          if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Using tag: $TAG"
-
-      - name: Download release assets
-        id: download
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.meta.outputs.tag }}"
-          rm -rf docs/firmware
-          mkdir -p docs/firmware
-
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" --dir docs/firmware \
-            --pattern "bootloader.bin" \
-            --pattern "partition-table.bin" \
-            --pattern "projectZero*.bin"
-
-          ls -lh docs/firmware
-
-          if [ ! -f docs/firmware/projectZero.bin ]; then
-            alt=$(ls docs/firmware/projectZero-*.bin 2>/dev/null | head -n1 || true)
-            if [ -n "$alt" ]; then
-              cp "$alt" docs/firmware/projectZero.bin
-            fi
-          fi
-
-          for f in bootloader.bin partition-table.bin projectZero.bin; do
-            if [ ! -f "docs/firmware/$f" ]; then
-              echo "Missing $f in release assets for tag ${TAG}" >&2
-              exit 1
-            fi
-          done
-
-          fw_version=$(ls docs/firmware/projectZero-*.bin 2>/dev/null | head -n1 | xargs -n1 basename | sed -E 's/^projectZero-([^.]*)\\.bin$/\\1/')
-          if [ -z "$fw_version" ]; then
-            fw_version="${TAG}"
-          fi
-          echo "fw_version=$fw_version" >> "$GITHUB_OUTPUT"
-
-      - name: Build manifest.json
-        env:
-          FW_VERSION: ${{ steps.download.outputs.fw_version }}
-          BUILD_TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          set -euo pipefail
-          python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG','manual'); manifest={'name':'projectZero ESP32-C5','version':version,'build':build,'chipFamily':'ESP32-C5','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/projectZero.bin','offset':131072}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2))"
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: docs
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
   discord:
     name: Discord
-    needs: [release, firmware, fap, pages]
+    needs: [release, firmware, fap]
     runs-on: ubuntu-24.04
+    if: ${{ needs.release.result == 'success' }}
     steps:
       - name: Notify Discord
         if: success()
@@ -428,7 +339,6 @@ jobs:
           FAP_VERSION: ${{ needs.fap.outputs.fap_version }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
           REPO: ${{ github.repository }}
-          PAGES_URL: ${{ needs.pages.outputs.page_url || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
         run: |
           set -euo pipefail
           if [ -z "$DISCORD_WEBHOOK" ]; then
@@ -442,7 +352,6 @@ jobs:
           FAP_ZIP="$BASE_URL/projectZero-faps-${FAP_VER}.zip"
           BUNDLE_ZIP="$BASE_URL/projectZero-${FW_VERSION}-with-fap-${FAP_VER}.zip"
           RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
-          PAGES_LINK="${PAGES_URL:-https://${GITHUB_REPOSITORY%/*}.github.io/${GITHUB_REPOSITORY#*/}/}"
 
           RELEASE_BODY=""
           if [ "${GITHUB_EVENT_NAME:-}" = "release" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
@@ -454,12 +363,10 @@ jobs:
 
           base_content=$(
             printf '%s\n' \
-              "JanOS" \
+              "JanOS (LOCOSP fork)" \
               "Release ${TAG} published." \
               "Release page:" \
               "${RELEASE_PAGE}" \
-              "Web flasher:" \
-              "${PAGES_LINK}" \
               "JanOS (${FW_VERSION}):" \
               "${JANOS_ZIP}" \
               "FAPs (${FAP_VER}):" \
