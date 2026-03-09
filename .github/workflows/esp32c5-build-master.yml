@@ -7,7 +7,7 @@ on:
         description: "Optional tag name to upload assets to a release (example 'v1.2.3')"
         required: false
   push:
-    branches: [main, feature/handshake-serial]
+    branches: [main, feature/handshake-serial, feature/handshake-serial-dev]
     paths:
       - 'ESP32C5/main/main.c'
       - 'FLIPPER/**'
