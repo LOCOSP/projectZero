@@ -1,11 +1,19 @@
-# projectZero
+# projectZero (LOCOSP fork)
 
-## Web flasher (Flipper + LAB C5)
-- Web flasher for Flipper Zero FAP and LAB C5 firmware: https://c5lab.github.io/projectZero/
-- Latest releases and changelog: https://github.com/C5Lab/projectZero/releases
+> Fork of [C5Lab/projectZero](https://github.com/C5Lab/projectZero) with additional features for headless (no SD card) operation and serial-based data streaming, built for use with [JanOS-app](https://github.com/LOCOSP/JanOS-app) TUI.
+
+## Downloads
+- **Latest firmware:** [GitHub Releases](https://github.com/LOCOSP/projectZero/releases/latest)
+- **Upstream project:** [C5Lab/projectZero](https://github.com/C5Lab/projectZero)
+
+### What this fork adds
+- **Handshake capture without SD card** — PCAP/HCCAPX streamed as base64 over serial, saved on the host machine
+- **Custom captive portal upload via serial** — `set_html` chunked protocol pushes HTML from host to ESP32 PSRAM (up to 1 MB)
+- **SSID with spaces** in `start_portal` command
+- All upstream features remain intact
 
 projectZero is a LAB C5 board add-on firmware that layers blackout, Sniffer Dog, wardriving, and captive portal tools on top of ESP32-C5 dual-band (2.4/5 GHz) radios—and is the first to ship working WPA handshake capture on ESP32-C5 using ESP-IDF.
-- **ESP32-C5-WROOM-1** (USB CLI) scans, runs the embedded evil-twin portal, captures credentials, and verifies WPA2/WPA3 passwords—everything lives on the same board now.  
+- **ESP32-C5-WROOM-1** (USB CLI) scans, runs the embedded evil-twin portal, captures credentials, and verifies WPA2/WPA3 passwords—everything lives on the same board now.
 - **Flipper Zero companion app** mirrors the CLI features and keeps the handheld navigation lightweight.
 - **LAB C5 board** is available on Tindie: https://www.tindie.com/products/lab/lab-esp32c5-flipper-zero-marauder/
 
@@ -110,47 +118,73 @@ Enrich CLI/Flipper listings with manufacturer names by feeding a compact OUI dat
 
 ## Flashing the ESP32-C5 Firmware
 
-1. Open a terminal in the repo and switch to the binaries folder: `cd ESP32C5/binaries-esp32c5`.
-2. Run the flasher: `python flash_board.py`. The script waits for a USB-UART bridge before streaming the binary.
-3. On the Flipper Zero, open **GPIO → GPIO → USB-UART Bridge** so it presents a serial adapter to the host PC.
-- While holding the lower **BOOT** button on the LAB C5 board, plug the board into the Flipper; release BOOT right after it clicks in.
-4. Connect the Flipper to your PC over USB; the flashing script will detect the bridge automatically (no qFlipper needed).
-5. Once the transfer begins the rest is automatic; the board reboots into the freshly flashed JanOS build.
+> **Important:** The upstream [C5Lab web flasher](https://c5lab.github.io/projectZero/) only supports mainline firmware and will **not** work with this fork. Use one of the methods below.
 
-### Flipper `.fap` via browser (experimental)
-- Open `docs/flipper_fap.html` in Chrome/Edge (HTTPS/local). Make sure Flipper exposes CDC/CLI (`>:` prompt).
-- Pick track (Unleashed/Momentum). The page auto-fetches the latest release `.fap` and shows file+size; you can re-fetch or point to a local `FLIPPER/dist/*.fap`, then hit **Upload** (uses `storage write_chunk` over WebSerial).
+### Method 1: flash_board.py (recommended)
+
+1. Download **`esp32c5-firmware.zip`** from the [latest release](https://github.com/LOCOSP/projectZero/releases/latest) and unzip it.
+2. Install dependencies:
+   ```bash
+   pip install --upgrade esptool pyserial
+   ```
+3. Put the ESP32-C5 into download mode — hold the **BOOT** button while plugging in USB (or while pressing **RESET**), then release.
+4. Flash:
+   ```bash
+   python flash_board.py --port /dev/ttyUSB0          # Linux
+   python flash_board.py --port COM10                 # Windows
+   python flash_board.py --port /dev/ttyUSB0 --erase  # full erase before flash
+   ```
+5. The board reboots automatically after flashing.
+
+### Method 2: Browser-based flasher (esptool-js)
+
+No installation needed — works in Chrome/Edge with WebSerial support.
+
+1. Download and unzip **`esp32c5-firmware.zip`** from the [latest release](https://github.com/LOCOSP/projectZero/releases/latest).
+2. Open [Espressif Web Flasher](https://espressif.github.io/esptool-js/) in your browser.
+3. Put the ESP32-C5 into download mode (hold **BOOT** + plug USB).
+4. Click **Connect**, select the serial port, and set baud to **460800**.
+5. Add the firmware files with these flash addresses:
+   | File | Address |
+   |------|---------|
+   | `bootloader.bin` | `0x0` |
+   | `partition-table.bin` | `0x8000` |
+   | `projectZero.bin` | `0x10000` |
+6. Click **Program** and wait for it to finish.
+7. After flashing, copy `oui_wifi.bin` to the SD card at `/lab/oui_wifi.bin` (optional, for vendor name lookups).
+
+### Method 3: Flashing via Flipper Zero USB-UART Bridge
+
+If the ESP32-C5 is connected through a Flipper Zero:
+
+1. On the Flipper, open **GPIO → USB-UART Bridge** so it presents a serial adapter to the host PC.
+2. While holding the **BOOT** button on the LAB C5 board, plug the board into the Flipper; release BOOT after it clicks in.
+3. Connect the Flipper to your PC over USB.
+4. Run `flash_board.py` as shown in Method 1 — it will detect the bridge automatically (close qFlipper first).
 
 ### Flashing Troubleshooting
 
-- Make sure the qFlipper application is closed; it will keep the UART bridge busy and the script will hang.
-- If you launched `flash_board.py` while the Flipper was already connected and nothing happened, unplug the USB cable, stop the script, then rerun the script before reconnecting (with BOOT held as described above).
+- **No port detected?** Make sure the board is in download mode (BOOT held during plug-in). On Windows you may need [CP210x](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers) or [CH340](http://www.wch.cn/download/CH341SER_EXE.html) drivers.
+- **qFlipper blocking the port?** Close qFlipper before flashing — it keeps the UART bridge busy.
+- **Flash failed mid-transfer?** Unplug USB, close the script, then retry with BOOT held from the start.
 
-With these anchors in place the README now focuses purely on the software's primary functions-scanning, deciding, attacking, and logging-while pointing both CLI and Flipper users to the exact commands and assets that power each flow.
+## Credits
 
-## About Us
-
-We're regular tinkerers who got bored and decided to design the full stack ourselves—from the LAB C5 hardware layout, through the JanOS firmware, to the graphics that ship with the Flipper app. Got questions or ideas? Drop by the Discord: https://discord.gg/57wmJzzR8C
+This fork is maintained by [LOCOSP](https://github.com/LOCOSP). The original projectZero is built by the [C5Lab](https://github.com/C5Lab) team.
 
 ## Community and Docs
 
-- Full technical documentation, wiring notes, and troubleshooting live on the wiki: https://github.com/C5Lab/projectZero/wiki
-- Join the LAB Discord server to discuss ESP32-C5 builds and projectZero workflows: https://discord.gg/57wmJzzR8C
+- Upstream wiki and hardware docs: https://github.com/C5Lab/projectZero/wiki
+- LAB Discord: https://discord.gg/57wmJzzR8C
 
-## Last Changes
-- 2025-12-23 JanOS 1.0.1 - fix evil rerun fail on bad pass / portal restart fix + new `show_pass` CLI / Fix boot_button fail to launch; FAP 0.38 - Portal /Evil twin / Blackout and Snifferdog GUI + Show Password for Evil and Portal
-- 2025-12-18 JanOS 1.0.1 - New GPS support for M5Stack GPS 1.1 / FAP 0.37 - Fix not full ssid and mac in Sniffer
-- 2025-12-17 FAP 0.36 - Fix Out of memory on flipper when using qfliper
-- 2025-12-11 FAP 0.35 - fixed qFlipper-connected crash; Sniffer flow adds 200+ pkt right-jump to Results then Probes, left/back returns; Probes label corrected for 2-digit SSID counts; haptics on Sniffer edge; hold Back to root, double Back opens Exit; Deauth Guard LED hit indicator removed; Wi-Fi Targets left re-runs Scanner and resets results; restored Scanner arrow after returning from console; build via `FLIPPER/build_fap.py`, deploy via `FLIPPER/dist/deploy_fap.py`.
-- 2025-12-10 FAP 0.34 Sniffer - new GUI for all 3 options
-- 2025-12-08 JanOS 1.0.0 fix BT name scan / FAP 0.33 Wifi Scanner new GUI / BT all GUI rework, BT scan show name of device / Exit from FAP small heptic.
-- 2025-12-07 JanOS 1.0.0 BT scan / Airtag scan / BT Locator / Deauth Guard passive deauth detection / FAP 031 support for JanOS 1.0.0 new Bluetooth menu
-- 2025-12-04 FAP 0.30 - Improve board discovery bootstrap with stabilization reboot
-- 2025-12-04 FAP 0.29 - fix evil twin exit and reopen FAP crash flipper
-- 2025-12-03 JanOS 0.7.6 / FAP 0.28 - Setup / Scan timing: add configurable min/max durations for scanning.
-- 2025-11-30 JanOS 0.7.5 / FAP 0.27 - Added Sniffer start with selected targets; Back stops and returns to Sniffers on Show Sniffer Results.
-- 2025-11-29 FAP 0.26 - Setup → SD Manager with folder picker, file listing, delete + scrolling for long names.
-- 2025-11-29 JanOS 0.7.1 - Added `list_dir [path]` and `file_delete <path>` for SD browsing/cleanup alongside `list_sd`.
-- 2025-11-29 FAP 0.25 - Fixed missing propagation of `config.txt` (config load/create popups now appear and settings persist).
-- 2025-11-28 JanOS 0.7.0 - Added WPA handshake capture via `start_handshake`.
-- 2025-11-28 FAP 0.24 - Attack / Handshaker.
+## Fork Changes
+- 2026-03-09 JanOS 1.5.5 - Handshake capture via serial (no SD card required), PCAP/HCCAPX streamed as base64 to host
+- 2026-03-09 JanOS 1.5.5 - Custom captive portal upload via serial (`set_html` chunked protocol, 1 MB PSRAM buffer)
+- 2026-03-09 JanOS 1.5.5 - Fix `start_portal` SSID with spaces, PSRAM buffer for `set_html` to prevent DRAM heap corruption
+- 2026-03-09 JanOS 1.5.5 - Console `max_cmdline_length` increased to 1024 for `set_html` base64 chunks
+
+## Upstream Changes (inherited)
+- 2025-12-23 JanOS 1.0.1 - fix evil rerun fail on bad pass / portal restart fix + new `show_pass` CLI / Fix boot_button fail to launch
+- 2025-12-18 JanOS 1.0.1 - New GPS support for M5Stack GPS 1.1
+- 2025-12-08 JanOS 1.0.0 - BT scan / Airtag scan / BT Locator / Deauth Guard passive deauth detection
+- 2025-11-28 JanOS 0.7.0 - Added WPA handshake capture via `start_handshake`
