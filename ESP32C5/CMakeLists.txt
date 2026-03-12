@@ -12,7 +12,7 @@ endif()
 # Bootstrap ESP-IDF build system
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
-project(projectZero)
+project(projectZerobyLOCOSP)
 
 # ===== POST-BUILD: copy binaries to binaries-esp32c5 =====
 set(EXPORT_DIR "${CMAKE_SOURCE_DIR}/binaries-esp32c5")
