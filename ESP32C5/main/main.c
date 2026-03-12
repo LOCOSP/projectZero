@@ -846,14 +846,22 @@ static void send_beacon_frame(const uint8_t *frame_buffer, int size) {
     }
 }
 
+static esp_err_t wifi_apply_extended_country(void);
+static void wifi_get_24ghz_channel_bounds(uint8_t *first_channel, uint8_t *last_channel);
+
 /**
  * Beacon spam task - continuously sends beacon frames for configured SSIDs
- * Sends on all 2.4GHz channels (1-13) with channel hopping
+ * Sends on all allowed 2.4 GHz channels with channel hopping
  */
 static void beacon_spam_task(void *pvParameters) {
     (void)pvParameters;
-    
-    MY_LOG_INFO(TAG, "Beacon spam task started with %d SSIDs on channels 1-13", beacon_ssid_count);
+
+    uint8_t first_channel = 1;
+    uint8_t last_channel = 11;
+    wifi_get_24ghz_channel_bounds(&first_channel, &last_channel);
+
+    MY_LOG_INFO(TAG, "Beacon spam task started with %d SSIDs on channels %u-%u",
+               beacon_ssid_count, first_channel, last_channel);
     
     // Static BSSID for all fake APs
     const uint8_t bssid[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
@@ -861,15 +869,11 @@ static void beacon_spam_task(void *pvParameters) {
     // Frame buffer
     uint8_t frame_buffer[256];
     
-    // 2.4GHz channels to use
-    const uint8_t channels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
-    const int num_channels = sizeof(channels) / sizeof(channels[0]);
-    
     while (beacon_spam_active && !operation_stop_requested) {
         // Iterate through all channels
-        for (int ch_idx = 0; ch_idx < num_channels && beacon_spam_active && !operation_stop_requested; ch_idx++) {
-            uint8_t current_channel = channels[ch_idx];
-            
+        for (uint8_t current_channel = first_channel;
+             current_channel <= last_channel && beacon_spam_active && !operation_stop_requested;
+             current_channel++) {
             // Set WiFi channel
             esp_err_t err = esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
             if (err != ESP_OK) {
@@ -896,7 +900,7 @@ static void beacon_spam_task(void *pvParameters) {
                         bcn_oled_last_us = bcn_now_us;
                         char bcn_l2[64], bcn_l3[64], bcn_l4[64];
                         snprintf(bcn_l2, sizeof(bcn_l2), ">> %s", beacon_ssids[i]);
-                        snprintf(bcn_l3, sizeof(bcn_l3), "  Ch %d/13", current_channel);
+                        snprintf(bcn_l3, sizeof(bcn_l3), "  Ch %d/%d", current_channel, last_channel);
                         snprintf(bcn_l4, sizeof(bcn_l4), "  %d SSIDs TX", beacon_ssid_count);
                         oled_display_update_full("> Beacon Spam", bcn_l2, bcn_l3, bcn_l4);
                     }
@@ -2648,6 +2652,52 @@ static esp_err_t wifi_init_ap_sta(void) {
     return ESP_OK;
 }
 
+static esp_err_t wifi_apply_extended_country(void)
+{
+    wifi_country_t wifi_country = {
+        .cc = "PH",
+        .schan = 1,
+        .nchan = 14,
+        .policy = WIFI_COUNTRY_POLICY_AUTO,
+    };
+
+    esp_err_t err = esp_wifi_set_country(&wifi_country);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set WiFi country for channels 1-13: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+static void wifi_get_24ghz_channel_bounds(uint8_t *first_channel, uint8_t *last_channel)
+{
+    uint8_t first = 1;
+    uint8_t last = 11;
+    wifi_country_t wifi_country = { 0 };
+
+    if (esp_wifi_get_country(&wifi_country) == ESP_OK && wifi_country.nchan > 0) {
+        int country_first = wifi_country.schan;
+        int country_last = wifi_country.schan + wifi_country.nchan - 1;
+
+        if (country_first < 1) {
+            country_first = 1;
+        }
+        if (country_last > 13) {
+            country_last = 13;
+        }
+        if (country_first <= country_last) {
+            first = (uint8_t)country_first;
+            last = (uint8_t)country_last;
+        }
+    }
+
+    if (first_channel != NULL) {
+        *first_channel = first;
+    }
+    if (last_channel != NULL) {
+        *last_channel = last;
+    }
+}
+
 // ============================================================================
 // Radio Mode Switching (lazy initialization)
 // ============================================================================
@@ -2672,14 +2722,7 @@ static bool ensure_wifi_mode(void)
                 return false;
             }
             
-            // Set WiFi country for extended channels
-            wifi_country_t wifi_country = {
-                .cc = "PH",
-                .schan = 1,
-                .nchan = 14,
-                .policy = WIFI_COUNTRY_POLICY_AUTO,
-            };
-            esp_wifi_set_country(&wifi_country);
+            wifi_apply_extended_country();
             
             current_radio_mode = RADIO_MODE_WIFI;
             wifi_initialized = true;
@@ -7148,19 +7191,9 @@ static int start_beacon_spam_internal(void) {
         MY_LOG_INFO(TAG, "  %d: %s", i + 1, beacon_ssids[i]);
     }
 
-    if (nimble_initialized) {
-        MY_LOG_INFO(TAG, "Deinitializing BLE...");
-        bt_nimble_deinit();
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-
-    if (!wifi_initialized) {
-        MY_LOG_INFO(TAG, "Initializing WiFi...");
-        esp_err_t err = wifi_init_ap_sta();
-        if (err != ESP_OK) {
-            MY_LOG_INFO(TAG, "WiFi initialization failed: %s", esp_err_to_name(err));
-            return 1;
-        }
+    if (!ensure_wifi_mode()) {
+        MY_LOG_INFO(TAG, "WiFi initialization failed");
+        return 1;
     }
 
     esp_wifi_stop();
@@ -7193,6 +7226,8 @@ static int start_beacon_spam_internal(void) {
         return 1;
     }
 
+    wifi_apply_extended_country();
+
     vTaskDelay(pdMS_TO_TICKS(100));
 
     err = esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
@@ -7200,7 +7235,13 @@ static int start_beacon_spam_internal(void) {
         MY_LOG_INFO(TAG, "Failed to set channel 1: %s", esp_err_to_name(err));
     }
 
-    MY_LOG_INFO(TAG, "WiFi configured for beacon spam on channels 1-13");
+    {
+        uint8_t first_channel = 1;
+        uint8_t last_channel = 11;
+        wifi_get_24ghz_channel_bounds(&first_channel, &last_channel);
+        MY_LOG_INFO(TAG, "WiFi configured for beacon spam on channels %u-%u",
+                   first_channel, last_channel);
+    }
 
     beacon_spam_active = true;
     operation_stop_requested = false;
@@ -14516,68 +14557,79 @@ void app_main(void) {
     repl_config.task_stack_size = 8192;
      MY_LOG_INFO(TAG,"");
     MY_LOG_INFO(TAG,"Available commands:");
+      MY_LOG_INFO(TAG,"  add_ssid <SSID>");
+      MY_LOG_INFO(TAG,"  arp_ban <MAC> [IP]");
       MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
       MY_LOG_INFO(TAG,"  channel_time set <min|max> <ms> | channel_time read <min|max>");
       MY_LOG_INFO(TAG,"  channel_view");
+      MY_LOG_INFO(TAG,"  clear_sniffer_results");
       MY_LOG_INFO(TAG,"  deauth_detector");
-      MY_LOG_INFO(TAG,"  download");
       MY_LOG_INFO(TAG,"  display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
+      MY_LOG_INFO(TAG,"  download");
       MY_LOG_INFO(TAG,"  file_delete <path>");
+      MY_LOG_INFO(TAG,"  gps_set <m5|atgm|external|cap>");
+      MY_LOG_INFO(TAG,"  help");
       MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
       MY_LOG_INFO(TAG,"  list_dir <path>");
+      MY_LOG_INFO(TAG,"  list_hosts");
+      MY_LOG_INFO(TAG,"  list_hosts_vendor");
+      MY_LOG_INFO(TAG,"  list_probes");
+      MY_LOG_INFO(TAG,"  list_probes_vendor");
       MY_LOG_INFO(TAG,"  list_sd");
-      MY_LOG_INFO(TAG,"  show_pass [portal|evil]");
       MY_LOG_INFO(TAG,"  list_ssid");
       MY_LOG_INFO(TAG,"  list_ssids");
-      MY_LOG_INFO(TAG,"  add_ssid <SSID>");
-      MY_LOG_INFO(TAG,"  remove_ssid <index>");
-      MY_LOG_INFO(TAG,"  start_beacon_spam_ssids");
-      MY_LOG_INFO(TAG,"  packet_monitor <channel>");
-      MY_LOG_INFO(TAG,"  ping");
-      MY_LOG_INFO(TAG,"  wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
-      MY_LOG_INFO(TAG,"  wifi_disconnect");
+      MY_LOG_INFO(TAG,"  ota_boot <ota_0|ota_1>");
       MY_LOG_INFO(TAG,"  ota_channel [main|dev]");
-      MY_LOG_INFO(TAG,"  ota_list");
       MY_LOG_INFO(TAG,"  ota_check");
       MY_LOG_INFO(TAG,"  ota_info");
-      MY_LOG_INFO(TAG,"  ota_boot <ota_0|ota_1>");
+      MY_LOG_INFO(TAG,"  ota_list");
+      MY_LOG_INFO(TAG,"  packet_monitor <channel>");
+      MY_LOG_INFO(TAG,"  ping");
       MY_LOG_INFO(TAG,"  reboot");
+      MY_LOG_INFO(TAG,"  remove_ssid <index>");
       MY_LOG_INFO(TAG,"  sae_overflow");
+      MY_LOG_INFO(TAG,"  save_handshake");
       MY_LOG_INFO(TAG,"  scan_airtag");
       MY_LOG_INFO(TAG,"  scan_bt");
       MY_LOG_INFO(TAG,"  scan_networks");
       MY_LOG_INFO(TAG,"  select_html <index>");
       MY_LOG_INFO(TAG,"  select_networks <index1> [index2] ...");
-      MY_LOG_INFO(TAG,"  unselect_networks");
       MY_LOG_INFO(TAG,"  select_stations <MAC1> [MAC2] ...");
-      MY_LOG_INFO(TAG,"  unselect_stations");
+      MY_LOG_INFO(TAG,"  set_gps_position <lat> <lon> [alt] [acc]");
+      MY_LOG_INFO(TAG,"  set_gps_position_cap <lat> <lon> [alt] [acc]");
+      MY_LOG_INFO(TAG,"  set_html <html>");
+      MY_LOG_INFO(TAG,"  show_pass [portal|evil]");
       MY_LOG_INFO(TAG,"  show_probes");
       MY_LOG_INFO(TAG,"  show_probes_vendor");
-      MY_LOG_INFO(TAG,"  list_probes_vendor");
       MY_LOG_INFO(TAG,"  show_scan_results");
       MY_LOG_INFO(TAG,"  show_sniffer_results");
       MY_LOG_INFO(TAG,"  show_sniffer_results_vendor");
-      MY_LOG_INFO(TAG,"  clear_sniffer_results");
       MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
+      MY_LOG_INFO(TAG,"  start_beacon_spam \"SSID1\" \"SSID2\" ...");
+      MY_LOG_INFO(TAG,"  start_beacon_spam_ssids");
       MY_LOG_INFO(TAG,"  start_blackout");
       MY_LOG_INFO(TAG,"  start_deauth");
       MY_LOG_INFO(TAG,"  start_evil_twin");
+      MY_LOG_INFO(TAG,"  start_gps_raw");
+      MY_LOG_INFO(TAG,"  start_handshake [index1] [index2] ...");
+      MY_LOG_INFO(TAG,"  start_karma <index>");
       MY_LOG_INFO(TAG,"  start_portal <SSID>");
       MY_LOG_INFO(TAG,"  start_rogueap <SSID> <password>");
       MY_LOG_INFO(TAG,"  start_sniffer");
-      MY_LOG_INFO(TAG,"  start_sniffer_noscan");
       MY_LOG_INFO(TAG,"  start_sniffer_dog");
-      MY_LOG_INFO(TAG,"  start_gps_raw");
-      MY_LOG_INFO(TAG,"  gps_set <m5|atgm|external|cap>");
-      MY_LOG_INFO(TAG,"  set_gps_position <lat> <lon> [alt] [acc]");
-      MY_LOG_INFO(TAG,"  set_gps_position_cap <lat> <lon> [alt] [acc]");
+      MY_LOG_INFO(TAG,"  start_sniffer_noscan");
       MY_LOG_INFO(TAG,"  start_wardrive");
+      MY_LOG_INFO(TAG,"  start_wardrive_promisc");
       MY_LOG_INFO(TAG,"  stop");
+      MY_LOG_INFO(TAG,"  unselect_networks");
+      MY_LOG_INFO(TAG,"  unselect_stations");
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
-      MY_LOG_INFO(TAG,"  wpasec_key set <key> | wpasec_key read");
-      MY_LOG_INFO(TAG,"  wpasec_upload");
+      MY_LOG_INFO(TAG,"  wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+      MY_LOG_INFO(TAG,"  wifi_disconnect");
       MY_LOG_INFO(TAG,"  wigle_key set <api_name> <api_token> | wigle_key read");
       MY_LOG_INFO(TAG,"  wigle_upload");
+      MY_LOG_INFO(TAG,"  wpasec_key set <key> | wpasec_key read");
+      MY_LOG_INFO(TAG,"  wpasec_upload");
 
     repl_config.prompt = ">";
     repl_config.max_cmdline_length = 100;
