@@ -111,7 +111,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.5"
+#define JANOS_VERSION "1.5.6"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -1131,6 +1131,7 @@ static sdmmc_card_t *sd_card_handle = NULL;
 #define MAX_SSID_PRESETS 64
 #define MAX_SSID_NAME_LEN 32
 #define SSID_PRESET_PATH "/sdcard/lab/ssid.txt"
+#define SSIDS_FILE_PATH  "/sdcard/lab/ssids.txt"
 
 // Whitelist for BSSID protection (allocated in PSRAM)
 #define MAX_WHITELISTED_BSSIDS 150
@@ -1264,6 +1265,11 @@ static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
 static int cmd_list_dir(int argc, char **argv);
 static int cmd_list_ssid(int argc, char **argv);
+static int cmd_list_ssids(int argc, char **argv);
+static int cmd_add_ssid(int argc, char **argv);
+static int cmd_remove_ssid(int argc, char **argv);
+static int cmd_start_beacon_spam_ssids(int argc, char **argv);
+static int start_beacon_spam_internal(void);
 static int cmd_select_html(int argc, char **argv);
 static int cmd_show_pass(int argc, char **argv);
 static int cmd_file_delete(int argc, char **argv);
@@ -7136,56 +7142,18 @@ static int cmd_start_evil_twin(int argc, char **argv) {
  * CLI command: start_beacon_spam "SSID1" "SSID2" ...
  * Starts beacon spam attack with multiple fake SSIDs
  */
-static int cmd_start_beacon_spam(int argc, char **argv) {
-    {
-        char oled_l3[24];
-        snprintf(oled_l3, sizeof(oled_l3), "  %d fake SSIDs", argc - 1 > 0 ? argc - 1 : 0);
-        oled_display_update_full("> Beacon Spam",
-            argc >= 2 ? argv[1] : "  No SSIDs",
-            oled_l3, "  Broadcast...");
-    }
-    if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: start_beacon_spam \"SSID1\" \"SSID2\" ...");
-        return 1;
-    }
-
-    // Check if already running
-    if (beacon_spam_active || beacon_spam_task_handle != NULL) {
-        MY_LOG_INFO(TAG, "Beacon spam already running. Use 'stop' first.");
-        return 1;
-    }
-
-    // Parse SSIDs from arguments
-    beacon_ssid_count = 0;
-    for (int i = 1; i < argc && beacon_ssid_count < MAX_BEACON_SSIDS; i++) {
-        int len = strlen(argv[i]);
-        if (len > 0 && len <= 32) {
-            strncpy(beacon_ssids[beacon_ssid_count], argv[i], 32);
-            beacon_ssids[beacon_ssid_count][32] = '\0';
-            beacon_ssid_count++;
-        } else {
-            MY_LOG_INFO(TAG, "Warning: SSID %d invalid length (%d), skipping", i, len);
-        }
-    }
-
-    if (beacon_ssid_count == 0) {
-        MY_LOG_INFO(TAG, "No valid SSIDs provided");
-        return 1;
-    }
-
+static int start_beacon_spam_internal(void) {
     MY_LOG_INFO(TAG, "Starting beacon spam with %d SSIDs:", beacon_ssid_count);
     for (int i = 0; i < beacon_ssid_count; i++) {
         MY_LOG_INFO(TAG, "  %d: %s", i + 1, beacon_ssids[i]);
     }
 
-    // Deinitialize BLE if active
     if (nimble_initialized) {
         MY_LOG_INFO(TAG, "Deinitializing BLE...");
         bt_nimble_deinit();
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
-    // Ensure WiFi is initialized
     if (!wifi_initialized) {
         MY_LOG_INFO(TAG, "Initializing WiFi...");
         esp_err_t err = wifi_init_ap_sta();
@@ -7195,18 +7163,15 @@ static int cmd_start_beacon_spam(int argc, char **argv) {
         }
     }
 
-    // Stop WiFi and reconfigure for AP mode
     esp_wifi_stop();
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Set to APSTA mode
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to set APSTA mode: %s", esp_err_to_name(err));
         return 1;
     }
 
-    // Hide the default AP SSID (avoid ESP_[MAC] showing up)
     wifi_config_t ap_config = {
         .ap = {
             .ssid = "",
@@ -7222,7 +7187,6 @@ static int cmd_start_beacon_spam(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Failed to set hidden AP config: %s", esp_err_to_name(ap_err));
     }
 
-    // Start WiFi
     err = esp_wifi_start();
     if (err != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to start WiFi: %s", esp_err_to_name(err));
@@ -7231,7 +7195,6 @@ static int cmd_start_beacon_spam(int argc, char **argv) {
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Set initial channel to 1 (task will hop through all channels)
     err = esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     if (err != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to set channel 1: %s", esp_err_to_name(err));
@@ -7239,7 +7202,6 @@ static int cmd_start_beacon_spam(int argc, char **argv) {
 
     MY_LOG_INFO(TAG, "WiFi configured for beacon spam on channels 1-13");
 
-    // Start beacon spam task
     beacon_spam_active = true;
     operation_stop_requested = false;
 
@@ -7261,6 +7223,95 @@ static int cmd_start_beacon_spam(int argc, char **argv) {
 
     MY_LOG_INFO(TAG, "Beacon spam started. Use 'stop' to end.");
     return 0;
+}
+
+static int cmd_start_beacon_spam(int argc, char **argv) {
+    {
+        char oled_l3[24];
+        snprintf(oled_l3, sizeof(oled_l3), "  %d fake SSIDs", argc - 1 > 0 ? argc - 1 : 0);
+        oled_display_update_full("> Beacon Spam",
+            argc >= 2 ? argv[1] : "  No SSIDs",
+            oled_l3, "  Broadcast...");
+    }
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_beacon_spam \"SSID1\" \"SSID2\" ...");
+        return 1;
+    }
+
+    if (beacon_spam_active || beacon_spam_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Beacon spam already running. Use 'stop' first.");
+        return 1;
+    }
+
+    beacon_ssid_count = 0;
+    for (int i = 1; i < argc && beacon_ssid_count < MAX_BEACON_SSIDS; i++) {
+        int len = strlen(argv[i]);
+        if (len > 0 && len <= 32) {
+            strncpy(beacon_ssids[beacon_ssid_count], argv[i], 32);
+            beacon_ssids[beacon_ssid_count][32] = '\0';
+            beacon_ssid_count++;
+        } else {
+            MY_LOG_INFO(TAG, "Warning: SSID %d invalid length (%d), skipping", i, len);
+        }
+    }
+
+    if (beacon_ssid_count == 0) {
+        MY_LOG_INFO(TAG, "No valid SSIDs provided");
+        return 1;
+    }
+
+    return start_beacon_spam_internal();
+}
+
+static int cmd_start_beacon_spam_ssids(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    if (beacon_spam_active || beacon_spam_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Beacon spam already running. Use 'stop' first.");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    FILE *f = fopen(SSIDS_FILE_PATH, "r");
+    if (f == NULL) {
+        MY_LOG_INFO(TAG, "ssids.txt not found on SD card.");
+        return 1;
+    }
+
+    beacon_ssid_count = 0;
+    char line[96];
+    while (beacon_ssid_count < MAX_BEACON_SSIDS && fgets(line, sizeof(line), f)) {
+        char *s = line;
+        while (*s && isspace((unsigned char)*s)) s++;
+        char *e = s + strlen(s);
+        while (e > s && (e[-1] == '\n' || e[-1] == '\r')) *--e = '\0';
+        while (e > s && isspace((unsigned char)e[-1])) *--e = '\0';
+        if (*s == '\0') continue;
+        int len = strlen(s);
+        if (len > 32) len = 32;
+        strncpy(beacon_ssids[beacon_ssid_count], s, 32);
+        beacon_ssids[beacon_ssid_count][32] = '\0';
+        beacon_ssid_count++;
+    }
+    fclose(f);
+
+    if (beacon_ssid_count == 0) {
+        MY_LOG_INFO(TAG, "ssids.txt is empty - no SSIDs to broadcast");
+        return 1;
+    }
+
+    {
+        char oled_l3[24];
+        snprintf(oled_l3, sizeof(oled_l3), "  %d SSIDs", beacon_ssid_count);
+        oled_display_update_full("> Beacon Spam", "  from ssids.txt", oled_l3, "  Broadcast...");
+    }
+
+    return start_beacon_spam_internal();
 }
 
 static int cmd_stop(int argc, char **argv) {
@@ -7740,6 +7791,8 @@ static const cli_hint_t k_cli_hints[] = {
     { "wpasec_upload", "" },
     { "wigle_key", " set <api_name> <api_token> | read" },
     { "wigle_upload", " [file1 file2 ...]" },
+    { "add_ssid", " <SSID>" },
+    { "remove_ssid", " <index>" },
 };
 
 static const char *lookup_cli_hint(const char *command) {
@@ -10517,6 +10570,33 @@ static void report_ssid_file_status(void) {
     MY_LOG_INFO(TAG, "ssid.txt found with %d preset SSID(s)", count);
 }
 
+static void ensure_ssids_file(void) {
+    FILE *f = fopen(SSIDS_FILE_PATH, "r");
+    if (f == NULL) {
+        f = fopen(SSIDS_FILE_PATH, "w");
+        if (f) {
+            fclose(f);
+            sd_sync();
+            MY_LOG_INFO(TAG, "ssids.txt created (empty)");
+        } else {
+            MY_LOG_INFO(TAG, "Failed to create ssids.txt");
+        }
+        return;
+    }
+    int count = 0;
+    char line[96];
+    while (fgets(line, sizeof(line), f)) {
+        char *s = line;
+        while (*s && isspace((unsigned char)*s)) s++;
+        char *e = s + strlen(s);
+        while (e > s && (e[-1] == '\n' || e[-1] == '\r')) *--e = '\0';
+        while (e > s && isspace((unsigned char)e[-1])) *--e = '\0';
+        if (*s != '\0') count++;
+    }
+    fclose(f);
+    MY_LOG_INFO(TAG, "ssids.txt found with %d SSID(s)", count);
+}
+
 // Command: list_ssid - Lists SSIDs from ssid.txt on SD card
 static int cmd_list_ssid(int argc, char **argv)
 {
@@ -10546,6 +10626,139 @@ static int cmd_list_ssid(int argc, char **argv)
         printf("%d %s\n", i + 1, ssids[i]);
     }
 
+    return 0;
+}
+
+static int cmd_list_ssids(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    FILE *f = fopen(SSIDS_FILE_PATH, "r");
+    if (f == NULL) {
+        MY_LOG_INFO(TAG, "ssids.txt not found on SD card.");
+        return 0;
+    }
+
+    char line[96];
+    int idx = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *start = line;
+        while (*start && isspace((unsigned char)*start)) start++;
+        char *end = start + strlen(start);
+        while (end > start && (end[-1] == '\n' || end[-1] == '\r')) *--end = '\0';
+        while (end > start && isspace((unsigned char)end[-1])) *--end = '\0';
+        if (*start == '\0') continue;
+        idx++;
+        printf("%d %s\n", idx, start);
+    }
+    fclose(f);
+
+    if (idx == 0) {
+        MY_LOG_INFO(TAG, "ssids.txt is empty.");
+    }
+    return 0;
+}
+
+static int cmd_add_ssid(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: add_ssid <SSID>");
+        return 1;
+    }
+
+    int len = strlen(argv[1]);
+    if (len == 0 || len > MAX_SSID_NAME_LEN) {
+        MY_LOG_INFO(TAG, "SSID length must be 1-%d characters", MAX_SSID_NAME_LEN);
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    FILE *f = fopen(SSIDS_FILE_PATH, "a");
+    if (f == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open ssids.txt for writing");
+        return 1;
+    }
+    fprintf(f, "%s\n", argv[1]);
+    fclose(f);
+    sd_sync();
+
+    MY_LOG_INFO(TAG, "Added SSID: %s", argv[1]);
+    return 0;
+}
+
+static int cmd_remove_ssid(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: remove_ssid <index>");
+        return 1;
+    }
+
+    int target = atoi(argv[1]);
+    if (target < 1) {
+        MY_LOG_INFO(TAG, "Index must be >= 1");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char lines[MAX_SSID_PRESETS][MAX_SSID_NAME_LEN + 1];
+    int count = 0;
+    {
+        FILE *rf = fopen(SSIDS_FILE_PATH, "r");
+        if (rf == NULL) {
+            MY_LOG_INFO(TAG, "ssids.txt not found on SD card.");
+            return 1;
+        }
+        char line[96];
+        while (count < MAX_SSID_PRESETS && fgets(line, sizeof(line), rf)) {
+            char *s = line;
+            while (*s && isspace((unsigned char)*s)) s++;
+            char *e = s + strlen(s);
+            while (e > s && (e[-1] == '\n' || e[-1] == '\r')) *--e = '\0';
+            while (e > s && isspace((unsigned char)e[-1])) *--e = '\0';
+            if (*s == '\0') continue;
+            strncpy(lines[count], s, MAX_SSID_NAME_LEN);
+            lines[count][MAX_SSID_NAME_LEN] = '\0';
+            count++;
+        }
+        fclose(rf);
+    }
+
+    if (target > count) {
+        MY_LOG_INFO(TAG, "Index %d out of range (1-%d)", target, count);
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "Removing SSID %d: %s", target, lines[target - 1]);
+
+    FILE *f = fopen(SSIDS_FILE_PATH, "w");
+    if (f == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open ssids.txt for writing");
+        return 1;
+    }
+    for (int i = 0; i < count; i++) {
+        if (i == target - 1) continue;
+        fprintf(f, "%s\n", lines[i]);
+    }
+    fclose(f);
+    sd_sync();
+
+    MY_LOG_INFO(TAG, "SSID removed. %d SSIDs remaining.", count - 1);
     return 0;
 }
 
@@ -13726,6 +13939,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&beacon_spam_cmd));
 
+    const esp_console_cmd_t beacon_spam_ssids_cmd = {
+        .command = "start_beacon_spam_ssids",
+        .help = "Beacon spam with all SSIDs from /sdcard/lab/ssids.txt",
+        .hint = NULL,
+        .func = &cmd_start_beacon_spam_ssids,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&beacon_spam_ssids_cmd));
+
     const esp_console_cmd_t gps_raw_cmd = {
         .command = "start_gps_raw",
         .help = "Prints raw GPS NMEA sentences: start_gps_raw [baud] (default depends on gps_set)",
@@ -14014,6 +14236,33 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_ssid_cmd));
 
+    const esp_console_cmd_t list_ssids_cmd = {
+        .command = "list_ssids",
+        .help = "Lists SSIDs from /sdcard/lab/ssids.txt",
+        .hint = NULL,
+        .func = &cmd_list_ssids,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&list_ssids_cmd));
+
+    const esp_console_cmd_t add_ssid_cmd = {
+        .command = "add_ssid",
+        .help = "Add SSID to /sdcard/lab/ssids.txt",
+        .hint = NULL,
+        .func = &cmd_add_ssid,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&add_ssid_cmd));
+
+    const esp_console_cmd_t remove_ssid_cmd = {
+        .command = "remove_ssid",
+        .help = "Remove SSID by index from /sdcard/lab/ssids.txt",
+        .hint = NULL,
+        .func = &cmd_remove_ssid,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&remove_ssid_cmd));
+
     const esp_console_cmd_t file_delete_cmd = {
         .command = "file_delete",
         .help = "Delete a file on SD card: file_delete <path>",
@@ -14279,6 +14528,10 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  list_sd");
       MY_LOG_INFO(TAG,"  show_pass [portal|evil]");
       MY_LOG_INFO(TAG,"  list_ssid");
+      MY_LOG_INFO(TAG,"  list_ssids");
+      MY_LOG_INFO(TAG,"  add_ssid <SSID>");
+      MY_LOG_INFO(TAG,"  remove_ssid <index>");
+      MY_LOG_INFO(TAG,"  start_beacon_spam_ssids");
       MY_LOG_INFO(TAG,"  packet_monitor <channel>");
       MY_LOG_INFO(TAG,"  ping");
       MY_LOG_INFO(TAG,"  wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
@@ -14369,6 +14622,7 @@ void app_main(void) {
     if (sd_init_ret == ESP_OK) {
         create_sd_directories();
         report_ssid_file_status();
+        ensure_ssids_file();
         if (vendor_is_enabled()) {
             ensure_vendor_file_checked();
         }
