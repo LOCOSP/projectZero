@@ -112,9 +112,9 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.5"
+#define JANOS_VERSION "1.6.0"
 
-#define OTA_GITHUB_OWNER "C5Lab"
+#define OTA_GITHUB_OWNER "LOCOSP"
 #define OTA_GITHUB_REPO "projectZero"
 #define OTA_ASSET_NAME "projectZero.bin"
 #define OTA_HTTP_MAX_BODY (256 * 1024)
