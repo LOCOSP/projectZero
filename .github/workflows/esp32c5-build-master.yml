@@ -10,6 +10,7 @@ on:
     branches: [main, feature/handshake-serial, feature/handshake-serial-dev]
     paths:
       - 'ESP32C5/main/main.c'
+      - 'ESP32C5/sdkconfig*'
       - 'FLIPPER/**'
       - '.github/workflows/**'
   release:
@@ -49,12 +50,21 @@ jobs:
           fi
 
   firmware:
-    name: JanOS
+    name: JanOS (${{ matrix.board }})
     permissions:
       contents: write
     runs-on: ubuntu-24.04
     container:
       image: espressif/idf:v6.0-beta1
+    strategy:
+      matrix:
+        include:
+          - board: wroom
+            sdkconfig_extra: ""
+            bin_suffix: ""
+          - board: xiao
+            sdkconfig_extra: "sdkconfig.xiao"
+            bin_suffix: "-xiao"
     outputs:
       fw_version: ${{ steps.version.outputs.version }}
     steps:
@@ -65,12 +75,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /root/.espressif
-          key: espidf-6.0-${{ runner.os }}-${{ hashFiles('ESP32C5/sdkconfig', 'ESP32C5/dependencies.lock') }}
+          key: espidf-6.0-${{ matrix.board }}-${{ runner.os }}-${{ hashFiles('ESP32C5/sdkconfig', 'ESP32C5/sdkconfig.xiao', 'ESP32C5/dependencies.lock') }}
           restore-keys: |
-            espidf-6.0-${{ runner.os }}-
+            espidf-6.0-${{ matrix.board }}-${{ runner.os }}-
+            espidf-6.0-${{ matrix.board }}-
             espidf-6.0-
 
-      - name: Build JanOS (IDF 6.0)
+      - name: Apply sdkconfig overlay (${{ matrix.board }})
+        if: matrix.sdkconfig_extra != ''
+        run: |
+          set -e
+          cd ESP32C5
+          # Clean previous build to avoid stale sdkconfig cache
+          rm -rf build
+          # Append XIAO overlay to sdkconfig so idf.py picks it up
+          cat "${{ matrix.sdkconfig_extra }}" >> sdkconfig
+
+      - name: Build JanOS (IDF 6.0) — ${{ matrix.board }}
         run: IDF_PY_FLAGS="--preview" bash .github/scripts/container_build.sh --no-docker
 
       - name: Stamp JanOS with JANOS_VERSION
@@ -87,36 +108,42 @@ jobs:
           print(m.group(1))
           PY
           )
+          suffix="${{ matrix.bin_suffix }}"
           src="ESP32C5/binaries-esp32c5/projectZerobyLOCOSP.bin"
-          dst="ESP32C5/binaries-esp32c5/projectZerobyLOCOSP-${version}.bin"
+          dst="ESP32C5/binaries-esp32c5/projectZerobyLOCOSP${suffix}-${version}.bin"
           if [ ! -f "$src" ]; then
             echo "Missing firmware: $src" >&2
             exit 1
           fi
           cp "$src" "$dst"
+          # Also rename base bin for XIAO so artifacts don't collide
+          if [ -n "$suffix" ]; then
+            mv "$src" "ESP32C5/binaries-esp32c5/projectZerobyLOCOSP${suffix}.bin"
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "release_asset=${dst}" >> "$GITHUB_OUTPUT"
 
-      - name: Package JanOS zip
+      - name: Package JanOS zip (${{ matrix.board }})
         id: bundle
         run: |
           set -e
           cd ESP32C5/binaries-esp32c5
-          out="projectZerobyLOCOSP-${{ steps.version.outputs.version }}.zip"
+          suffix="${{ matrix.bin_suffix }}"
+          version="${{ steps.version.outputs.version }}"
+          out="projectZerobyLOCOSP${suffix}-${version}.zip"
           rm -f "$out"
           zip -9 "$out" \
             bootloader.bin \
             partition-table.bin \
             flash_board.py \
             oui_wifi.bin \
-            "projectZerobyLOCOSP-${{ steps.version.outputs.version }}.bin" \
-            projectZerobyLOCOSP.bin
+            "projectZerobyLOCOSP${suffix}-${version}.bin" \
+            "projectZerobyLOCOSP${suffix}.bin"
           echo "bundle_zip=$(pwd)/$out" >> "$GITHUB_OUTPUT"
 
-      - name: Upload JanOS artifacts
+      - name: Upload JanOS artifacts (${{ matrix.board }})
         uses: actions/upload-artifact@v4
         with:
-          name: esp32c5-firmware
+          name: esp32c5-firmware-${{ matrix.board }}
           path: ESP32C5/binaries-esp32c5
           if-no-files-found: error
 
@@ -189,11 +216,17 @@ jobs:
       pull-requests: read
     if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')) && needs.changes.outputs.workflow_changed != 'true'
     steps:
-      - name: Download JanOS artifacts
+      - name: Download WROOM firmware artifacts
         uses: actions/download-artifact@v4
         with:
-          name: esp32c5-firmware
+          name: esp32c5-firmware-wroom
           path: release_artifacts/firmware
+
+      - name: Download XIAO firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: esp32c5-firmware-xiao
+          path: release_artifacts/firmware-xiao
 
       - name: Download FAP artifacts (if present)
         uses: actions/download-artifact@v4
@@ -257,6 +290,7 @@ jobs:
           FAP_VER="${FAP_VERSION:-unknown}"
           BASE_URL="https://github.com/$REPO/releases/download/$TAG"
           JANOS_ZIP="$BASE_URL/projectZerobyLOCOSP-${FW_VERSION}.zip"
+          XIAO_ZIP="$BASE_URL/projectZerobyLOCOSP-xiao-${FW_VERSION}.zip"
           FAP_ZIP="$BASE_URL/projectZero-faps-${FAP_VER}.zip"
           BUNDLE_ZIP="$BASE_URL/projectZerobyLOCOSP-${FW_VERSION}-with-fap-${FAP_VER}.zip"
           RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
@@ -266,7 +300,8 @@ jobs:
             printf '%s\n\n' "Release ${TAG} published."
             printf '%s\n' "Release page: ${RELEASE_PAGE}"
             printf '%s\n' "Web flasher: ${PAGES_LINK}"
-            printf '%s\n' "JanOS (${FW_VERSION}): ${JANOS_ZIP}"
+            printf '%s\n' "JanOS WROOM (${FW_VERSION}): ${JANOS_ZIP}"
+            printf '%s\n' "JanOS XIAO (${FW_VERSION}): ${XIAO_ZIP}"
             printf '%s\n' "FAPs (${FAP_VER}): ${FAP_ZIP}"
             printf '%s\n\n' "Full package: ${BUNDLE_ZIP}"
           } > "$notes_file"
@@ -318,9 +353,11 @@ jobs:
             release_artifacts/firmware/projectZerobyLOCOSP.bin
             release_artifacts/firmware/projectZerobyLOCOSP-${{ needs.firmware.outputs.fw_version }}.bin
             release_artifacts/firmware/projectZerobyLOCOSP-${{ needs.firmware.outputs.fw_version }}.zip
+            release_artifacts/firmware-xiao/projectZerobyLOCOSP-xiao.bin
+            release_artifacts/firmware-xiao/projectZerobyLOCOSP-xiao-${{ needs.firmware.outputs.fw_version }}.bin
+            release_artifacts/firmware-xiao/projectZerobyLOCOSP-xiao-${{ needs.firmware.outputs.fw_version }}.zip
             release_artifacts/fap/projectZero-faps-${{ needs.fap.outputs.fap_version }}.zip
             release_artifacts/bundle/projectZerobyLOCOSP-*-with-fap-*.zip
             release_artifacts/fap/*.fap
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
