@@ -3,6 +3,49 @@ import sys
 import subprocess
 import os
 import argparse
+try:
+    from importlib import metadata as importlib_metadata
+except ImportError:
+    importlib_metadata = None
+
+# Colors
+RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"; CYAN = "\033[96m"; RESET = "\033[0m"
+
+VERSION = "v04"
+MIN_ESPTOOL_VERSION = "5.2.0"
+DEFAULT_BAUD = 460800  # Original default; can be overridden via CLI
+REQUIRED_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
+
+def parse_version(version):
+    parts = []
+    prerelease = False
+    for part in version.split("."):
+        digits = []
+        for ch in part:
+            if ch.isdigit():
+                digits.append(ch)
+            else:
+                prerelease = True
+                break
+        parts.append(int("".join(digits) or 0))
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3]), prerelease
+
+def is_version_at_least(installed, required):
+    installed_tuple, installed_prerelease = parse_version(installed)
+    required_tuple, _ = parse_version(required)
+    if installed_tuple != required_tuple:
+        return installed_tuple > required_tuple
+    return not installed_prerelease
+
+def get_esptool_version(esptool_module):
+    if importlib_metadata is not None:
+        try:
+            return importlib_metadata.version("esptool")
+        except importlib_metadata.PackageNotFoundError:
+            pass
+    return getattr(esptool_module, "__version__", None)
 
 def ensure_packages():
     missing = []
@@ -11,24 +54,21 @@ def ensure_packages():
     except ImportError:
         missing.append("pyserial")
     try:
-        import esptool  # noqa
+        import esptool
     except ImportError:
-        missing.append("esptool")
+        missing.append(f"esptool>={MIN_ESPTOOL_VERSION}")
+    else:
+        installed_version = get_esptool_version(esptool)
+        if not installed_version or not is_version_at_least(installed_version, MIN_ESPTOOL_VERSION):
+            missing.append(f"esptool>={MIN_ESPTOOL_VERSION}")
     if missing:
-        print("\033[93mInstalling missing packages: " + ", ".join(missing) + "\033[0m")
-        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+        print(f"{YELLOW}Installing/upgrading packages: {', '.join(missing)}{RESET}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade"] + missing)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 ensure_packages()
 import serial
 import serial.tools.list_ports
-
-# Colors
-RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"; CYAN = "\033[96m"; RESET = "\033[0m"
-
-VERSION = "v04"
-DEFAULT_BAUD = 460800  # Original default; can be overridden via CLI
-REQUIRED_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
 
 # Keep these offsets in sync with partitions.csv.
 OFFSETS = {
