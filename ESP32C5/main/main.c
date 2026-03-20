@@ -115,7 +115,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.0"
+#define JANOS_VERSION "1.8.0"
 
 #define OTA_GITHUB_OWNER "LOCOSP"
 #define OTA_GITHUB_REPO "projectZero"
