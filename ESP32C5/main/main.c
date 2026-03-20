@@ -115,7 +115,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.8.0"
+#define JANOS_VERSION "1.8.1"
 
 #define OTA_GITHUB_OWNER "LOCOSP"
 #define OTA_GITHUB_REPO "projectZero"
@@ -1580,6 +1580,7 @@ static void bt_scan_stop(void);
 static int cmd_bt_hid(int argc, char **argv);
 static int cmd_bt_hid_type(int argc, char **argv);
 static void hid_stop(void);
+static esp_err_t hid_register_services(void);
 void hid_start_advertising(void);
 static void bt_scan_task(void *pvParameters);
 static void bt_airtag_scan_task(void *pvParameters);
