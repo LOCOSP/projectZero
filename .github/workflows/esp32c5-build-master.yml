@@ -57,6 +57,7 @@ jobs:
     container:
       image: espressif/idf:v6.0-beta1
     strategy:
+      fail-fast: false
       matrix:
         include:
           - board: wroom
