@@ -7294,6 +7294,8 @@ static void boot_button_task(void *arg) {
 static int cmd_start_evil_twin(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    // Reset onlyDeauth — evil twin always needs full portal + deauth
+    onlyDeauth = 0;
     if (!onlyDeauth) {
         char oled_target[48];
         oled_build_target_summary(oled_target, sizeof(oled_target));
@@ -7707,7 +7709,10 @@ static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
     oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
-    
+
+    // Reset onlyDeauth so next evil twin starts with full portal
+    onlyDeauth = 0;
+
     // Set global stop flags
     operation_stop_requested = true;
     wardrive_active = false;
