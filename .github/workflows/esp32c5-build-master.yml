@@ -215,7 +215,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
-    if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')) && needs.changes.outputs.workflow_changed != 'true'
+    if: always() && !cancelled() && needs.changes.outputs.workflow_changed != 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != ''))
     steps:
       - name: Download WROOM firmware artifacts
         uses: actions/download-artifact@v4
@@ -228,6 +228,7 @@ jobs:
         with:
           name: esp32c5-firmware-xiao
           path: release_artifacts/firmware-xiao
+        continue-on-error: true
 
       - name: Download FAP artifacts (if present)
         uses: actions/download-artifact@v4
@@ -346,6 +347,7 @@ jobs:
           tag_name: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
           name: ${{ format('projectZerobyLOCOSP {0}', needs.firmware.outputs.fw_version) }}
           body_path: release_notes.md
+          fail_on_unmatched_files: false
           files: |
             release_artifacts/firmware/bootloader.bin
             release_artifacts/firmware/partition-table.bin
