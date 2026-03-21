@@ -7211,6 +7211,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             httpd_config_t config = HTTPD_DEFAULT_CONFIG();
             config.server_port = 80;
             config.max_open_sockets = 7;
+            config.uri_match_fn = httpd_uri_match_wildcard;
             
             // Start HTTP server
             esp_err_t http_ret = httpd_start(&portal_server, &config);
@@ -7302,7 +7303,20 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 .user_ctx = NULL
             };
             httpd_register_uri_handler(portal_server, &windows_captive_uri);
-            
+
+            // Catch-all: redirect any unregistered URL to portal.
+            // Critical for captive portal detection — devices probe many
+            // URLs and without this they get 404, so the popup never shows.
+            {
+                httpd_uri_t catchall_uri = {
+                    .uri = "/*",
+                    .method = HTTP_GET,
+                    .handler = captive_portal_handler,
+                    .user_ctx = NULL
+                };
+                httpd_register_uri_handler(portal_server, &catchall_uri);
+            }
+
             // Set portal_active flag BEFORE starting DNS task
             // (DNS task checks this flag in its loop)
             portal_active = true;
@@ -12551,7 +12565,8 @@ static int cmd_start_portal(int argc, char **argv) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.max_open_sockets = 7;
-    
+    config.uri_match_fn = httpd_uri_match_wildcard;
+
     // Start HTTP server
     esp_err_t http_ret = httpd_start(&portal_server, &config);
     if (http_ret != ESP_OK) {
@@ -12865,7 +12880,8 @@ static int cmd_start_rogueap(int argc, char **argv) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.max_open_sockets = 7;
-    
+    config.uri_match_fn = httpd_uri_match_wildcard;
+
     // Start HTTP server
     esp_err_t http_ret = httpd_start(&portal_server, &config);
     if (http_ret != ESP_OK) {
