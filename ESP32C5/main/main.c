@@ -11142,33 +11142,63 @@ static int cmd_set_html_begin(int argc, char **argv)
     return 0;
 }
 
-// Command: set_html <chunk> — append a base64 chunk to the accumulator
+// Command: set_html <data>
+// Two modes:
+//   1. Chunked base64: call set_html_begin first, then set_html <b64>, then set_html_end
+//   2. Inline raw HTML: set_html <html>...</html>  (no set_html_begin needed)
 static int cmd_set_html(int argc, char **argv)
 {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: set_html <base64_chunk>");
-        MY_LOG_INFO(TAG, "       Use set_html_begin first, then set_html chunks, then set_html_end");
+        MY_LOG_INFO(TAG, "Usage: set_html <html_or_base64_chunk>");
+        MY_LOG_INFO(TAG, "  Inline:  set_html <html>...</html>");
+        MY_LOG_INFO(TAG, "  Chunked: set_html_begin, set_html <b64>, set_html_end");
         return 1;
     }
 
-    if (!html_b64_active || !html_b64_buf) {
-        MY_LOG_INFO(TAG, "set_html: no transfer in progress — call set_html_begin first");
-        return 1;
-    }
-
-    // Concatenate all argv fragments (esp_console may split on spaces)
-    for (int i = 1; i < argc; i++) {
-        size_t frag_len = strlen(argv[i]);
-        if (html_b64_len + frag_len + 1 > html_b64_cap) {
-            MY_LOG_INFO(TAG, "set_html: buffer full (%u/%u bytes)",
-                        (unsigned)html_b64_len, (unsigned)html_b64_cap);
-            return 1;
+    // Mode 1: chunked base64 transfer in progress
+    if (html_b64_active && html_b64_buf) {
+        for (int i = 1; i < argc; i++) {
+            size_t frag_len = strlen(argv[i]);
+            if (html_b64_len + frag_len + 1 > html_b64_cap) {
+                MY_LOG_INFO(TAG, "set_html: buffer full (%u/%u bytes)",
+                            (unsigned)html_b64_len, (unsigned)html_b64_cap);
+                return 1;
+            }
+            memcpy(html_b64_buf + html_b64_len, argv[i], frag_len);
+            html_b64_len += frag_len;
+            html_b64_buf[html_b64_len] = '\0';
         }
-        memcpy(html_b64_buf + html_b64_len, argv[i], frag_len);
-        html_b64_len += frag_len;
-        html_b64_buf[html_b64_len] = '\0';
+        return 0;   // silent success — avoid flooding serial with ACKs
     }
-    return 0;   // silent success — avoid flooding serial with ACKs
+
+    // Mode 2: inline raw HTML (no set_html_begin needed)
+    size_t total_len = 0;
+    for (int i = 1; i < argc; i++) {
+        total_len += strlen(argv[i]) + 1;
+    }
+
+    if (custom_portal_html != NULL) {
+        free(custom_portal_html);
+        custom_portal_html = NULL;
+    }
+
+    custom_portal_html = (char *)malloc(total_len + 1);
+    if (custom_portal_html == NULL) {
+        MY_LOG_INFO(TAG, "Failed to allocate memory for HTML.");
+        return 1;
+    }
+
+    custom_portal_html[0] = '\0';
+    for (int i = 1; i < argc; i++) {
+        strcat(custom_portal_html, argv[i]);
+        if (i < argc - 1) {
+            strcat(custom_portal_html, " ");
+        }
+    }
+
+    MY_LOG_INFO(TAG, "Custom HTML set (%u bytes). Portal/Evil Twin/Karma will use this HTML.",
+                (unsigned)strlen(custom_portal_html));
+    return 0;
 }
 
 // Command: set_html_end — decode accumulated base64 and set custom_portal_html
