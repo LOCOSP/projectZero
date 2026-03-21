@@ -1352,6 +1352,7 @@ static esp_err_t login_handler(httpd_req_t *req);
 static esp_err_t get_handler(httpd_req_t *req);
 static esp_err_t save_handler(httpd_req_t *req);
 static esp_err_t android_captive_handler(httpd_req_t *req);
+static esp_err_t captive_portal_handler(httpd_req_t *req);
 static esp_err_t ios_captive_handler(httpd_req_t *req);
 static esp_err_t captive_detection_handler(httpd_req_t *req);
 // Sniffer functions
