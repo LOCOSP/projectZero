@@ -7,39 +7,92 @@ on:
         description: "Optional tag name to upload assets to a release (example 'v1.2.3')"
         required: false
   push:
-    branches: [main]
+    branches: [main, feature/handshake-serial, feature/handshake-serial-dev]
     paths:
-      - 'ESP32C5/**'
+      - 'ESP32C5/main/main.c'
+      - 'ESP32C5/sdkconfig*'
       - 'FLIPPER/**'
-      - '.github/scripts/**'
-      - '.github/workflows/esp32c5-build-master.yml'
+      - '.github/workflows/**'
   release:
     types: [published, edited]
 
 jobs:
+  changes:
+    name: Detect workflow changes
+    runs-on: ubuntu-24.04
+    outputs:
+      workflow_changed: ${{ steps.filter.outputs.workflow_changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check workflow diff
+        id: filter
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME:-}" != "push" ]; then
+            echo "workflow_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base="${{ github.event.before }}"
+          head="${{ github.sha }}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+
+          if git diff --name-only "$base" "$head" | grep -qE '^\.github/workflows/'; then
+            echo "workflow_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "workflow_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   firmware:
-    name: JanOS
+    name: JanOS (${{ matrix.board }})
     permissions:
       contents: write
     runs-on: ubuntu-24.04
     container:
       image: espressif/idf:v6.0-beta1
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: wroom
+            sdkconfig_extra: ""
+            bin_suffix: ""
+          - board: xiao
+            sdkconfig_extra: "sdkconfig.xiao"
+            bin_suffix: "-xiao"
     outputs:
       fw_version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Cache ESP-IDF artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         with:
           path: /root/.espressif
-          key: espidf-6.0-${{ runner.os }}-${{ hashFiles('ESP32C5/sdkconfig', 'ESP32C5/dependencies.lock') }}
+          key: espidf-6.0-${{ matrix.board }}-${{ runner.os }}-${{ hashFiles('ESP32C5/sdkconfig', 'ESP32C5/sdkconfig.xiao', 'ESP32C5/dependencies.lock') }}
           restore-keys: |
-            espidf-6.0-${{ runner.os }}-
+            espidf-6.0-${{ matrix.board }}-${{ runner.os }}-
+            espidf-6.0-${{ matrix.board }}-
             espidf-6.0-
 
-      - name: Build JanOS (IDF 6.0)
+      - name: Apply sdkconfig overlay (${{ matrix.board }})
+        if: matrix.sdkconfig_extra != ''
+        run: |
+          set -e
+          cd ESP32C5
+          # Clean previous build to avoid stale sdkconfig cache
+          rm -rf build
+          # Append XIAO overlay to sdkconfig so idf.py picks it up
+          cat "${{ matrix.sdkconfig_extra }}" >> sdkconfig
+
+      - name: Build JanOS (IDF 6.0) — ${{ matrix.board }}
         run: IDF_PY_FLAGS="--preview" bash .github/scripts/container_build.sh --no-docker
 
       - name: Stamp JanOS with JANOS_VERSION
@@ -56,36 +109,42 @@ jobs:
           print(m.group(1))
           PY
           )
-          src="ESP32C5/binaries-esp32c5/projectZero.bin"
-          dst="ESP32C5/binaries-esp32c5/projectZero-${version}.bin"
+          suffix="${{ matrix.bin_suffix }}"
+          src="ESP32C5/binaries-esp32c5/projectZerobyLOCOSP.bin"
+          dst="ESP32C5/binaries-esp32c5/projectZerobyLOCOSP${suffix}-${version}.bin"
           if [ ! -f "$src" ]; then
             echo "Missing firmware: $src" >&2
             exit 1
           fi
           cp "$src" "$dst"
+          # Also rename base bin for XIAO so artifacts don't collide
+          if [ -n "$suffix" ]; then
+            mv "$src" "ESP32C5/binaries-esp32c5/projectZerobyLOCOSP${suffix}.bin"
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "release_asset=${dst}" >> "$GITHUB_OUTPUT"
 
-      - name: Package JanOS zip
+      - name: Package JanOS zip (${{ matrix.board }})
         id: bundle
         run: |
           set -e
           cd ESP32C5/binaries-esp32c5
-          out="projectZero-${{ steps.version.outputs.version }}.zip"
+          suffix="${{ matrix.bin_suffix }}"
+          version="${{ steps.version.outputs.version }}"
+          out="projectZerobyLOCOSP${suffix}-${version}.zip"
           rm -f "$out"
           zip -9 "$out" \
             bootloader.bin \
             partition-table.bin \
             flash_board.py \
             oui_wifi.bin \
-            "projectZero-${{ steps.version.outputs.version }}.bin" \
-            projectZero.bin
+            "projectZerobyLOCOSP${suffix}-${version}.bin" \
+            "projectZerobyLOCOSP${suffix}.bin"
           echo "bundle_zip=$(pwd)/$out" >> "$GITHUB_OUTPUT"
 
-      - name: Upload JanOS artifacts
-        uses: actions/upload-artifact@v6
+      - name: Upload JanOS artifacts (${{ matrix.board }})
+        uses: actions/upload-artifact@v4
         with:
-          name: esp32c5-firmware
+          name: esp32c5-firmware-${{ matrix.board }}
           path: ESP32C5/binaries-esp32c5
           if-no-files-found: error
 
@@ -97,7 +156,7 @@ jobs:
       fap_version: ${{ steps.fap_version.outputs.fap_version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Install FAP build dependencies (ufbt in venv)
         run: |
@@ -144,28 +203,35 @@ jobs:
 
       - name: Upload FAP artifacts
         if: ${{ hashFiles('FLIPPER/dist/*.fap') != '' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: flipper-fap
           path: FLIPPER/dist/*.fap
 
   release:
     name: Release
-    needs: [firmware, fap]
+    needs: [changes, firmware, fap]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       pull-requests: read
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    if: always() && !cancelled() && needs.changes.outputs.workflow_changed != 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != ''))
     steps:
-      - name: Download JanOS artifacts
-        uses: actions/download-artifact@v6
+      - name: Download WROOM firmware artifacts
+        uses: actions/download-artifact@v4
         with:
-          name: esp32c5-firmware
+          name: esp32c5-firmware-wroom
           path: release_artifacts/firmware
 
+      - name: Download XIAO firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: esp32c5-firmware-xiao
+          path: release_artifacts/firmware-xiao
+        continue-on-error: true
+
       - name: Download FAP artifacts (if present)
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v4
         with:
           name: flipper-fap
           path: release_artifacts/fap
@@ -195,13 +261,13 @@ jobs:
             firmware/partition-table.bin
             firmware/flash_board.py
             firmware/oui_wifi.bin
-            firmware/projectZero.bin
-            "firmware/projectZero-${FW_VERSION}.bin"
+            firmware/projectZerobyLOCOSP.bin
+            "firmware/projectZerobyLOCOSP-${FW_VERSION}.bin"
           )
 
           # Include existing JanOS zip if present
-          if [ -f "firmware/projectZero-${FW_VERSION}.zip" ]; then
-            files+=("firmware/projectZero-${FW_VERSION}.zip")
+          if [ -f "firmware/projectZerobyLOCOSP-${FW_VERSION}.zip" ]; then
+            files+=("firmware/projectZerobyLOCOSP-${FW_VERSION}.zip")
           fi
 
           # Add all FAPs (if any)
@@ -209,7 +275,7 @@ jobs:
             files+=("${faps[@]}")
           fi
 
-          out="bundle/projectZero-${FW_VERSION}-with-fap-${FAP_VERSION:-unknown}.zip"
+          out="bundle/projectZerobyLOCOSP-${FW_VERSION}-with-fap-${FAP_VERSION:-unknown}.zip"
           zip -9 "$out" "${files[@]}"
 
       - name: Build release notes
@@ -225,9 +291,10 @@ jobs:
           TAG="${RELEASE_TAG:-$FW_VERSION}"
           FAP_VER="${FAP_VERSION:-unknown}"
           BASE_URL="https://github.com/$REPO/releases/download/$TAG"
-          JANOS_ZIP="$BASE_URL/projectZero-${FW_VERSION}.zip"
+          JANOS_ZIP="$BASE_URL/projectZerobyLOCOSP-${FW_VERSION}.zip"
+          XIAO_ZIP="$BASE_URL/projectZerobyLOCOSP-xiao-${FW_VERSION}.zip"
           FAP_ZIP="$BASE_URL/projectZero-faps-${FAP_VER}.zip"
-          BUNDLE_ZIP="$BASE_URL/projectZero-${FW_VERSION}-with-fap-${FAP_VER}.zip"
+          BUNDLE_ZIP="$BASE_URL/projectZerobyLOCOSP-${FW_VERSION}-with-fap-${FAP_VER}.zip"
           RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
           PAGES_LINK="https://${REPO%/*}.github.io/${REPO#*/}/"
 
@@ -235,7 +302,8 @@ jobs:
             printf '%s\n\n' "Release ${TAG} published."
             printf '%s\n' "Release page: ${RELEASE_PAGE}"
             printf '%s\n' "Web flasher: ${PAGES_LINK}"
-            printf '%s\n' "JanOS (${FW_VERSION}): ${JANOS_ZIP}"
+            printf '%s\n' "JanOS WROOM (${FW_VERSION}): ${JANOS_ZIP}"
+            printf '%s\n' "JanOS XIAO (${FW_VERSION}): ${XIAO_ZIP}"
             printf '%s\n' "FAPs (${FAP_VER}): ${FAP_ZIP}"
             printf '%s\n\n' "Full package: ${BUNDLE_ZIP}"
           } > "$notes_file"
@@ -273,201 +341,26 @@ jobs:
             fi
           fi
 
-      - name: Create or update GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
-          FAP_VERSION: ${{ needs.fap.outputs.fap_version }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
-        run: |
-          set -euo pipefail
-          TAG="${RELEASE_TAG:-v${FW_VERSION}}"
-          NAME="projectZero ${FW_VERSION}"
-
-          files=(
+      - name: Upload binaries to GitHub Release (notes)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
+          name: ${{ format('projectZerobyLOCOSP {0}', needs.firmware.outputs.fw_version) }}
+          body_path: release_notes.md
+          fail_on_unmatched_files: false
+          files: |
             release_artifacts/firmware/bootloader.bin
             release_artifacts/firmware/partition-table.bin
             release_artifacts/firmware/flash_board.py
             release_artifacts/firmware/oui_wifi.bin
-            release_artifacts/firmware/projectZero.bin
-            "release_artifacts/firmware/projectZero-${FW_VERSION}.bin"
-            "release_artifacts/firmware/projectZero-${FW_VERSION}.zip"
-          )
-
-          shopt -s nullglob
-          optional=(
-            "release_artifacts/fap/projectZero-faps-${FAP_VERSION}.zip"
-            release_artifacts/bundle/projectZero-*-with-fap-*.zip
+            release_artifacts/firmware/projectZerobyLOCOSP.bin
+            release_artifacts/firmware/projectZerobyLOCOSP-${{ needs.firmware.outputs.fw_version }}.bin
+            release_artifacts/firmware/projectZerobyLOCOSP-${{ needs.firmware.outputs.fw_version }}.zip
+            release_artifacts/firmware-xiao/projectZerobyLOCOSP-xiao.bin
+            release_artifacts/firmware-xiao/projectZerobyLOCOSP-xiao-${{ needs.firmware.outputs.fw_version }}.bin
+            release_artifacts/firmware-xiao/projectZerobyLOCOSP-xiao-${{ needs.firmware.outputs.fw_version }}.zip
+            release_artifacts/fap/projectZero-faps-${{ needs.fap.outputs.fap_version }}.zip
+            release_artifacts/bundle/projectZerobyLOCOSP-*-with-fap-*.zip
             release_artifacts/fap/*.fap
-          )
-
-          for file in "${optional[@]}"; do
-            if [ -e "$file" ]; then
-              files+=("$file")
-            fi
-          done
-
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "$NAME" --notes-file release_notes.md
-          else
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$NAME" --notes-file release_notes.md
-          fi
-
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "${files[@]}"
-
-  pages:
-    name: Pages Web Flasher
-    needs: [release, firmware, fap]
-    if: ${{ needs.release.result == 'success' }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    outputs:
-      page_url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-        with:
-          enablement: true
-
-      - name: Resolve release tag
-        id: meta
         env:
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ inputs.release_tag }}
-          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
-        run: |
-          set -euo pipefail
-          TAG="${EVENT_TAG:-}"
-          if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
-          if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Using tag: $TAG"
-
-      - name: Download release assets
-        id: download
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.meta.outputs.tag }}"
-          rm -rf docs/firmware
-          mkdir -p docs/firmware
-
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" --dir docs/firmware \
-            --pattern "bootloader.bin" \
-            --pattern "partition-table.bin" \
-            --pattern "projectZero*.bin"
-
-          ls -lh docs/firmware
-
-          if [ ! -f docs/firmware/projectZero.bin ]; then
-            alt=$(ls docs/firmware/projectZero-*.bin 2>/dev/null | head -n1 || true)
-            if [ -n "$alt" ]; then
-              cp "$alt" docs/firmware/projectZero.bin
-            fi
-          fi
-
-          for f in bootloader.bin partition-table.bin projectZero.bin; do
-            if [ ! -f "docs/firmware/$f" ]; then
-              echo "Missing $f in release assets for tag ${TAG}" >&2
-              exit 1
-            fi
-          done
-
-          fw_version=$(ls docs/firmware/projectZero-*.bin 2>/dev/null | head -n1 | xargs -n1 basename | sed -E 's/^projectZero-([^.]*)\\.bin$/\\1/')
-          if [ -z "$fw_version" ]; then
-            fw_version="${TAG}"
-          fi
-          echo "fw_version=$fw_version" >> "$GITHUB_OUTPUT"
-
-      - name: Build manifest.json
-        env:
-          FW_VERSION: ${{ steps.download.outputs.fw_version }}
-          BUILD_TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          set -euo pipefail
-          python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG','manual'); manifest={'name':'projectZero ESP32-C5','version':version,'build':build,'chipFamily':'ESP32-C5','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/projectZero.bin','offset':131072},{'path':'firmware/projectZero.bin','offset':4259840}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2))"
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: docs
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-  discord:
-    name: Discord
-    needs: [release, firmware, fap, pages]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Notify Discord
-        if: success()
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.GIT_BUILD }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
-          FAP_VERSION: ${{ needs.fap.outputs.fap_version }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
-          REPO: ${{ github.repository }}
-          PAGES_URL: ${{ needs.pages.outputs.page_url || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
-        run: |
-          set -euo pipefail
-          if [ -z "$DISCORD_WEBHOOK" ]; then
-            echo "DISCORD_WEBHOOK not configured, skipping notification"
-            exit 0
-          fi
-          TAG="${RELEASE_TAG:-$FW_VERSION}"
-          FAP_VER="${FAP_VERSION:-unknown}"
-          BASE_URL="https://github.com/$REPO/releases/download/$TAG"
-          JANOS_ZIP="$BASE_URL/projectZero-${FW_VERSION}.zip"
-          FAP_ZIP="$BASE_URL/projectZero-faps-${FAP_VER}.zip"
-          BUNDLE_ZIP="$BASE_URL/projectZero-${FW_VERSION}-with-fap-${FAP_VER}.zip"
-          RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
-          PAGES_LINK="${PAGES_URL:-https://${GITHUB_REPOSITORY%/*}.github.io/${GITHUB_REPOSITORY#*/}/}"
-
-          RELEASE_BODY=""
-          if [ "${GITHUB_EVENT_NAME:-}" = "release" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
-            RELEASE_BODY="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH")"
-          fi
-          if [ -z "$(printf '%s' "$RELEASE_BODY" | tr -d '\r\n[:space:]')" ]; then
-            RELEASE_BODY="$(gh release view "$TAG" -R "$REPO" --json body --jq .body 2>/dev/null || true)"
-          fi
-
-          base_content=$(
-            printf '%s\n' \
-              "JanOS" \
-              "Release ${TAG} published." \
-              "Release page:" \
-              "${RELEASE_PAGE}" \
-              "Web flasher:" \
-              "${PAGES_LINK}" \
-              "JanOS (${FW_VERSION}):" \
-              "${JANOS_ZIP}" \
-              "FAPs (${FAP_VER}):" \
-              "${FAP_ZIP}" \
-              "Full package:" \
-              "${BUNDLE_ZIP}"
-          )
-
-          RELEASE_BODY="$(printf '%s' "$RELEASE_BODY" | tr -d '\r')"
-          base_len=$(printf '%s' "$base_content" | wc -c | tr -d ' ')
-          room=$((1990 - base_len))
-          if [ "$room" -gt 0 ] && [ -n "$(printf '%s' "$RELEASE_BODY" | tr -d '\n[:space:]')" ]; then
-            body_trimmed="$(printf '%s' "$RELEASE_BODY" | head -c "$room")"
-            content="$(printf '%s\n%s' "$base_content" "$body_trimmed")"
-          else
-            content="$base_content"
-          fi
-
-          payload=$(jq -n --arg content "$content" '{content:$content}')
-          curl -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
