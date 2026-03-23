@@ -110,7 +110,12 @@ jobs:
           PY
           )
           suffix="${{ matrix.bin_suffix }}"
-          src="ESP32C5/binaries-esp32c5/projectZerobyLOCOSP.bin"
+          # Support both upstream (projectZero.bin) and LOCOSP fork naming
+          if [ -f "ESP32C5/binaries-esp32c5/projectZerobyLOCOSP.bin" ]; then
+            src="ESP32C5/binaries-esp32c5/projectZerobyLOCOSP.bin"
+          else
+            src="ESP32C5/binaries-esp32c5/projectZero.bin"
+          fi
           dst="ESP32C5/binaries-esp32c5/projectZerobyLOCOSP${suffix}-${version}.bin"
           if [ ! -f "$src" ]; then
             echo "Missing firmware: $src" >&2
