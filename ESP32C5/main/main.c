@@ -1269,6 +1269,7 @@ static int cmd_list_probes_vendor(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
 static int cmd_ping(int argc, char **argv);
+static int cmd_version(int argc, char **argv);
 static int cmd_boot_button(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_rogueap(int argc, char **argv);
@@ -10304,7 +10305,13 @@ static int cmd_reboot(int argc, char **argv)
 
 static int cmd_ping(int argc, char **argv) {
     (void)argc; (void)argv;
-    MY_LOG_INFO(TAG, "pong");
+    MY_LOG_INFO(TAG, "pong v" JANOS_VERSION);
+    return 0;
+}
+
+static int cmd_version(int argc, char **argv) {
+    (void)argc; (void)argv;
+    MY_LOG_INFO(TAG, "JanOS version: " JANOS_VERSION);
     return 0;
 }
 
@@ -14387,6 +14394,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&ping_cmd));
+
+    const esp_console_cmd_t version_cmd = {
+        .command = "version",
+        .help = "Print firmware version",
+        .hint = NULL,
+        .func = &cmd_version,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&version_cmd));
 
     const esp_console_cmd_t list_sd_cmd = {
         .command = "list_sd",
