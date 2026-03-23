@@ -115,7 +115,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.4"
+#define JANOS_VERSION "1.6.5"
 
 #define OTA_GITHUB_OWNER "LOCOSP"
 #define OTA_GITHUB_REPO "projectZero"
@@ -14772,7 +14772,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  wigle_upload");
 
     repl_config.prompt = ">";
-    repl_config.max_cmdline_length = 16384;  // must fit inline set_html (portals up to ~15KB)
+    repl_config.max_cmdline_length = 1024;  // must fit set_html chunks (~266 chars each)
 
     esp_console_register_help_command();
     register_commands();
