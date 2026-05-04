@@ -1352,6 +1352,7 @@ static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_rogueap(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
+static int cmd_sd_status(int argc, char **argv);
 static int cmd_list_dir(int argc, char **argv);
 static int cmd_list_ssid(int argc, char **argv);
 static int cmd_list_ssids(int argc, char **argv);
@@ -12553,6 +12554,19 @@ static int cmd_remove_ssid(int argc, char **argv)
     return 0;
 }
 
+// Command: sd_status - Fast SD card presence check (no mount/init)
+static int cmd_sd_status(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    struct stat st;
+    if (stat("/sdcard", &st) == 0) {
+        MY_LOG_INFO(TAG, "SD_OK");
+    } else {
+        MY_LOG_INFO(TAG, "SD_NONE");
+    }
+    return 0;
+}
+
 // Command: list_sd - Lists HTML files on SD card
 static int cmd_list_sd(int argc, char **argv)
 {
@@ -16696,6 +16710,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_sd_cmd));
 
+    const esp_console_cmd_t sd_status_cmd = {
+        .command = "sd_status",
+        .help = "Fast SD card presence check (no init/mount)",
+        .hint = NULL,
+        .func = &cmd_sd_status,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sd_status_cmd));
+
     const esp_console_cmd_t show_pass_cmd = {
         .command = "show_pass",
         .help = "Prints password log: show_pass [portal|evil]",
@@ -17032,6 +17055,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  list_probes");
       MY_LOG_INFO(TAG,"  list_probes_vendor");
       MY_LOG_INFO(TAG,"  list_sd");
+      MY_LOG_INFO(TAG,"  sd_status");
       MY_LOG_INFO(TAG,"  list_ssid");
       MY_LOG_INFO(TAG,"  list_ssids");
       MY_LOG_INFO(TAG,"  ota_boot <ota_0|ota_1>");
