@@ -307,13 +307,24 @@ jobs:
             fi
           done
 
+          gh_retry() {
+            local n=0
+            until [ $n -ge 5 ]; do
+              "$@" && return 0
+              n=$((n+1))
+              echo "gh command failed (attempt $n/5), retrying in 15s..."
+              sleep 15
+            done
+            return 1
+          }
+
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "$NAME" --notes-file release_notes.md
+            gh_retry gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "$NAME" --notes-file release_notes.md
           else
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$NAME" --notes-file release_notes.md
+            gh_retry gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$NAME" --notes-file release_notes.md
           fi
 
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+          gh_retry gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "${files[@]}"
 
   pages:
     name: Pages Web Flasher
