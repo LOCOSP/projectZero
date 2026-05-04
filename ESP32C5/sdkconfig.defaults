@@ -1,3 +1,6 @@
+# Main task stack - increased from 3584 to avoid overflow during startup help printing
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
 # Partition table - custom 8 MB OTA layout for BLE+WiFi app
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
