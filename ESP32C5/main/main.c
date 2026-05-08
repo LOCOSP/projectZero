@@ -123,7 +123,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.3"
+#define JANOS_VERSION "1.6.4"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -1320,6 +1320,7 @@ static display_type_t display_forced_mode = DISPLAY_NONE; /* DISPLAY_NONE = auto
 // Methods forward declarations
 static int cmd_scan_networks(int argc, char **argv);
 static int cmd_show_scan_results(int argc, char **argv);
+static int cmd_inspect_network(int argc, char **argv);
 static int cmd_select_networks(int argc, char **argv);
 static int cmd_unselect_networks(int argc, char **argv);
 static int cmd_select_stations(int argc, char **argv);
@@ -2703,7 +2704,7 @@ static void ota_mark_valid_if_pending(void) {
 }
 
 static void ota_log_boot_info(void) {
-    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    /*const esp_partition_t *boot = */esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
     const esp_partition_t *invalid = esp_ota_get_last_invalid_partition();
@@ -4170,6 +4171,202 @@ static int cmd_show_scan_results(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "Showing results from last scan (%u networks found):", g_scan_count);
     print_scan_results();
+    return 0;
+}
+
+// --- inspect_network: passively capture beacons and parse RSN IE (MFP) + TSF (uptime) ---
+
+#define INSPECT_TIMEOUT_MS    1500
+#define INSPECT_MIN_BEACONS   3
+
+typedef struct {
+    uint8_t target_bssid[6];
+    volatile bool active;
+    volatile uint32_t beacons_seen;
+    volatile uint64_t last_tsf_us;
+    volatile uint16_t last_beacon_interval_tu;
+    volatile bool has_rsn;
+    volatile bool mfp_capable;
+    volatile bool mfp_required;
+} inspect_state_t;
+
+static inspect_state_t g_inspect = {0};
+
+static void inspect_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!g_inspect.active) return;
+    if (type != WIFI_PKT_MGMT) return;
+
+    wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *)buf;
+    int total_len = (int)frame->rx_ctrl.sig_len;
+    const int hdr_len = (int)sizeof(data_frame_mac_header_t); // 24
+    if (total_len < hdr_len + 12) return;
+
+    data_frame_mac_header_t *hdr = (data_frame_mac_header_t *)frame->payload;
+    // Beacon: type=Management(0), subtype=Beacon(8)
+    if (hdr->frame_control.type != 0 || hdr->frame_control.subtype != 8) return;
+    if (memcmp(hdr->addr3, g_inspect.target_bssid, 6) != 0) return;
+
+    const uint8_t *body = frame->payload + hdr_len;
+    int body_len = total_len - hdr_len;
+    if (body_len < 12) return;
+
+    // Timestamp (8 B LE) - microseconds (TSF, ~AP uptime since boot)
+    uint64_t tsf = 0;
+    for (int i = 0; i < 8; i++) tsf |= ((uint64_t)body[i]) << (i * 8);
+    uint16_t bi = (uint16_t)body[8] | ((uint16_t)body[9] << 8);
+
+    // Walk tagged parameters
+    int p = 12;
+    bool found_rsn = false;
+    bool mfpc = false, mfpr = false;
+    while (p + 2 <= body_len) {
+        uint8_t tag_id = body[p];
+        uint8_t tag_len = body[p + 1];
+        if (p + 2 + (int)tag_len > body_len) break;
+        const uint8_t *tag_data = body + p + 2;
+
+        if (tag_id == 48 /* RSN */ && tag_len >= 2) {
+            int q = 0;
+            do {
+                if ((int)tag_len < q + 2) break;       // version
+                q += 2;
+                if ((int)tag_len < q + 4) break;       // group cipher
+                q += 4;
+                if ((int)tag_len < q + 2) break;       // pairwise count
+                uint16_t pw_count = (uint16_t)tag_data[q] | ((uint16_t)tag_data[q + 1] << 8);
+                q += 2;
+                if ((int)tag_len < q + (int)pw_count * 4) break;
+                q += (int)pw_count * 4;
+                if ((int)tag_len < q + 2) break;       // AKM count
+                uint16_t akm_count = (uint16_t)tag_data[q] | ((uint16_t)tag_data[q + 1] << 8);
+                q += 2;
+                if ((int)tag_len < q + (int)akm_count * 4) break;
+                q += (int)akm_count * 4;
+                if ((int)tag_len < q + 2) break;       // RSN Capabilities
+                uint16_t rsn_cap = (uint16_t)tag_data[q] | ((uint16_t)tag_data[q + 1] << 8);
+                mfpr = (rsn_cap & (1u << 6)) != 0;
+                mfpc = (rsn_cap & (1u << 7)) != 0;
+                found_rsn = true;
+            } while (0);
+        }
+        p += 2 + (int)tag_len;
+    }
+
+    g_inspect.last_tsf_us = tsf;
+    g_inspect.last_beacon_interval_tu = bi;
+    g_inspect.has_rsn = found_rsn;
+    g_inspect.mfp_capable = mfpc;
+    g_inspect.mfp_required = mfpr;
+    g_inspect.beacons_seen++;
+}
+
+static void inspect_format_uptime(uint64_t tsf_us, char *out, size_t out_sz) {
+    uint64_t total_s = tsf_us / 1000000ULL;
+    uint64_t days = total_s / 86400ULL;
+    uint64_t rem = total_s % 86400ULL;
+    unsigned hh = (unsigned)(rem / 3600ULL);
+    unsigned mm = (unsigned)((rem % 3600ULL) / 60ULL);
+    unsigned ss = (unsigned)(rem % 60ULL);
+    snprintf(out, out_sz, "%llud %02u:%02u:%02u", (unsigned long long)days, hh, mm, ss);
+}
+
+static int cmd_inspect_network(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Syntax: inspect_network <index>");
+        return 1;
+    }
+
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+
+    if (g_scan_in_progress) {
+        MY_LOG_INFO(TAG, "Scan still in progress... wait for completion.");
+        return 1;
+    }
+    if (!g_scan_done || g_scan_count == 0) {
+        MY_LOG_INFO(TAG, "No scan results. Run 'scan_networks' first.");
+        return 1;
+    }
+    if (sniffer_active || wardrive_active || beacon_spam_active) {
+        MY_LOG_INFO(TAG, "Another operation is active. Use 'stop' first.");
+        return 1;
+    }
+
+    int idx_1based = atoi(argv[1]);
+    if (idx_1based < 1 || idx_1based > (int)g_scan_count) {
+        MY_LOG_INFO(TAG, "Invalid index %d (valid: 1..%u)", idx_1based, g_scan_count);
+        return 1;
+    }
+    int idx = idx_1based - 1;
+    wifi_ap_record_t *ap = &g_scan_results[idx];
+    uint8_t channel = ap->primary;
+
+    operation_stop_requested = false;
+
+    // Save previous promiscuous state so we can restore it
+    bool prev_promisc = false;
+    esp_wifi_get_promiscuous(&prev_promisc);
+
+    memset((void *)&g_inspect, 0, sizeof(g_inspect));
+    memcpy(g_inspect.target_bssid, ap->bssid, 6);
+    g_inspect.active = true;
+
+    wifi_promiscuous_filter_t filter = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(inspect_promiscuous_cb);
+    if (!prev_promisc) {
+        esp_wifi_set_promiscuous(true);
+    }
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)INSPECT_TIMEOUT_MS * 1000;
+    while (esp_timer_get_time() < deadline_us && !operation_stop_requested) {
+        if (g_inspect.beacons_seen >= INSPECT_MIN_BEACONS) break;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    g_inspect.active = false;
+    if (!prev_promisc) {
+        esp_wifi_set_promiscuous(false);
+    }
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+
+    uint32_t seen = g_inspect.beacons_seen;
+    char bssid_str[18];
+    snprintf(bssid_str, sizeof(bssid_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             ap->bssid[0], ap->bssid[1], ap->bssid[2],
+             ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+
+    if (seen == 0) {
+        MY_LOG_INFO(TAG,
+            "[INSPECT] index=%d bssid=%s channel=%u ssid=\"%s\" beacons_seen=0 error=timeout",
+            idx_1based, bssid_str, (unsigned)channel, (const char *)ap->ssid);
+        return 1;
+    }
+
+    char uptime_str[40];
+    inspect_format_uptime(g_inspect.last_tsf_us, uptime_str, sizeof(uptime_str));
+
+    if (g_inspect.has_rsn) {
+        MY_LOG_INFO(TAG,
+            "[INSPECT] index=%d bssid=%s channel=%u ssid=\"%s\" mfp_capable=%d mfp_required=%d uptime_us=%llu uptime_str=%s beacon_interval_tu=%u beacons_seen=%u",
+            idx_1based, bssid_str, (unsigned)channel, (const char *)ap->ssid,
+            g_inspect.mfp_capable ? 1 : 0,
+            g_inspect.mfp_required ? 1 : 0,
+            (unsigned long long)g_inspect.last_tsf_us,
+            uptime_str,
+            (unsigned)g_inspect.last_beacon_interval_tu,
+            (unsigned)seen);
+    } else {
+        MY_LOG_INFO(TAG,
+            "[INSPECT] index=%d bssid=%s channel=%u ssid=\"%s\" mfp_capable=- mfp_required=- uptime_us=%llu uptime_str=%s beacon_interval_tu=%u beacons_seen=%u note=no_rsn_ie",
+            idx_1based, bssid_str, (unsigned)channel, (const char *)ap->ssid,
+            (unsigned long long)g_inspect.last_tsf_us,
+            uptime_str,
+            (unsigned)g_inspect.last_beacon_interval_tu,
+            (unsigned)seen);
+    }
     return 0;
 }
 
@@ -16119,6 +16316,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_scan_cmd));
+
+    const esp_console_cmd_t inspect_cmd = {
+        .command = "inspect_network",
+        .help = "Inspect AP from last scan: parse beacon for MFP (802.11w) and TSF uptime. Usage: inspect_network <index>",
+        .hint = NULL,
+        .func = &cmd_inspect_network,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&inspect_cmd));
     
 
     const esp_console_cmd_t sniffer_cmd = {

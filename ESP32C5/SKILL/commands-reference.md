@@ -28,6 +28,26 @@ Scan results printed.
 - **Description**: Prints results from last `scan_networks`. Same CSV format as above.
 - **Completion marker**: `"Scan results printed"`
 
+### `inspect_network`
+- **Syntax**: `inspect_network <index>`
+- **Description**: Passively captures beacons from the AP at the given 1-based index (from last `scan_networks`) on its primary channel for ~1.5 s. Parses the beacon to expose data not available in `scan_networks`:
+  - **MFP (802.11w / Management Frame Protection)** — read from RSN IE (tag 48) RSN Capabilities field: `mfp_capable` (bit 7 = MFPC) and `mfp_required` (bit 6 = MFPR).
+  - **AP uptime** — TSF timestamp from beacon body (microseconds since AP boot).
+- **Output** (single line, prefixed with `[INSPECT]`):
+```
+[INSPECT] index=1 bssid=C4:2B:44:12:29:20 channel=112 ssid="AX3" mfp_capable=1 mfp_required=0 uptime_us=1234567890 uptime_str=14d 06:56:07 beacon_interval_tu=100 beacons_seen=3
+```
+- **No-RSN AP** (open / WPA-only — MFP not applicable):
+```
+[INSPECT] index=2 bssid=... mfp_capable=- mfp_required=- uptime_us=... uptime_str=... beacon_interval_tu=100 beacons_seen=2 note=no_rsn_ie
+```
+- **Timeout** (no beacon received within ~1.5 s):
+```
+[INSPECT] index=1 bssid=... channel=... ssid="..." beacons_seen=0 error=timeout
+```
+- **Completion marker**: any line containing `"[INSPECT]"`.
+- **Notes**: Requires prior `scan_networks`. Refuses to run while sniffer / wardrive / beacon spam is active. Switches the radio to the target channel during the capture; previous promiscuous state is restored afterward.
+
 ### `select_networks`
 - **Syntax**: `select_networks <index1> [index2] ...`
 - **Description**: Selects networks by 1-based index for targeted attacks/operations.
