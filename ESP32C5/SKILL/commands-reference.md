@@ -532,6 +532,13 @@ Wardrive promisc: 29 unique networks, D-UCB best ch: 1 (5 visits), GPS: valid
 
 ## SD Card Operations
 
+### `sd_status`
+- **Syntax**: `sd_status`
+- **Description**: Fast SD card presence check. Does NOT initialize or mount SD — only checks if already accessible.
+- **Output**: `"SD_OK"` if SD is mounted and accessible, `"SD_NONE"` otherwise.
+- **Completion marker**: Either `strstr("SD_OK")` or `strstr("SD_NONE")`
+- **Notes**: Returns within ~200ms. Use this instead of `list_sd` when you only need to know if SD is present.
+
 ### `list_sd`
 - **Syntax**: `list_sd`
 - **Description**: Lists HTML portal files on SD card.

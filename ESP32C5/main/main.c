@@ -1377,6 +1377,7 @@ static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_rogueap(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
+static int cmd_sd_status(int argc, char **argv);
 static int cmd_list_dir(int argc, char **argv);
 static int cmd_list_ssid(int argc, char **argv);
 static int cmd_list_ssids(int argc, char **argv);
@@ -2745,16 +2746,10 @@ static void ota_log_boot_info(void) {
         }
     }
 
-    MY_LOG_INFO(TAG, "OTA: boot partition=%s offset=0x%lx",
-                boot ? boot->label : "n/a",
-                boot ? (unsigned long)boot->address : 0UL);
-    MY_LOG_INFO(TAG, "OTA: running partition=%s offset=0x%lx state=%d",
+    MY_LOG_INFO(TAG, "OTA: run=%s state=%d next=%s",
                 running ? running->label : "n/a",
-                running ? (unsigned long)running->address : 0UL,
-                (int)state);
-    MY_LOG_INFO(TAG, "OTA: next update partition=%s offset=0x%lx",
-                next ? next->label : "n/a",
-                next ? (unsigned long)next->address : 0UL);
+                (int)state,
+                next ? next->label : "n/a");
     if (invalid) {
         MY_LOG_INFO(TAG, "OTA: last invalid partition=%s offset=0x%lx",
                     invalid->label,
@@ -12898,6 +12893,19 @@ static int cmd_remove_ssid(int argc, char **argv)
     return 0;
 }
 
+// Command: sd_status - Fast SD card presence check (no mount/init)
+static int cmd_sd_status(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    struct stat st;
+    if (stat("/sdcard", &st) == 0) {
+        MY_LOG_INFO(TAG, "SD_OK");
+    } else {
+        MY_LOG_INFO(TAG, "SD_NONE");
+    }
+    return 0;
+}
+
 // Command: list_sd - Lists HTML files on SD card
 static int cmd_list_sd(int argc, char **argv)
 {
@@ -17043,6 +17051,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_sd_cmd));
 
+    const esp_console_cmd_t sd_status_cmd = {
+        .command = "sd_status",
+        .help = "Fast SD card presence check (no init/mount)",
+        .hint = NULL,
+        .func = &cmd_sd_status,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sd_status_cmd));
+
     const esp_console_cmd_t show_pass_cmd = {
         .command = "show_pass",
         .help = "Prints password log: show_pass [portal|evil]",
@@ -17207,7 +17224,6 @@ void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
     display_mode_load_from_nvs();
     oled_display_set_forced_type(display_forced_mode);
-    MY_LOG_INFO(TAG, "Display mode configured: %s", display_mode_to_str(display_forced_mode));
 
     // Initialize display module (auto-detect SSD1306 / SH1107 / SH1106 / Unit LCD)
     oled_display_init();
@@ -17243,7 +17259,7 @@ void app_main(void) {
                 snprintf(display_desc, sizeof(display_desc), "check display wiring / I2C");
                 break;
         }
-        MY_LOG_INFO(TAG, "Display auto-detect: %s (%s)", display_name, display_desc);
+        MY_LOG_INFO(TAG, "Display: %s", display_name);
     }
     oled_display_update_full("> JanOS v" JANOS_VERSION, "  Booting...", "", "");
     vTaskDelay(pdMS_TO_TICKS(80));
@@ -17255,40 +17271,6 @@ void app_main(void) {
     wdgwars_load_key_from_nvs();
     ota_mark_valid_if_pending();
     ota_log_boot_info();
-    {
-        const char *display_name = "NONE";
-        char display_desc[64];
-        int disp_addr7 = oled_display_get_i2c_addr_7bit();
-        int disp_addr_raw = oled_display_get_i2c_addr_raw();
-        snprintf(display_desc, sizeof(display_desc), "not detected");
-        switch (oled_display_get_type()) {
-            case DISPLAY_SSD1306:
-                display_name = "SSD1306";
-                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
-                         disp_addr_raw, disp_addr7);
-                break;
-            case DISPLAY_SH1107:
-                display_name = "SH1107";
-                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
-                         disp_addr_raw, disp_addr7);
-                break;
-            case DISPLAY_SH1106:
-                display_name = "SH1106";
-                snprintf(display_desc, sizeof(display_desc), "addr raw 0x%02X / 7-bit 0x%02X",
-                         disp_addr_raw, disp_addr7);
-                break;
-            case DISPLAY_UNIT_LCD:
-                display_name = "UNIT_LCD";
-                snprintf(display_desc, sizeof(display_desc), "addr 0x%02X", disp_addr7);
-                break;
-            case DISPLAY_NONE:
-            default:
-                display_name = "NONE";
-                snprintf(display_desc, sizeof(display_desc), "check display wiring / I2C");
-                break;
-        }
-        MY_LOG_INFO(TAG, "POST Display auto-detect: %s (%s)", display_name, display_desc);
-    }
     //printf("NVS initialized OK\n");
 
     channel_time_load_state_from_nvs();
@@ -17296,9 +17278,7 @@ void app_main(void) {
     led_load_state_from_nvs();
     oled_display_update_full(NULL, "  NVS: OK", "  Init LED...", "");
     vTaskDelay(pdMS_TO_TICKS(60));
-    MY_LOG_INFO(TAG, "GPS module: %s (baud %d)",
-                gps_get_module_name(current_gps_module),
-                gps_get_baud_for_module(current_gps_module));
+    MY_LOG_INFO(TAG, "GPS: %s", gps_get_module_name(current_gps_module));
 
     //printf("Step 4: Init LED strip\n");
     // 1. LED strip configuration
@@ -17331,7 +17311,6 @@ void app_main(void) {
         led_boot_sequence();
     }
     //printf("Step 6: Vendor load state\n");
-    MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
     oled_display_update_full(NULL, "  NVS: OK", "  LED: OK", "  Init SD...");
     vTaskDelay(pdMS_TO_TICKS(60));
     vendor_load_state_from_nvs();
@@ -17358,87 +17337,7 @@ void app_main(void) {
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     // Keep REPL stable for heavier TLS-based commands triggered directly from CLI.
     repl_config.task_stack_size = 8192;
-     MY_LOG_INFO(TAG,"");
-    MY_LOG_INFO(TAG,"Available commands:");
-      MY_LOG_INFO(TAG,"  add_ssid <SSID>");
-      MY_LOG_INFO(TAG,"  arp_ban <MAC> [IP]");
-      MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
-      MY_LOG_INFO(TAG,"  channel_time set <min|max> <ms> | channel_time read <min|max>");
-      MY_LOG_INFO(TAG,"  channel_view");
-      MY_LOG_INFO(TAG,"  clear_sniffer_results");
-      MY_LOG_INFO(TAG,"  deauth_detector");
-      MY_LOG_INFO(TAG,"  display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
-      MY_LOG_INFO(TAG,"  download");
-      MY_LOG_INFO(TAG,"  file_delete <path>");
-      MY_LOG_INFO(TAG,"  gps_set <m5|atgm|external|cap>");
-      MY_LOG_INFO(TAG,"  help");
-      MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
-      MY_LOG_INFO(TAG,"  list_dir <path>");
-      MY_LOG_INFO(TAG,"  list_hosts");
-      MY_LOG_INFO(TAG,"  list_hosts_vendor");
-      MY_LOG_INFO(TAG,"  list_probes");
-      MY_LOG_INFO(TAG,"  list_probes_vendor");
-      MY_LOG_INFO(TAG,"  list_sd");
-      MY_LOG_INFO(TAG,"  list_ssid");
-      MY_LOG_INFO(TAG,"  list_ssids");
-      MY_LOG_INFO(TAG,"  ota_boot <ota_0|ota_1>");
-      MY_LOG_INFO(TAG,"  ota_channel [main|dev]");
-      MY_LOG_INFO(TAG,"  ota_check");
-      MY_LOG_INFO(TAG,"  ota_info");
-      MY_LOG_INFO(TAG,"  ota_list");
-      MY_LOG_INFO(TAG,"  packet_monitor <channel>");
-      MY_LOG_INFO(TAG,"  ping");
-      MY_LOG_INFO(TAG,"  reboot");
-      MY_LOG_INFO(TAG,"  remove_ssid <index>");
-      MY_LOG_INFO(TAG,"  sae_overflow");
-      MY_LOG_INFO(TAG,"  save_handshake");
-      MY_LOG_INFO(TAG,"  scan_airtag");
-      MY_LOG_INFO(TAG,"  scan_bt");
-      MY_LOG_INFO(TAG,"  scan_networks");
-      MY_LOG_INFO(TAG,"  select_html <index>");
-      MY_LOG_INFO(TAG,"  select_networks <index1> [index2] ...");
-      MY_LOG_INFO(TAG,"  select_stations <MAC1> [MAC2] ...");
-      MY_LOG_INFO(TAG,"  set_gps_position <lat> <lon> [alt] [acc]");
-      MY_LOG_INFO(TAG,"  set_gps_position_cap <lat> <lon> [alt] [acc]");
-      MY_LOG_INFO(TAG,"  set_html <html>");
-      MY_LOG_INFO(TAG,"  show_pass [portal|evil]");
-      MY_LOG_INFO(TAG,"  show_probes");
-      MY_LOG_INFO(TAG,"  show_probes_vendor");
-      MY_LOG_INFO(TAG,"  show_scan_results");
-      MY_LOG_INFO(TAG,"  show_sniffer_results");
-      MY_LOG_INFO(TAG,"  show_sniffer_results_vendor");
-      MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
-      MY_LOG_INFO(TAG,"  start_beacon_spam \"SSID1\" \"SSID2\" ...");
-      MY_LOG_INFO(TAG,"  start_beacon_spam_ssids");
-      MY_LOG_INFO(TAG,"  start_blackout");
-      MY_LOG_INFO(TAG,"  start_deauth");
-      MY_LOG_INFO(TAG,"  start_evil_twin");
-      MY_LOG_INFO(TAG,"  start_gps_raw");
-      MY_LOG_INFO(TAG,"  start_handshake [index1] [index2] ...");
-      MY_LOG_INFO(TAG,"  start_karma <index>");
-    MY_LOG_INFO(TAG,"  start_ap_locator");
-      MY_LOG_INFO(TAG,"  start_nmap [quick|medium|heavy] [IP]");
-      MY_LOG_INFO(TAG,"  start_portal <SSID>");
-      MY_LOG_INFO(TAG,"  start_rogueap <SSID> <password>");
-      MY_LOG_INFO(TAG,"  start_sniffer");
-      MY_LOG_INFO(TAG,"  start_sniffer_dog");
-      MY_LOG_INFO(TAG,"  start_sniffer_noscan");
-      MY_LOG_INFO(TAG,"  start_wardrive");
-      MY_LOG_INFO(TAG,"  start_wardrive_promisc");
-      MY_LOG_INFO(TAG,"  start_wardrive_promisc_trace");
-      MY_LOG_INFO(TAG,"  stop");
-      MY_LOG_INFO(TAG,"  unselect_networks");
-      MY_LOG_INFO(TAG,"  unselect_stations");
-      MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
-      MY_LOG_INFO(TAG,"  version");
-      MY_LOG_INFO(TAG,"  wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
-      MY_LOG_INFO(TAG,"  wifi_disconnect");
-      MY_LOG_INFO(TAG,"  wdgwars_key set <key> | wdgwars_key read");
-      MY_LOG_INFO(TAG,"  wdgwars_upload");
-      MY_LOG_INFO(TAG,"  wigle_key set <api_name> <api_token> | wigle_key read");
-      MY_LOG_INFO(TAG,"  wigle_upload");
-      MY_LOG_INFO(TAG,"  wpasec_key set <key> | wpasec_key read");
-      MY_LOG_INFO(TAG,"  wpasec_upload");
+    MY_LOG_INFO(TAG,"Type 'help' to list all commands.");
 
     repl_config.prompt = ">";
     repl_config.max_cmdline_length = 100;
@@ -19497,21 +19396,19 @@ static esp_err_t init_sd_card(void) {
         return ret;
     }
     
-    // Print card info
-    MY_LOG_INFO(TAG, "SD card mounted successfully");
-    sdmmc_card_print_info(stdout, sd_card_handle);
-    
+    // Print card info (single line)
+    uint64_t size_mb = ((uint64_t)sd_card_handle->csd.capacity) * sd_card_handle->csd.sector_size / (1024 * 1024);
+    MY_LOG_INFO(TAG, "SD: %s %lluMB", sd_card_handle->cid.name, size_mb);
+
     // Test file creation to verify write access
     FILE *test_file = fopen("/sdcard/test.txt", "w");
     if (test_file != NULL) {
         fprintf(test_file, "Test write\n");
         fclose(test_file);
-        MY_LOG_INFO(TAG, "SD card write test successful");
-        // Clean up test file
         unlink("/sdcard/test.txt");
         sd_sync();
     } else {
-        MY_LOG_INFO(TAG, "SD card write test failed, errno: %d (%s)", errno, strerror(errno));
+        MY_LOG_INFO(TAG, "SD write test failed, errno: %d (%s)", errno, strerror(errno));
     }
     
     // Mark SD card as successfully mounted
@@ -19524,74 +19421,22 @@ static esp_err_t init_sd_card(void) {
 static esp_err_t create_sd_directories(void) {
     struct stat st;
     
-    MY_LOG_INFO(TAG, "Checking and creating SD card directories...");
-    
-    // Create /sdcard/lab directory
-    if (stat("/sdcard/lab", &st) != 0) {
-        MY_LOG_INFO(TAG, "Creating /sdcard/lab directory...");
-        if (mkdir("/sdcard/lab", 0755) != 0) {
-            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab directory: %s", strerror(errno));
-            return ESP_FAIL;
+    static const char * const dirs[] = {
+        "/sdcard/lab",
+        "/sdcard/lab/htmls",
+        "/sdcard/lab/handshakes",
+        "/sdcard/lab/wardrives",
+        "/sdcard/lab/pcaps",
+    };
+    for (int i = 0; i < (int)(sizeof(dirs) / sizeof(dirs[0])); i++) {
+        if (stat(dirs[i], &st) != 0) {
+            if (mkdir(dirs[i], 0755) != 0) {
+                MY_LOG_INFO(TAG, "mkdir %s failed: %s", dirs[i], strerror(errno));
+                return ESP_FAIL;
+            }
+            sd_sync();
         }
-        sd_sync();
-        MY_LOG_INFO(TAG, "/sdcard/lab created successfully");
-    } else {
-        MY_LOG_INFO(TAG, "/sdcard/lab already exists");
     }
-    
-    // Create /sdcard/lab/htmls directory
-    if (stat("/sdcard/lab/htmls", &st) != 0) {
-        MY_LOG_INFO(TAG, "Creating /sdcard/lab/htmls directory...");
-        if (mkdir("/sdcard/lab/htmls", 0755) != 0) {
-            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/htmls directory: %s", strerror(errno));
-            return ESP_FAIL;
-        }
-        sd_sync();
-        MY_LOG_INFO(TAG, "/sdcard/lab/htmls created successfully");
-    } else {
-        MY_LOG_INFO(TAG, "/sdcard/lab/htmls already exists");
-    }
-    
-    // Create /sdcard/lab/handshakes directory
-    if (stat("/sdcard/lab/handshakes", &st) != 0) {
-        MY_LOG_INFO(TAG, "Creating /sdcard/lab/handshakes directory...");
-        if (mkdir("/sdcard/lab/handshakes", 0755) != 0) {
-            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/handshakes directory: %s", strerror(errno));
-            return ESP_FAIL;
-        }
-        sd_sync();
-        MY_LOG_INFO(TAG, "/sdcard/lab/handshakes created successfully");
-    } else {
-        MY_LOG_INFO(TAG, "/sdcard/lab/handshakes already exists");
-    }
-    
-    // Create /sdcard/lab/wardrives directory
-    if (stat("/sdcard/lab/wardrives", &st) != 0) {
-        MY_LOG_INFO(TAG, "Creating /sdcard/lab/wardrives directory...");
-        if (mkdir("/sdcard/lab/wardrives", 0755) != 0) {
-            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/wardrives directory: %s", strerror(errno));
-            return ESP_FAIL;
-        }
-        sd_sync();
-        MY_LOG_INFO(TAG, "/sdcard/lab/wardrives created successfully");
-    } else {
-        MY_LOG_INFO(TAG, "/sdcard/lab/wardrives already exists");
-    }
-    
-    // Create /sdcard/lab/pcaps directory
-    if (stat("/sdcard/lab/pcaps", &st) != 0) {
-        MY_LOG_INFO(TAG, "Creating /sdcard/lab/pcaps directory...");
-        if (mkdir("/sdcard/lab/pcaps", 0755) != 0) {
-            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/pcaps directory: %s", strerror(errno));
-            return ESP_FAIL;
-        }
-        sd_sync();
-        MY_LOG_INFO(TAG, "/sdcard/lab/pcaps created successfully");
-    } else {
-        MY_LOG_INFO(TAG, "/sdcard/lab/pcaps already exists");
-    }
-    
-    MY_LOG_INFO(TAG, "All required directories are ready");
     return ESP_OK;
 }
 
@@ -20032,8 +19877,6 @@ static void save_portal_data(const char* ssid, const char* form_data) {
 static void load_whitelist_from_sd(void) {
     whitelistedBssidsCount = 0; // Reset count
     
-    MY_LOG_INFO(TAG, "Checking for whitelist file (white.txt) on SD card...");
-    
     // Try to initialize SD card (silently fail if not available)
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
@@ -20044,7 +19887,6 @@ static void load_whitelist_from_sd(void) {
     // Try to open white.txt file
     FILE *file = fopen("/sdcard/lab/white.txt", "r");
     if (file == NULL) {
-        MY_LOG_INFO(TAG, "white.txt not found on SD card - whitelist will be empty");
         return;
     }
     
