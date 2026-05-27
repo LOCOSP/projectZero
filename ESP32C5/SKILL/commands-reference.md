@@ -685,6 +685,21 @@ SSID removed. 2 SSIDs remaining.
 - **Parse fields**: `CH:` (int), `AP:` (string until `(`), BSSID (inside parens), `RSSI:` (int).
 - **Stop**: Send `stop`.
 
+### `start_ap_locator`
+- **Syntax**: `start_ap_locator`
+- **Description**: Locks onto the channel of exactly one AP selected with `select_networks`, listens for its beacon frames, and prints RSSI once per second.
+- **Prerequisite**: Exactly one selected network from prior `scan_networks` + `select_networks <index>`.
+- **Continuous output**:
+```
+[AP Locator] CH: 6 | AP: MyNetwork (AA:BB:CC:DD:EE:FF) | RSSI: -47 dBm | beacons: 10
+[AP Locator] CH: 6 | AP: MyNetwork (AA:BB:CC:DD:EE:FF) | RSSI: N/A | no beacon
+```
+- **Notes**:
+  - Uses the selected AP's last scanned primary channel; no channel hopping.
+  - If no matching beacon is seen during the last second, it still prints a status line with `RSSI: N/A | no beacon`.
+  - Conflicts with other monitoring or attack modes that take over WiFi promiscuous mode or channel control.
+- **Stop**: Send `stop`.
+
 ### `packet_monitor`
 - **Syntax**: `packet_monitor <channel>`
 - **Description**: Monitors packets per second on a specific channel (1-14).
