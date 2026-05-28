@@ -111,6 +111,7 @@ Every command response has a known end marker. Wait for it before proceeding:
 | Command | Completion Marker |
 |---------|-------------------|
 | `scan_networks` | `"Scan results printed"` |
+| `inspect_network` | `"[INSPECT]"` (single line) |
 | `wifi_connect` | `"SUCCESS"` or `"FAILED"` or `"TIMEOUT"` |
 | `start_nmap` | `"Scanned"` + `"open ports"` (final summary line) |
 | `list_hosts` | `"Discovered Hosts"` (header line, data follows) |
