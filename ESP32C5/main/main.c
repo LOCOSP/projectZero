@@ -154,6 +154,7 @@
 #define WDGWARS_NVS_NAMESPACE "wdgwars"
 #define WDGWARS_NVS_KEY       "api_key"
 #define WDGWARS_URL           "https://wdgwars.pl/api/upload-csv"
+#define WDGWARS_HISTORY_URL   "https://wdgwars.pl/api/upload-history?limit=5"
 #define WDGWARS_KEY_MAX_LEN   65
 
 #define DISPLAY_NVS_NAMESPACE "display"
@@ -7813,6 +7814,98 @@ static int cmd_wdgwars_key(int argc, char **argv) {
     return 0;
 }
 
+/**
+ * @brief Query upload history and check if filename appears in the last 5 uploads.
+ * @return true if found (upload confirmed), false otherwise
+ */
+static bool wdgwars_check_in_history(const char *filename) {
+    const size_t RESP_BUF_SZ = 2048;
+    bool found = false;
+    esp_tls_t *tls = NULL;
+    char *resp_buf = NULL;
+    char *req_buf = NULL;
+
+    resp_buf = (char *)heap_caps_malloc(RESP_BUF_SZ, MALLOC_CAP_8BIT);
+    req_buf  = (char *)heap_caps_malloc(256, MALLOC_CAP_8BIT);
+    if (!resp_buf || !req_buf) goto hist_cleanup;
+
+    int req_len = snprintf(req_buf, 256,
+                           "GET /api/upload-history?limit=5 HTTP/1.1\r\n"
+                           "Host: wdgwars.pl\r\n"
+                           "X-API-Key: %s\r\n"
+                           "Connection: close\r\n"
+                           "\r\n",
+                           wdgwars_api_key);
+    if (req_len <= 0 || req_len >= 256) goto hist_cleanup;
+
+    esp_tls_cfg_t tls_cfg = { .crt_bundle_attach = NULL, .timeout_ms = 10000 };
+    tls = esp_tls_init();
+    if (!tls) goto hist_cleanup;
+    if (esp_tls_conn_http_new_sync(WDGWARS_HISTORY_URL, &tls_cfg, tls) < 0) goto hist_cleanup;
+    if (wpasec_tls_write_all(tls, req_buf, req_len) < 0) goto hist_cleanup;
+
+    memset(resp_buf, 0, RESP_BUF_SZ);
+    int total_read = 0;
+    int ret;
+    while (total_read < (int)RESP_BUF_SZ - 1) {
+        ret = esp_tls_conn_read(tls, resp_buf + total_read, RESP_BUF_SZ - 1 - total_read);
+        if (ret <= 0) break;
+        total_read += ret;
+    }
+    resp_buf[total_read] = '\0';
+
+    // Find JSON body after HTTP headers
+    const char *body = strstr(resp_buf, "\r\n\r\n");
+    if (!body) goto hist_cleanup;
+    body += 4;
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) goto hist_cleanup;
+
+    cJSON *uploads = cJSON_GetObjectItem(root, "uploads");
+    if (cJSON_IsArray(uploads)) {
+        int n = cJSON_GetArraySize(uploads);
+        for (int i = 0; i < n && !found; i++) {
+            cJSON *entry = cJSON_GetArrayItem(uploads, i);
+            cJSON *fn = cJSON_GetObjectItem(entry, "filename");
+            if (cJSON_IsString(fn) && fn->valuestring &&
+                strcmp(fn->valuestring, filename) == 0) {
+                found = true;
+            }
+        }
+    }
+    cJSON_Delete(root);
+
+hist_cleanup:
+    if (tls) esp_tls_conn_destroy(tls);
+    if (resp_buf) free(resp_buf);
+    if (req_buf)  free(req_buf);
+    return found;
+}
+
+static int wdgwars_upload_file_with_retry(const char *filepath, const char *filename) {
+    int result = wdgwars_upload_file(filepath, filename);
+    if (result != -1) return result;
+
+    // HTTP error (likely timeout reading response) — verify via history before retrying
+    MY_LOG_INFO(TAG, "  Upload response not received, checking history...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    if (wdgwars_check_in_history(filename)) {
+        MY_LOG_INFO(TAG, "  Upload confirmed via history");
+        return 0;
+    }
+
+    // Not in history yet — try once more
+    MY_LOG_INFO(TAG, "  Not found in history, retrying upload...");
+    result = wdgwars_upload_file(filepath, filename);
+    if (result == 1) {
+        // Duplicate on retry = first attempt landed after all
+        MY_LOG_INFO(TAG, "  Upload confirmed (duplicate on retry)");
+        return 0;
+    }
+    return result;
+}
+
 static int cmd_wdgwars_upload(int argc, char **argv) {
     oled_display_update_full("> WDGWars", "  Sending files", "  wdgwars.pl", "  Uploading...");
 
@@ -7861,7 +7954,7 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
                 fsize = (long)st.st_size;
             }
 
-            int result = wdgwars_upload_file(filepath, upload_name);
+            int result = wdgwars_upload_file_with_retry(filepath, upload_name);
             if (result == 0) {
                 MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
                 uploaded++;
@@ -7936,7 +8029,7 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
             fsize = (long)st.st_size;
         }
 
-        int result = wdgwars_upload_file(filepath, entry->d_name);
+        int result = wdgwars_upload_file_with_retry(filepath, entry->d_name);
         if (result == 0) {
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
             uploaded++;
