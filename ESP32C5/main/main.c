@@ -94,6 +94,7 @@
 #include "frame_analyzer_types.h"
 #include "sniffer.h"
 #include "oled_display.h"
+#include "nrf24_jammer.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -123,7 +124,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.4"
+#define JANOS_VERSION "1.6.5"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -154,6 +155,7 @@
 #define WDGWARS_NVS_NAMESPACE "wdgwars"
 #define WDGWARS_NVS_KEY       "api_key"
 #define WDGWARS_URL           "https://wdgwars.pl/api/upload-csv"
+#define WDGWARS_HISTORY_URL   "https://wdgwars.pl/api/upload-history?limit=5"
 #define WDGWARS_KEY_MAX_LEN   65
 
 #define DISPLAY_NVS_NAMESPACE "display"
@@ -320,6 +322,30 @@ static wifi_second_chan_t packet_monitor_prev_secondary = WIFI_SECOND_CHAN_NONE;
 static bool packet_monitor_has_prev_channel = false;
 static bool packet_monitor_promiscuous_owned = false;
 static bool packet_monitor_callback_installed = false;
+
+// AP locator state
+static volatile bool ap_locator_active = false;
+static volatile int ap_locator_last_rssi = 0;
+static volatile bool ap_locator_beacon_seen = false;
+static volatile uint32_t ap_locator_beacon_total = 0;
+static volatile int64_t ap_locator_last_seen_us = 0;
+static TaskHandle_t ap_locator_task_handle = NULL;
+static uint8_t ap_locator_target_bssid[6] = {0};
+static char ap_locator_target_ssid[33] = {0};
+static uint8_t ap_locator_target_channel = 1;
+static uint8_t ap_locator_prev_primary = 1;
+static wifi_second_chan_t ap_locator_prev_secondary = WIFI_SECOND_CHAN_NONE;
+static bool ap_locator_has_prev_channel = false;
+static bool ap_locator_promiscuous_owned = false;
+static bool ap_locator_callback_installed = false;
+static int cmd_start_ap_locator(int argc, char **argv);
+static const esp_console_cmd_t ap_locator_cmd = {
+    .command = "start_ap_locator",
+    .help = "Track beacon RSSI of exactly one selected AP: start_ap_locator",
+    .hint = NULL,
+    .func = &cmd_start_ap_locator,
+    .argtable = NULL
+};
 
 // Channel view monitor state
 static volatile bool channel_view_active = false;
@@ -1337,6 +1363,7 @@ static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_start_sniffer_noscan(int argc, char **argv);
 static int cmd_packet_monitor(int argc, char **argv);
+static int cmd_start_ap_locator(int argc, char **argv);
 static int cmd_channel_view(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
 static int cmd_clear_sniffer_results(int argc, char **argv);
@@ -1366,6 +1393,8 @@ static int cmd_show_pass(int argc, char **argv);
 static int cmd_file_delete(int argc, char **argv);
 static int cmd_start_pcap(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
+static int cmd_init_nrf24(int argc, char **argv);
+static int cmd_start_jammer24(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
 static int cmd_list_hosts_vendor(int argc, char **argv);
@@ -1456,6 +1485,11 @@ static void packet_monitor_promiscuous_callback(void *buf, wifi_promiscuous_pkt_
 static void packet_monitor_task(void *pvParameters);
 static void packet_monitor_shutdown(void);
 static void packet_monitor_stop(void);
+// AP locator functions
+static void ap_locator_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
+static void ap_locator_task(void *pvParameters);
+static void ap_locator_shutdown(void);
+static void ap_locator_stop(void);
 // Sniffer Dog functions
 static int cmd_start_sniffer_dog(int argc, char **argv);
 static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
@@ -7783,6 +7817,98 @@ static int cmd_wdgwars_key(int argc, char **argv) {
     return 0;
 }
 
+/**
+ * @brief Query upload history and check if filename appears in the last 5 uploads.
+ * @return true if found (upload confirmed), false otherwise
+ */
+static bool wdgwars_check_in_history(const char *filename) {
+    const size_t RESP_BUF_SZ = 2048;
+    bool found = false;
+    esp_tls_t *tls = NULL;
+    char *resp_buf = NULL;
+    char *req_buf = NULL;
+
+    resp_buf = (char *)heap_caps_malloc(RESP_BUF_SZ, MALLOC_CAP_8BIT);
+    req_buf  = (char *)heap_caps_malloc(256, MALLOC_CAP_8BIT);
+    if (!resp_buf || !req_buf) goto hist_cleanup;
+
+    int req_len = snprintf(req_buf, 256,
+                           "GET /api/upload-history?limit=5 HTTP/1.1\r\n"
+                           "Host: wdgwars.pl\r\n"
+                           "X-API-Key: %s\r\n"
+                           "Connection: close\r\n"
+                           "\r\n",
+                           wdgwars_api_key);
+    if (req_len <= 0 || req_len >= 256) goto hist_cleanup;
+
+    esp_tls_cfg_t tls_cfg = { .crt_bundle_attach = NULL, .timeout_ms = 10000 };
+    tls = esp_tls_init();
+    if (!tls) goto hist_cleanup;
+    if (esp_tls_conn_http_new_sync(WDGWARS_HISTORY_URL, &tls_cfg, tls) < 0) goto hist_cleanup;
+    if (wpasec_tls_write_all(tls, req_buf, req_len) < 0) goto hist_cleanup;
+
+    memset(resp_buf, 0, RESP_BUF_SZ);
+    int total_read = 0;
+    int ret;
+    while (total_read < (int)RESP_BUF_SZ - 1) {
+        ret = esp_tls_conn_read(tls, resp_buf + total_read, RESP_BUF_SZ - 1 - total_read);
+        if (ret <= 0) break;
+        total_read += ret;
+    }
+    resp_buf[total_read] = '\0';
+
+    // Find JSON body after HTTP headers
+    const char *body = strstr(resp_buf, "\r\n\r\n");
+    if (!body) goto hist_cleanup;
+    body += 4;
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) goto hist_cleanup;
+
+    cJSON *uploads = cJSON_GetObjectItem(root, "uploads");
+    if (cJSON_IsArray(uploads)) {
+        int n = cJSON_GetArraySize(uploads);
+        for (int i = 0; i < n && !found; i++) {
+            cJSON *entry = cJSON_GetArrayItem(uploads, i);
+            cJSON *fn = cJSON_GetObjectItem(entry, "filename");
+            if (cJSON_IsString(fn) && fn->valuestring &&
+                strcmp(fn->valuestring, filename) == 0) {
+                found = true;
+            }
+        }
+    }
+    cJSON_Delete(root);
+
+hist_cleanup:
+    if (tls) esp_tls_conn_destroy(tls);
+    if (resp_buf) free(resp_buf);
+    if (req_buf)  free(req_buf);
+    return found;
+}
+
+static int wdgwars_upload_file_with_retry(const char *filepath, const char *filename) {
+    int result = wdgwars_upload_file(filepath, filename);
+    if (result != -1) return result;
+
+    // HTTP error (likely timeout reading response) — verify via history before retrying
+    MY_LOG_INFO(TAG, "  Upload response not received, checking history...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    if (wdgwars_check_in_history(filename)) {
+        MY_LOG_INFO(TAG, "  Upload confirmed via history");
+        return 0;
+    }
+
+    // Not in history yet — try once more
+    MY_LOG_INFO(TAG, "  Not found in history, retrying upload...");
+    result = wdgwars_upload_file(filepath, filename);
+    if (result == 1) {
+        // Duplicate on retry = first attempt landed after all
+        MY_LOG_INFO(TAG, "  Upload confirmed (duplicate on retry)");
+        return 0;
+    }
+    return result;
+}
+
 static int cmd_wdgwars_upload(int argc, char **argv) {
     oled_display_update_full("> WDGWars", "  Sending files", "  wdgwars.pl", "  Uploading...");
 
@@ -7831,7 +7957,7 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
                 fsize = (long)st.st_size;
             }
 
-            int result = wdgwars_upload_file(filepath, upload_name);
+            int result = wdgwars_upload_file_with_retry(filepath, upload_name);
             if (result == 0) {
                 MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
                 uploaded++;
@@ -7906,7 +8032,7 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
             fsize = (long)st.st_size;
         }
 
-        int result = wdgwars_upload_file(filepath, entry->d_name);
+        int result = wdgwars_upload_file_with_retry(filepath, entry->d_name);
         if (result == 0) {
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
             uploaded++;
@@ -8563,6 +8689,12 @@ static int cmd_stop(int argc, char **argv) {
     // Stop packet monitor if running
     packet_monitor_stop();
 
+    // Stop nRF24 jammer if running
+    nrf24_jammer_stop();
+
+    // Stop AP locator if running
+    ap_locator_stop();
+
     // Stop PCAP capture if running
     if (pcap_capture_active) {
         pcap_capture_active = false;
@@ -9094,6 +9226,7 @@ typedef struct {
 
 static const cli_hint_t k_cli_hints[] = {
     { "packet_monitor", " <channel>" },
+    { "start_ap_locator", "" },
     { "deauth_detector", " [index1 index2 ...]" },
     { "select_networks", " <index1> [index2] ..." },
     { "select_stations", " <MAC1> [MAC2] ..." },
@@ -10667,6 +10800,142 @@ static void packet_monitor_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
+static void ap_locator_shutdown(void) {
+    if (ap_locator_promiscuous_owned) {
+        esp_wifi_set_promiscuous(false);
+        ap_locator_promiscuous_owned = false;
+    }
+
+    if (ap_locator_callback_installed) {
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+        ap_locator_callback_installed = false;
+    }
+
+    if (ap_locator_has_prev_channel) {
+        esp_wifi_set_channel(ap_locator_prev_primary, ap_locator_prev_secondary);
+        ap_locator_has_prev_channel = false;
+    }
+}
+
+static void ap_locator_stop(void) {
+    if (!ap_locator_active && ap_locator_task_handle == NULL && !ap_locator_promiscuous_owned &&
+        !ap_locator_callback_installed) {
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "Stopping AP locator...");
+
+    ap_locator_active = false;
+
+    for (int i = 0; i < 40 && ap_locator_task_handle != NULL; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (ap_locator_task_handle != NULL) {
+        vTaskDelete(ap_locator_task_handle);
+        ap_locator_task_handle = NULL;
+    }
+
+    ap_locator_shutdown();
+    ap_locator_last_rssi = 0;
+    ap_locator_beacon_seen = false;
+    ap_locator_beacon_total = 0;
+    ap_locator_last_seen_us = 0;
+    ap_locator_target_channel = 1;
+    memset(ap_locator_target_bssid, 0, sizeof(ap_locator_target_bssid));
+    ap_locator_target_ssid[0] = '\0';
+}
+
+static void ap_locator_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!ap_locator_active || type != WIFI_PKT_MGMT) {
+        return;
+    }
+
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+
+    if (len < 24) {
+        return;
+    }
+
+    if ((frame[0] & 0xFC) != 0x80) {
+        return;
+    }
+
+    if (memcmp(&frame[10], ap_locator_target_bssid, sizeof(ap_locator_target_bssid)) != 0) {
+        return;
+    }
+
+    ap_locator_last_rssi = (int)pkt->rx_ctrl.rssi;
+    ap_locator_last_seen_us = esp_timer_get_time();
+    ap_locator_beacon_seen = true;
+    ap_locator_beacon_total++;
+}
+
+static void ap_locator_task(void *pvParameters) {
+    (void)pvParameters;
+
+    uint32_t last_total = 0;
+
+    while (ap_locator_active) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        if (!ap_locator_active) {
+            break;
+        }
+
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 ap_locator_target_bssid[0], ap_locator_target_bssid[1], ap_locator_target_bssid[2],
+                 ap_locator_target_bssid[3], ap_locator_target_bssid[4], ap_locator_target_bssid[5]);
+
+        const char *ssid = ap_locator_target_ssid[0] != '\0' ? ap_locator_target_ssid : "<hidden>";
+        uint32_t current_total = ap_locator_beacon_total;
+        uint32_t diff = current_total - last_total;
+        last_total = current_total;
+
+        if (ap_locator_beacon_seen) {
+            printf("[AP Locator] CH: %u | AP: %s (%s) | RSSI: %d dBm | beacons: %" PRIu32 "\n",
+                   ap_locator_target_channel,
+                   ssid,
+                   mac_str,
+                   ap_locator_last_rssi,
+                   diff);
+        } else {
+            printf("[AP Locator] CH: %u | AP: %s (%s) | RSSI: N/A | no beacon\n",
+                   ap_locator_target_channel,
+                   ssid,
+                   mac_str);
+        }
+        fflush(stdout);
+
+        {
+            char line2[32];
+            char line3[32];
+            char line4[32];
+            snprintf(line2, sizeof(line2), "  %.24s", ssid);
+            if (ap_locator_beacon_seen) {
+                snprintf(line3, sizeof(line3), "  Ch %u  %d dB",
+                         ap_locator_target_channel,
+                         ap_locator_last_rssi);
+                snprintf(line4, sizeof(line4), "  %" PRIu32 " bcn/sec", diff);
+            } else {
+                snprintf(line3, sizeof(line3), "  Ch %u  No beacon", ap_locator_target_channel);
+                snprintf(line4, sizeof(line4), "  Waiting...");
+            }
+            oled_display_update_full("> AP Locator", line2, line3, line4);
+        }
+
+        ap_locator_beacon_seen = false;
+    }
+
+    ap_locator_shutdown();
+    ap_locator_task_handle = NULL;
+    ap_locator_active = false;
+    vTaskDelete(NULL);
+}
+
 static int cmd_packet_monitor(int argc, char **argv) {
     {
         char oled_ch[24];
@@ -10799,6 +11068,181 @@ static int cmd_packet_monitor(int argc, char **argv) {
     if (led_err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set LED for packet monitor: %s", esp_err_to_name(led_err));
     }
+    return 0;
+}
+
+static int cmd_start_ap_locator(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    oled_display_update_full("> AP Locator", "  Preparing...", "  Selected AP", "  Locking...");
+    log_memory_info("start_ap_locator");
+
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+
+    if (ap_locator_active || ap_locator_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "AP locator already active. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    if (g_selected_count != 1) {
+        MY_LOG_INFO(TAG, "AP locator requires exactly one selected network. Use 'select_networks <index>'.");
+        return 1;
+    }
+
+    if (!g_scan_done || g_scan_count == 0) {
+        MY_LOG_INFO(TAG, "No scan results available. Run 'scan_networks' first.");
+        return 1;
+    }
+
+    if (packet_monitor_active || packet_monitor_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Packet monitor is active. Use 'stop' first.");
+        return 1;
+    }
+
+    if (channel_view_active || channel_view_task_handle != NULL || channel_view_scan_mode) {
+        MY_LOG_INFO(TAG, "Channel view is active. Use 'stop' first.");
+        return 1;
+    }
+
+    if (deauth_detector_active || deauth_detector_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Deauth detector is active. Use 'stop' first.");
+        return 1;
+    }
+
+    if (sniffer_active || sniffer_scan_phase || sniffer_dog_active || sniffer_dog_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Sniffer operations are active. Use 'stop' first.");
+        return 1;
+    }
+
+    if (wardrive_active || wardrive_task_handle != NULL || wardrive_promisc_active ||
+        wardrive_promisc_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Wardrive is active. Use 'stop' first.");
+        return 1;
+    }
+
+    if (handshake_attack_active || handshake_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Handshake attack is active. Use 'stop' first.");
+        return 1;
+    }
+
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Portal is active. Use 'stop' first.");
+        return 1;
+    }
+
+    if (applicationState != IDLE) {
+        MY_LOG_INFO(TAG, "Another attack is active. Use 'stop' first.");
+        return 1;
+    }
+
+    if (g_scan_in_progress) {
+        MY_LOG_INFO(TAG, "Scan is still in progress. Wait for it to finish or use 'stop'.");
+        return 1;
+    }
+
+    int selected_idx = g_selected_indices[0];
+    if (selected_idx < 0 || selected_idx >= (int)g_scan_count) {
+        MY_LOG_INFO(TAG, "Selected network is out of range. Run 'scan_networks' and select again.");
+        return 1;
+    }
+
+    const wifi_ap_record_t *target_ap = &g_scan_results[selected_idx];
+    if (target_ap->primary < 1 || target_ap->primary > 165) {
+        MY_LOG_INFO(TAG, "Selected AP has invalid channel %d.", target_ap->primary);
+        return 1;
+    }
+
+    operation_stop_requested = false;
+    memcpy(ap_locator_target_bssid, target_ap->bssid, sizeof(ap_locator_target_bssid));
+    strncpy(ap_locator_target_ssid, (const char *)target_ap->ssid, sizeof(ap_locator_target_ssid) - 1);
+    ap_locator_target_ssid[sizeof(ap_locator_target_ssid) - 1] = '\0';
+    ap_locator_target_channel = target_ap->primary;
+    ap_locator_last_rssi = target_ap->rssi;
+    ap_locator_beacon_total = 0;
+    ap_locator_beacon_seen = false;
+    ap_locator_last_seen_us = 0;
+
+    esp_err_t err;
+    uint8_t primary = 1;
+    wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+    err = esp_wifi_get_channel(&primary, &secondary);
+    if (err == ESP_OK) {
+        ap_locator_prev_primary = primary;
+        ap_locator_prev_secondary = secondary;
+        ap_locator_has_prev_channel = true;
+    } else {
+        ap_locator_has_prev_channel = false;
+    }
+
+    wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
+    };
+
+    esp_wifi_set_promiscuous(false);
+
+    err = esp_wifi_set_promiscuous_filter(&filter);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP locator filter: %s", esp_err_to_name(err));
+        ap_locator_shutdown();
+        return 1;
+    }
+
+    err = esp_wifi_set_channel(ap_locator_target_channel, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP locator channel %u: %s",
+                    ap_locator_target_channel,
+                    esp_err_to_name(err));
+        ap_locator_shutdown();
+        return 1;
+    }
+
+    err = esp_wifi_set_promiscuous_rx_cb(ap_locator_promiscuous_callback);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP locator callback: %s", esp_err_to_name(err));
+        ap_locator_shutdown();
+        return 1;
+    }
+    ap_locator_callback_installed = true;
+
+    ap_locator_active = true;
+
+    err = esp_wifi_set_promiscuous(true);
+    if (err != ESP_OK) {
+        ap_locator_active = false;
+        MY_LOG_INFO(TAG, "Failed to enable promiscuous mode for AP locator: %s", esp_err_to_name(err));
+        ap_locator_shutdown();
+        return 1;
+    }
+    ap_locator_promiscuous_owned = true;
+
+    BaseType_t task_ok = xTaskCreate(
+        ap_locator_task,
+        "ap_locator",
+        3072,
+        NULL,
+        5,
+        &ap_locator_task_handle
+    );
+
+    if (task_ok != pdPASS) {
+        ap_locator_active = false;
+        ap_locator_task_handle = NULL;
+        MY_LOG_INFO(TAG, "Failed to create AP locator task.");
+        ap_locator_shutdown();
+        return 1;
+    }
+
+    esp_err_t led_err = led_set_color(0, 255, 0);
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for AP locator: %s", esp_err_to_name(led_err));
+    }
+
+    MY_LOG_INFO(TAG, "AP locator started for '%s' on channel %u. Type 'stop' to stop.",
+                ap_locator_target_ssid[0] != '\0' ? ap_locator_target_ssid : "<hidden>",
+                ap_locator_target_channel);
     return 0;
 }
 
@@ -16296,6 +16740,47 @@ static int cmd_scan_airtag(int argc, char **argv)
 
 // ============================================================================
 
+// --- nRF24 jammer commands ---
+static int cmd_init_nrf24(int argc, char **argv) {
+    (void)argc; (void)argv;
+    bool ok = nrf24_jammer_init();
+    if (ok) {
+        printf("[NRF24] detected (init OK) - SCK=6 MOSI=7 MISO=2 CS=3 CE=4\n");
+        oled_display_update_full("> NRF24", "  Module OK", "", "  > Ready");
+    } else {
+        printf("[NRF24] not detected - check wiring/power (3.3V + cap)\n");
+        oled_display_update_full("> NRF24", "  NOT detected", "  check wiring", "  > Idle");
+    }
+    return 0;
+}
+
+static int cmd_start_jammer24(int argc, char **argv) {
+    nrf24_jam_band_t band = JAM_ALL;
+    if (argc >= 2 && argv[1] != NULL) {
+        if (strcasecmp(argv[1], "ble") == 0) band = JAM_BLE;
+        else if (strcasecmp(argv[1], "bt") == 0) band = JAM_BT;
+        else if (strcasecmp(argv[1], "wifi") == 0) band = JAM_WIFI;
+        else if (strcasecmp(argv[1], "drone") == 0) band = JAM_DRONE;
+        else if (strcasecmp(argv[1], "all") == 0) band = JAM_ALL;
+        else {
+            printf("[NRF24] unknown band '%s' (use ble|bt|wifi|drone|all)\n", argv[1]);
+            return 1;
+        }
+    }
+
+    if (!nrf24_jammer_start(band)) {
+        printf("[NRF24] failed to start - run init_nrf24 first, or jammer already running\n");
+        return 1;
+    }
+
+    const char *name = nrf24_jammer_band_name(band);
+    printf("nRF24 jammer started (band=%s). Use 'stop' to end.\n", name);
+    char line2[24];
+    snprintf(line2, sizeof(line2), "  band=%s", name);
+    oled_display_update_full("> JAMMING 2.4G", line2, "", "  > stop to end");
+    return 0;
+}
+
 // --- Command registration in esp_console ---
 static void register_commands(void)
 {
@@ -16353,6 +16838,8 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&packet_monitor_cmd));
+
+    ESP_ERROR_CHECK(esp_console_cmd_register(&ap_locator_cmd));
 
     const esp_console_cmd_t channel_view_cmd = {
         .command = "channel_view",
@@ -16783,6 +17270,24 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&stop_cmd));
+
+    const esp_console_cmd_t init_nrf24_cmd = {
+        .command = "init_nrf24",
+        .help = "Initialize and detect the nRF24 module on SPI2 (CS=3, CE=4)",
+        .hint = NULL,
+        .func = &cmd_init_nrf24,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&init_nrf24_cmd));
+
+    const esp_console_cmd_t start_jammer24_cmd = {
+        .command = "start_jammer24",
+        .help = "Start nRF24 2.4GHz jammer: start_jammer24 [ble|bt|wifi|drone|all]",
+        .hint = "[ble|bt|wifi|drone|all]",
+        .func = &cmd_start_jammer24,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&start_jammer24_cmd));
 
     const esp_console_cmd_t wifi_connect_cmd = {
         .command = "wifi_connect",
