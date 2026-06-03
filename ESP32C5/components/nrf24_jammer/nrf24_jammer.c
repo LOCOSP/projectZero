@@ -24,11 +24,12 @@
  * Arduino RF24 setPALevel(RF24_PA_MAX, true). */
 #define NRF24_TX_POWER   7
 
-/* Duty cycle: hop as fast as possible for this many microseconds, then take a
- * single 10 ms (1 tick) breather so the priority-2 console task can run (to
- * receive `stop`) and the idle-task watchdog is fed. ~30 ms busy / 10 ms idle
- * keeps the carrier sweeping ~75% of the time on the single-core C5. */
-#define JAM_BUSY_US      30000
+/* The jam task runs below the console, so `stop` is handled by preemption and
+ * we no longer need frequent yields. The only remaining reason to block is to
+ * feed the idle-task watchdog (5 s timeout): sweep continuously for this long,
+ * then take a single 10 ms (1 tick) breather. ~2 s keeps the carrier sweeping
+ * ~99.5% of the time. */
+#define JAM_WDT_FEED_US  2000000
 
 static nrf24_device_t s_dev;
 static bool s_initialized = false;
@@ -79,19 +80,45 @@ bool nrf24_jammer_init(void) {
 
 /* ---- jam loop (single module, constant carrier) ------------------------- */
 
+/* BLE advertising channels: nRF 2/26/80 = 2402/2426/2480 MHz. */
+static const uint8_t ble_adv[3] = {2, 26, 80};
+
 /* Fast constant-carrier sweep over channels [lo, hi]. Hops with no per-hop
- * delay and only yields (10 ms) after JAM_BUSY_US of continuous sweeping, so
- * the carrier covers the band densely while the system stays responsive. */
+ * delay and only blocks (10 ms) after JAM_WDT_FEED_US of continuous sweeping to
+ * feed the idle watchdog, so the carrier covers the band almost continuously. */
 static void jam_sweep(uint8_t lo, uint8_t hi) {
     nrf24_startConstCarrier(&s_dev, NRF24_TX_POWER, lo);
 
-    int64_t last_yield_us = esp_timer_get_time();
+    int64_t last_feed_us = esp_timer_get_time();
     while (!s_jam_stop) {
         for (uint8_t ch = lo; ch <= hi && !s_jam_stop; ch++) {
             nrf24_write_reg(&s_dev, REG_RF_CH, ch);
-            if (esp_timer_get_time() - last_yield_us >= JAM_BUSY_US) {
+            if (esp_timer_get_time() - last_feed_us >= JAM_WDT_FEED_US) {
                 vTaskDelay(1);
-                last_yield_us = esp_timer_get_time();
+                last_feed_us = esp_timer_get_time();
+            }
+        }
+    }
+
+    nrf24_stopConstCarrier(&s_dev);
+}
+
+/* BLE-focused sweep: weave an advertising channel between every band channel so
+ * the three advertising frequencies are hit far more often (every ~3 steps)
+ * while still covering the whole BLE band (2..80). */
+static void jam_ble(void) {
+    nrf24_startConstCarrier(&s_dev, NRF24_TX_POWER, ble_adv[0]);
+
+    int64_t last_feed_us = esp_timer_get_time();
+    uint8_t a = 0;
+    while (!s_jam_stop) {
+        for (uint8_t ch = 2; ch <= 80 && !s_jam_stop; ch++) {
+            nrf24_write_reg(&s_dev, REG_RF_CH, ble_adv[a]);
+            a = (a + 1) % 3;
+            nrf24_write_reg(&s_dev, REG_RF_CH, ch);
+            if (esp_timer_get_time() - last_feed_us >= JAM_WDT_FEED_US) {
+                vTaskDelay(1);
+                last_feed_us = esp_timer_get_time();
             }
         }
     }
@@ -104,7 +131,7 @@ static void nrf24_jam_task(void* ctx) {
     s_jam_running = true;
 
     switch (s_band) {
-        case JAM_BLE: jam_sweep(2, 80); break;    /* BLE 2402-2480 MHz */
+        case JAM_BLE: jam_ble(); break;           /* BLE, adv channels weighted */
         case JAM_BT: jam_sweep(0, 83); break;     /* classic BT band */
         case JAM_WIFI: jam_sweep(1, 84); break;   /* WiFi 2.4 GHz span */
         case JAM_DRONE:
@@ -135,7 +162,11 @@ bool nrf24_jammer_start(nrf24_jam_band_t band) {
     s_band = band;
     s_jam_stop = false;
 
-    BaseType_t ok = xTaskCreate(nrf24_jam_task, "nrf24_jam", 4096, NULL, 6, &s_jam_task);
+    /* Priority 1: just above idle, below the priority-2 console task (and all
+     * WiFi/system tasks). The console therefore preempts the jammer the instant
+     * a `stop` line arrives, so the sweep can run nearly continuously without
+     * frequent voluntary yields. */
+    BaseType_t ok = xTaskCreate(nrf24_jam_task, "nrf24_jam", 4096, NULL, 1, &s_jam_task);
     if (ok != pdPASS) {
         s_jam_task = NULL;
         s_jam_stop = true;
