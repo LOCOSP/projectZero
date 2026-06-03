@@ -94,6 +94,7 @@
 #include "frame_analyzer_types.h"
 #include "sniffer.h"
 #include "oled_display.h"
+#include "nrf24_jammer.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -1392,6 +1393,8 @@ static int cmd_show_pass(int argc, char **argv);
 static int cmd_file_delete(int argc, char **argv);
 static int cmd_start_pcap(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
+static int cmd_init_nrf24(int argc, char **argv);
+static int cmd_start_jammer24(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
 static int cmd_list_hosts_vendor(int argc, char **argv);
@@ -8685,6 +8688,9 @@ static int cmd_stop(int argc, char **argv) {
 
     // Stop packet monitor if running
     packet_monitor_stop();
+
+    // Stop nRF24 jammer if running
+    nrf24_jammer_stop();
 
     // Stop AP locator if running
     ap_locator_stop();
@@ -16734,6 +16740,47 @@ static int cmd_scan_airtag(int argc, char **argv)
 
 // ============================================================================
 
+// --- nRF24 jammer commands ---
+static int cmd_init_nrf24(int argc, char **argv) {
+    (void)argc; (void)argv;
+    bool ok = nrf24_jammer_init();
+    if (ok) {
+        printf("[NRF24] detected (init OK) - SCK=6 MOSI=7 MISO=2 CS=3 CE=4\n");
+        oled_display_update_full("> NRF24", "  Module OK", "", "  > Ready");
+    } else {
+        printf("[NRF24] not detected - check wiring/power (3.3V + cap)\n");
+        oled_display_update_full("> NRF24", "  NOT detected", "  check wiring", "  > Idle");
+    }
+    return 0;
+}
+
+static int cmd_start_jammer24(int argc, char **argv) {
+    nrf24_jam_band_t band = JAM_ALL;
+    if (argc >= 2 && argv[1] != NULL) {
+        if (strcasecmp(argv[1], "ble") == 0) band = JAM_BLE;
+        else if (strcasecmp(argv[1], "bt") == 0) band = JAM_BT;
+        else if (strcasecmp(argv[1], "wifi") == 0) band = JAM_WIFI;
+        else if (strcasecmp(argv[1], "drone") == 0) band = JAM_DRONE;
+        else if (strcasecmp(argv[1], "all") == 0) band = JAM_ALL;
+        else {
+            printf("[NRF24] unknown band '%s' (use ble|bt|wifi|drone|all)\n", argv[1]);
+            return 1;
+        }
+    }
+
+    if (!nrf24_jammer_start(band)) {
+        printf("[NRF24] failed to start - run init_nrf24 first, or jammer already running\n");
+        return 1;
+    }
+
+    const char *name = nrf24_jammer_band_name(band);
+    printf("nRF24 jammer started (band=%s). Use 'stop' to end.\n", name);
+    char line2[24];
+    snprintf(line2, sizeof(line2), "  band=%s", name);
+    oled_display_update_full("> JAMMING 2.4G", line2, "", "  > stop to end");
+    return 0;
+}
+
 // --- Command registration in esp_console ---
 static void register_commands(void)
 {
@@ -17223,6 +17270,24 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&stop_cmd));
+
+    const esp_console_cmd_t init_nrf24_cmd = {
+        .command = "init_nrf24",
+        .help = "Initialize and detect the nRF24 module on SPI2 (CS=3, CE=4)",
+        .hint = NULL,
+        .func = &cmd_init_nrf24,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&init_nrf24_cmd));
+
+    const esp_console_cmd_t start_jammer24_cmd = {
+        .command = "start_jammer24",
+        .help = "Start nRF24 2.4GHz jammer: start_jammer24 [ble|bt|wifi|drone|all]",
+        .hint = "[ble|bt|wifi|drone|all]",
+        .func = &cmd_start_jammer24,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&start_jammer24_cmd));
 
     const esp_console_cmd_t wifi_connect_cmd = {
         .command = "wifi_connect",

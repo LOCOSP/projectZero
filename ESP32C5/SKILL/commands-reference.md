@@ -824,3 +824,33 @@ SSID removed. 2 SSIDs remaining.
 ### `help`
 - **Syntax**: `help` or `help <command>`
 - **Description**: Lists all commands or shows help for a specific command.
+
+---
+
+## nRF24 Jammer
+
+Requires an external nRF24L01+ module wired to the ESP32C5. It shares the SD card's SPI2 bus (SCK=GPIO6, MOSI=GPIO7, MISO=GPIO2) and uses dedicated CSN=GPIO3 and CE=GPIO4 (the control lines previously used for a CC1101). A clean 3.3 V supply (e.g. AMS1117 + 100 uF capacitor) is recommended for the PA+LNA variant.
+
+### `init_nrf24`
+- **Syntax**: `init_nrf24`
+- **Description**: Initializes the SPI device and probes the single nRF24 module (writes/reads back the RF_CH register). Run this once before `start_jammer24`. Safe to re-run.
+- **Output (detected)**: `"[NRF24] detected (init OK) - SCK=6 MOSI=7 MISO=2 CS=3 CE=4"`
+- **Output (not detected)**: `"[NRF24] not detected - check wiring/power (3.3V + cap)"`
+- **Completion marker**: any line containing `"[NRF24]"`.
+
+### `start_jammer24`
+- **Syntax**: `start_jammer24 [ble|bt|wifi|drone|all]`
+- **Description**: Starts the nRF24 jammer. The band argument is optional and defaults to `all` (full 2.4 GHz constant-carrier sweep, channels 0-125). Bands:
+  - `ble` - BLE advertising channels (2/26/80), packet spam.
+  - `bt` - Bluetooth channel list, constant carrier.
+  - `wifi` - sweep across all WiFi channels, packet spam.
+  - `drone` - constant-carrier sweep 0-125 (RC / drone 2.4 GHz).
+  - `all` - full 2.4 GHz constant-carrier sweep 0-125 (default).
+- **Output (success)**: `"nRF24 jammer started (band=<name>). Use 'stop' to end."`
+- **Output (failure)**: `"[NRF24] failed to start - run init_nrf24 first, or jammer already running"` or `"[NRF24] unknown band '<arg>' (use ble|bt|wifi|drone|all)"`
+- **Prerequisite**: `init_nrf24` must report the module as detected.
+- **Completion marker**: `"nRF24 jammer started"`.
+- **Notes**: Stopped with `stop`. While jamming, WiFi throughput on the ESP32C5 will degrade until stopped.
+
+### `stop`
+- The universal `stop` command (see System) also halts an active nRF24 jammer and returns the radio to idle.
