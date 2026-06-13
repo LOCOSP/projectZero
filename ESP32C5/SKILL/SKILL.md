@@ -133,6 +133,8 @@ Every command response has a known end marker. Wait for it before proceeding:
 
 For commands without explicit end markers, use a timeout with empty-read detection (e.g., 3 consecutive empty reads of 500ms each).
 
+`zig_recon_nodes` emits `[ZIG] node` lines for Mesh Recon consumers. Parse legacy fields first (`pan`, `addr_type`, `short`, `ext`, `role`, `packets`, `last_rssi`, `last_seen_ms`, `age_ms`) and treat appended fields as optional: `best_rssi`, `avg_rssi`, `lqi`, `sample_count`, `last_channel`, `vendor`, `device_hint`, `battery`. RSSI/LQI fields are signal hints only, not distance.
+
 ### Key Parsing Recipes
 
 **Network scan CSV** -- fields: index, SSID, (empty), BSSID, channel, security, RSSI, band:

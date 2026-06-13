@@ -4,7 +4,9 @@
 #include <string.h>
 #include "esp_check.h"
 #include "esp_bit_defs.h"
+#include "esp_heap_caps.h"
 #include "esp_ieee802154.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -25,6 +27,7 @@ typedef struct {
     uint8_t channel;
     int8_t rssi;
     uint8_t lqi;
+    bool has_lqi;
     uint64_t timestamp;
 } zig_recon_rx_frame_t;
 
@@ -54,10 +57,36 @@ static uint16_t s_dwell_ms = ZIG_RECON_DEFAULT_DWELL_MS;
 static uint32_t s_channel_mask = ZIG_RECON_ALL_CHANNELS_MASK;
 static uint32_t s_packets_total;
 static uint32_t s_dropped_frames;
-static zig_recon_pan_t s_pans[ZIG_RECON_MAX_PANS];
+static zig_recon_pan_t *s_pans;
 static uint16_t s_pan_count;
-static zig_recon_node_t s_nodes[ZIG_RECON_MAX_NODES];
+static zig_recon_node_t *s_nodes;
 static uint16_t s_node_count;
+
+static bool zig_recon_ensure_storage(void)
+{
+    if (!s_pans) {
+        s_pans = heap_caps_calloc(ZIG_RECON_MAX_PANS, sizeof(*s_pans),
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!s_nodes) {
+        s_nodes = heap_caps_calloc(ZIG_RECON_MAX_NODES, sizeof(*s_nodes),
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!s_pans || !s_nodes) {
+        ESP_LOGE(ZIG_RECON_TAG, "PSRAM allocation failed for recon tables (pans=%p nodes=%p)",
+                 s_pans, s_nodes);
+        if (s_pans) {
+            heap_caps_free(s_pans);
+            s_pans = NULL;
+        }
+        if (s_nodes) {
+            heap_caps_free(s_nodes);
+            s_nodes = NULL;
+        }
+        return false;
+    }
+    return true;
+}
 
 static uint32_t now_ms(void)
 {
@@ -303,6 +332,9 @@ static bool payload_looks_matter_thread(const zig_recon_mac_info_t *mac)
 
 static zig_recon_pan_t *find_or_add_pan(uint16_t pan_id)
 {
+    if (!s_pans) {
+        return NULL;
+    }
     for (uint16_t i = 0; i < s_pan_count; i++) {
         if (s_pans[i].pan_id == pan_id) {
             return &s_pans[i];
@@ -324,6 +356,9 @@ static zig_recon_pan_t *find_or_add_pan(uint16_t pan_id)
 
 static zig_recon_node_t *find_or_add_node(uint16_t pan_id, const zig_recon_mac_info_t *mac)
 {
+    if (!s_nodes) {
+        return NULL;
+    }
     if (!mac->has_src_short && !mac->has_src_ext) {
         return NULL;
     }
@@ -359,7 +394,40 @@ static zig_recon_node_t *find_or_add_node(uint16_t pan_id, const zig_recon_mac_i
     node->role = (mac->has_src_short && mac->src_short == 0x0000)
         ? ZIG_RECON_ROLE_COORDINATOR
         : ZIG_RECON_ROLE_UNKNOWN;
+    node->last_rssi = ZIG_RECON_NO_RSSI;
+    node->best_rssi = ZIG_RECON_NO_RSSI;
+    node->avg_rssi = ZIG_RECON_NO_RSSI;
     return node;
+}
+
+static void update_node_metrics(zig_recon_node_t *node, const zig_recon_rx_frame_t *rx, uint32_t seen_ms)
+{
+    if (!node || !rx) {
+        return;
+    }
+
+    node->packets++;
+    if (rx->rssi != ZIG_RECON_NO_RSSI) {
+        node->sample_count++;
+        node->last_rssi = rx->rssi;
+        if (node->best_rssi == ZIG_RECON_NO_RSSI || rx->rssi > node->best_rssi) {
+            node->best_rssi = rx->rssi;
+        }
+        if (node->avg_rssi == ZIG_RECON_NO_RSSI || node->sample_count == 1) {
+            node->avg_rssi = rx->rssi;
+        } else if (node->sample_count < 32) {
+            int32_t total = ((int32_t)node->avg_rssi * (int32_t)(node->sample_count - 1U)) + rx->rssi;
+            node->avg_rssi = (int8_t)(total / (int32_t)node->sample_count);
+        } else {
+            node->avg_rssi = (int8_t)((((int32_t)node->avg_rssi * 7) + rx->rssi) / 8);
+        }
+    }
+    node->last_channel = rx->channel;
+    if (rx->has_lqi) {
+        node->last_lqi = rx->lqi;
+        node->has_lqi = true;
+    }
+    node->last_seen_ms = seen_ms;
 }
 
 static void update_proto_guess(zig_recon_pan_t *pan, const zig_recon_mac_info_t *mac)
@@ -413,9 +481,7 @@ static void process_frame(const zig_recon_rx_frame_t *rx)
             if (node->packets == 0) {
                 pan->nodes++;
             }
-            node->packets++;
-            node->last_rssi = rx->rssi;
-            node->last_seen_ms = seen_ms;
+            update_node_metrics(node, rx, seen_ms);
         }
     }
     portEXIT_CRITICAL(&s_lock);
@@ -454,6 +520,8 @@ esp_err_t zig_recon_start(const zig_recon_config_t *config)
     if (s_active) {
         return ESP_ERR_INVALID_STATE;
     }
+    ESP_RETURN_ON_FALSE(zig_recon_ensure_storage(), ESP_ERR_NO_MEM, ZIG_RECON_TAG,
+                        "recon PSRAM storage alloc failed");
 
     s_channel_mask = normalize_channel_mask(config ? config->channel_mask : 0);
     s_dwell_ms = (config && config->dwell_ms) ? config->dwell_ms : ZIG_RECON_DEFAULT_DWELL_MS;
@@ -547,8 +615,12 @@ void zig_recon_clear(void)
     s_dropped_frames = 0;
     s_pan_count = 0;
     s_node_count = 0;
-    memset(s_pans, 0, sizeof(s_pans));
-    memset(s_nodes, 0, sizeof(s_nodes));
+    if (s_pans) {
+        memset(s_pans, 0, ZIG_RECON_MAX_PANS * sizeof(*s_pans));
+    }
+    if (s_nodes) {
+        memset(s_nodes, 0, ZIG_RECON_MAX_NODES * sizeof(*s_nodes));
+    }
     portEXIT_CRITICAL(&s_lock);
     if (s_rx_queue) {
         xQueueReset(s_rx_queue);
@@ -570,8 +642,12 @@ void zig_recon_get_snapshot(zig_recon_snapshot_t *out)
     out->dropped_frames = s_dropped_frames;
     out->pan_count = s_pan_count;
     out->node_count = s_node_count;
-    memcpy(out->pans, s_pans, sizeof(s_pans));
-    memcpy(out->nodes, s_nodes, sizeof(s_nodes));
+    if (s_pans) {
+        memcpy(out->pans, s_pans, ZIG_RECON_MAX_PANS * sizeof(*s_pans));
+    }
+    if (s_nodes) {
+        memcpy(out->nodes, s_nodes, ZIG_RECON_MAX_NODES * sizeof(*s_nodes));
+    }
     portEXIT_CRITICAL(&s_lock);
 }
 
@@ -640,10 +716,12 @@ void IRAM_ATTR esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_
             rx.channel = frame_info->channel;
             rx.rssi = frame_info->rssi;
             rx.lqi = frame_info->lqi;
+            rx.has_lqi = true;
             rx.timestamp = frame_info->timestamp;
         } else {
             rx.channel = s_current_channel;
             rx.rssi = ZIG_RECON_NO_RSSI;
+            rx.has_lqi = false;
         }
 
         BaseType_t woken = pdFALSE;

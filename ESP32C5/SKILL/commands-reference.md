@@ -853,11 +853,12 @@ PAN       Proto       Ch                 Nodes  Packets  RSSI  Last
 PAN 0x1A62  Proto: Zigbee  Channels: 11,15  Packets: 48
 ADDR      ROLE         PKTS  RSSI  LAST
 0x0000    Coordinator    42   -63  2s
-[ZIG] node pan=0x1A62 addr_type=short short=0x0000 ext=na role=coordinator packets=42 last_rssi=-63 last_seen_ms=123456 age_ms=2000
+[ZIG] node pan=0x1A62 addr_type=short short=0x0000 ext=na role=coordinator packets=42 last_rssi=-63 best_rssi=-58 avg_rssi=-61 lqi=172 sample_count=42 last_channel=11 vendor=na device_hint=na battery=na last_seen_ms=123456 age_ms=2000
 [ZIG] END
 ```
-- **Machine fields**: `pan`, `addr_type`, `short`, `ext`, `role`, `packets`, `last_rssi`, `last_seen_ms`, `age_ms`.
+- **Machine fields**: `pan`, `addr_type`, `short`, `ext`, `role`, `packets`, `last_rssi`, `best_rssi`, `avg_rssi`, `lqi`, `sample_count`, `last_channel`, `vendor`, `device_hint`, `battery`, `last_seen_ms`, `age_ms`.
 - **Notes**: `last_seen_ms` is device uptime timestamp in milliseconds; `age_ms` is the age of the observation and is the preferred UI field for "last seen".
+- **Signal notes**: `best_rssi`, `avg_rssi`, `sample_count`, `last_channel`, and `lqi` are passive signal hints, not distance. `vendor`, `device_hint`, and `battery` are `na` unless a later parser can prove them from observed frames.
 - **Addressing**: `addr_type=short` means `short` is a real 16-bit node address. `addr_type=ext` means no short address was present; use `ext` as the node key and display address. `short=na` must not be rendered as `0xFFFF`.
 - **Completion marker**: `"[ZIG] END"`.
 

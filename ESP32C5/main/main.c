@@ -10246,6 +10246,11 @@ static void zig_recon_format_ext(uint64_t value, char *out, size_t out_len)
              (unsigned long)(value & 0xffffffffUL));
 }
 
+static zig_recon_snapshot_t *zig_recon_alloc_snapshot(void)
+{
+    return heap_caps_calloc(1, sizeof(zig_recon_snapshot_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
 static int cmd_start_zig_recon(int argc, char **argv)
 {
     if (argc > 3) {
@@ -10304,28 +10309,34 @@ static int cmd_start_zig_recon(int argc, char **argv)
 static int cmd_zig_recon_status(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    zig_recon_snapshot_t snap;
-    zig_recon_get_snapshot(&snap);
+    zig_recon_snapshot_t *snap = zig_recon_alloc_snapshot();
+    if (!snap) {
+        printf("FAILED: no PSRAM for zig_recon_status snapshot\n");
+        printf("[ZIG] END\n");
+        return 1;
+    }
+    zig_recon_get_snapshot(snap);
     char channels[64];
-    zig_recon_format_channels(snap.channel_mask, channels, sizeof(channels));
+    zig_recon_format_channels(snap->channel_mask, channels, sizeof(channels));
 
-    printf("802.15.4 Recon: %s\n", snap.active ? "running" : "idle");
+    printf("802.15.4 Recon: %s\n", snap->active ? "running" : "idle");
     printf("Channel: %u  Packets: %lu  Networks: %u  Dropped: %lu\n",
-           snap.current_channel,
-           (unsigned long)snap.packets_total,
-           snap.pan_count,
-           (unsigned long)snap.dropped_frames);
-    printf("Hopping: %s dwell=%ums  Mode: passive\n", channels, snap.dwell_ms);
+           snap->current_channel,
+           (unsigned long)snap->packets_total,
+           snap->pan_count,
+           (unsigned long)snap->dropped_frames);
+    printf("Hopping: %s dwell=%ums  Mode: passive\n", channels, snap->dwell_ms);
     printf("[ZIG] status active=%d channel=%u packets=%lu pans=%u nodes=%u dropped=%lu dwell_ms=%u channels=0x%08lx\n",
-           snap.active ? 1 : 0,
-           snap.current_channel,
-           (unsigned long)snap.packets_total,
-           snap.pan_count,
-           snap.node_count,
-           (unsigned long)snap.dropped_frames,
-           snap.dwell_ms,
-           (unsigned long)snap.channel_mask);
+           snap->active ? 1 : 0,
+           snap->current_channel,
+           (unsigned long)snap->packets_total,
+           snap->pan_count,
+           snap->node_count,
+           (unsigned long)snap->dropped_frames,
+           snap->dwell_ms,
+           (unsigned long)snap->channel_mask);
     printf("[ZIG] END\n");
+    heap_caps_free(snap);
     return 0;
 }
 
@@ -10337,14 +10348,19 @@ static int cmd_zig_recon_list(int argc, char **argv)
         return 1;
     }
 
-    zig_recon_snapshot_t snap;
-    zig_recon_get_snapshot(&snap);
+    zig_recon_snapshot_t *snap = zig_recon_alloc_snapshot();
+    if (!snap) {
+        printf("FAILED: no PSRAM for zig_recon_list snapshot\n");
+        printf("[ZIG] END\n");
+        return 1;
+    }
+    zig_recon_get_snapshot(snap);
     printf("PAN       Proto       Ch                 Nodes  Packets  RSSI  Last\n");
     uint16_t printed = 0;
     uint16_t hidden = 0;
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
-    for (uint16_t i = 0; i < snap.pan_count; i++) {
-        const zig_recon_pan_t *pan = &snap.pans[i];
+    for (uint16_t i = 0; i < snap->pan_count; i++) {
+        const zig_recon_pan_t *pan = &snap->pans[i];
         if (!show_all && pan->pan_id == 0xffff) {
             hidden++;
             continue;
@@ -10383,6 +10399,7 @@ static int cmd_zig_recon_list(int argc, char **argv)
         printf("... %u more hidden PANs/broadcast entries (use zig_recon_list all)\n", hidden);
     }
     printf("[ZIG] END\n");
+    heap_caps_free(snap);
     return 0;
 }
 
@@ -10399,19 +10416,25 @@ static int cmd_zig_recon_nodes(int argc, char **argv)
         return 1;
     }
 
-    zig_recon_snapshot_t snap;
-    zig_recon_get_snapshot(&snap);
+    zig_recon_snapshot_t *snap = zig_recon_alloc_snapshot();
+    if (!snap) {
+        printf("FAILED: no PSRAM for zig_recon_nodes snapshot\n");
+        printf("[ZIG] END\n");
+        return 1;
+    }
+    zig_recon_get_snapshot(snap);
     const zig_recon_pan_t *pan = NULL;
     if (!show_all) {
-        for (uint16_t i = 0; i < snap.pan_count; i++) {
-            if (snap.pans[i].pan_id == pan_id) {
-                pan = &snap.pans[i];
+        for (uint16_t i = 0; i < snap->pan_count; i++) {
+            if (snap->pans[i].pan_id == pan_id) {
+                pan = &snap->pans[i];
                 break;
             }
         }
         if (!pan) {
             printf("PAN 0x%04X not found\n", pan_id);
             printf("[ZIG] END\n");
+            heap_caps_free(snap);
             return 1;
         }
     }
@@ -10427,8 +10450,8 @@ static int cmd_zig_recon_nodes(int argc, char **argv)
     printf(show_all ? "PAN       ADDR    ROLE         PKTS  RSSI  LAST\n"
                     : "ADDR      ROLE         PKTS  RSSI  LAST\n");
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
-    for (uint16_t i = 0; i < snap.node_count; i++) {
-        const zig_recon_node_t *node = &snap.nodes[i];
+    for (uint16_t i = 0; i < snap->node_count; i++) {
+        const zig_recon_node_t *node = &snap->nodes[i];
         if (!show_all && node->pan_id != pan_id) {
             continue;
         }
@@ -10447,6 +10470,18 @@ static int cmd_zig_recon_nodes(int argc, char **argv)
             snprintf(ext_text, sizeof(ext_text), "0x%s", ext);
         } else {
             strlcpy(ext_text, "na", sizeof(ext_text));
+        }
+        char lqi_text[8];
+        if (node->has_lqi) {
+            snprintf(lqi_text, sizeof(lqi_text), "%u", node->last_lqi);
+        } else {
+            strlcpy(lqi_text, "na", sizeof(lqi_text));
+        }
+        char channel_text[8];
+        if (node->last_channel >= ZIG_RECON_MIN_CHANNEL && node->last_channel <= ZIG_RECON_MAX_CHANNEL) {
+            snprintf(channel_text, sizeof(channel_text), "%u", node->last_channel);
+        } else {
+            strlcpy(channel_text, "na", sizeof(channel_text));
         }
         if (show_all) {
             if (node->has_short_addr) {
@@ -10481,7 +10516,7 @@ static int cmd_zig_recon_nodes(int argc, char **argv)
                        (unsigned long)age_s);
             }
         }
-        printf("[ZIG] node pan=0x%04X addr_type=%s short=%s ext=%s role=%s packets=%lu last_rssi=%d last_seen_ms=%lu age_ms=%lu\n",
+        printf("[ZIG] node pan=0x%04X addr_type=%s short=%s ext=%s role=%s packets=%lu last_rssi=%d best_rssi=%d avg_rssi=%d lqi=%s sample_count=%lu last_channel=%s vendor=na device_hint=na battery=na last_seen_ms=%lu age_ms=%lu\n",
                node->pan_id,
                node->has_short_addr ? "short" : (node->has_ext_addr ? "ext" : "unknown"),
                short_text,
@@ -10489,10 +10524,16 @@ static int cmd_zig_recon_nodes(int argc, char **argv)
                zig_recon_role_token(node->role),
                (unsigned long)node->packets,
                node->last_rssi,
+               node->best_rssi,
+               node->avg_rssi,
+               lqi_text,
+               (unsigned long)node->sample_count,
+               channel_text,
                (unsigned long)node->last_seen_ms,
                (unsigned long)age_ms);
     }
     printf("[ZIG] END\n");
+    heap_caps_free(snap);
     return 0;
 }
 

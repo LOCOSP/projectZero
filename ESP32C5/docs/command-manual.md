@@ -278,9 +278,13 @@ Machine output example:
 ```
 [ZIG] status active=1 channel=11 packets=55 pans=4 nodes=6 dropped=0 dwell_ms=250 channels=0x07fff800
 [ZIG] pan id=0x1A62 kind=network proto=zigbee confidence=probable channels=0x00008800 nodes=6 packets=48 best_rssi=-63 last_rssi=-67 last_seen_ms=123456 age_ms=2000
-[ZIG] node pan=0x1A62 addr_type=short short=0x0000 ext=na role=coordinator packets=42 last_rssi=-63 last_seen_ms=123456 age_ms=2000
+[ZIG] node pan=0x1A62 addr_type=short short=0x0000 ext=na role=coordinator packets=42 last_rssi=-63 best_rssi=-58 avg_rssi=-61 lqi=172 sample_count=42 last_channel=11 vendor=na device_hint=na battery=na last_seen_ms=123456 age_ms=2000
 [ZIG] END
 ```
+
+`zig_recon_nodes` keeps legacy fields and appends richer passive-recon metadata for UI use. `best_rssi`, `avg_rssi`, `sample_count`, `last_channel`, and `lqi` are signal-quality hints, not distance. Unknown metadata is emitted as `na`; do not infer vendor, device type, or battery unless a later parser can prove it from observed frames.
+
+Recon PAN/node tables and CLI snapshots are allocated in PSRAM. The RX queue remains a normal FreeRTOS queue because it is used from the IEEE 802.15.4 RX ISR.
 
 ## GPS
 

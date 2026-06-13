@@ -61,6 +61,12 @@ typedef struct {
     zig_recon_role_t role;
     uint32_t packets;
     int8_t last_rssi;
+    int8_t best_rssi;
+    int8_t avg_rssi;
+    uint32_t sample_count;
+    uint8_t last_channel;
+    uint8_t last_lqi;
+    bool has_lqi;
     uint32_t last_seen_ms;
 } zig_recon_node_t;
 

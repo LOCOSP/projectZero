@@ -242,12 +242,13 @@ Format maszynowy powinien byc stabilny i prefiksowany, z markerem konca jak obec
 ```text
 [ZIG] status active=1 channel=11 packets=55 pans=4 dropped=0 dwell_ms=250
 [ZIG] pan id=0x1A62 kind=network proto=zigbee confidence=confirmed channels=0x00000011 nodes=6 packets=48 best_rssi=-63 last_rssi=-67 last_seen_ms=123456 age_ms=2000
-[ZIG] node pan=0x1A62 addr_type=short short=0x0000 ext=na role=coordinator packets=42 last_rssi=-63 last_seen_ms=123456 age_ms=2000
+[ZIG] node pan=0x1A62 addr_type=short short=0x0000 ext=na role=coordinator packets=42 last_rssi=-63 best_rssi=-58 avg_rssi=-61 lqi=172 sample_count=42 last_channel=11 vendor=na device_hint=na battery=na last_seen_ms=123456 age_ms=2000
 [ZIG] END
 ```
 
 `last_seen_ms` jest timestampem uptime urzadzenia. `age_ms` jest wiekiem obserwacji i to pole powinno karmic UI `last seen`.
 `short=na` oznacza, ze ramka miala tylko extended source address; UI ma wtedy uzyc `ext` jako adresu i nie renderowac falszywego `0xFFFF`.
+`best_rssi`, `avg_rssi`, `sample_count`, `last_channel` i `lqi` sluza do oceny jakosci sygnalu i namierzania po trendzie RSSI; nie sa dystansem w metrach. `vendor`, `device_hint` i `battery` maja wartosc `na`, dopoki parser nie potwierdzi ich z ramek.
 
 Zasady konsoli:
 - `start_zig_recon` ma odmowic startu, jesli aktywny jest Wi-Fi promisc/wardrive/BLE scan/nRF24, z komunikatem `FAILED: radio busy (...)`.
@@ -256,6 +257,7 @@ Zasady konsoli:
 - `zig_recon_nodes all` sluzy do synchronizacji tab5 bez odpytywania kazdego PAN osobno.
 - format maszynowy nie powinien zmieniac nazw pol bez potrzeby, bo JanOS/UI bedzie go parsowal.
 - RSSI `unknown` kodowac jako puste `rssi=na`, nie jako magiczne `0`.
+- Duze tabele recon PAN/node sa alokowane raz w PSRAM. FreeRTOS queue dla callbacku RX zostaje przez `xQueueCreate`, bo jest uzywana z ISR.
 
 ## TODO etapami
 
@@ -276,8 +278,9 @@ Etap 1 - spike techniczny:
 Etap 2 - parser i model danych:
 - [x] Dekodowac MAC 802.15.4: FCF, sequence, PAN ID, adresy, typ ramki.
 - [x] Zliczac PAN-y i node'y.
+- [x] Zliczac per-node `best_rssi`, `avg_rssi`, `sample_count`, `last_channel` i `lqi`.
 - [x] Dodac podstawowa heurystyke `Zigbee?`/`Thread?`.
-- [x] Dodac snapshot API bez alokacji dynamicznej na goracej sciezce.
+- [x] Dodac snapshot API; duze tabele robocze i snapshoty CLI alokowac w PSRAM, bez dynamicznej alokacji per odebrana ramke.
 
 Etap 3 - integracja Monster:
 - [x] Podpiac `start_zig_recon` i status do konsoli.
