@@ -41,6 +41,9 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 
+# Enable native IEEE 802.15.4 radio for passive Zigbee/Thread recon
+CONFIG_IEEE802154_ENABLED=y
+
 # Minimize NimBLE memory footprint (we only need scanning)
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_MAX_BONDS=1

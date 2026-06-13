@@ -120,6 +120,10 @@ Every command response has a known end marker. Wait for it before proceeding:
 | `list_probes` | Timeout (no explicit end marker) |
 | `wpasec_upload` | `"Done:"` |
 | `start_pcap` | `"PCAP radio capture started"` or `"PCAP net capture started"` (initial); on stop: `"PCAP saved:"` |
+| `zig_recon_status` | `"[ZIG] END"` |
+| `zig_recon_list` | `"[ZIG] END"` |
+| `zig_recon_nodes` | `"[ZIG] END"` |
+| `zig_recon_clear` | `"[ZIG] END"` |
 | `start_beacon_spam` | `"Beacon spam started. Use 'stop' to end."` |
 | `start_beacon_spam_ssids` | `"Beacon spam started. Use 'stop' to end."` (same as `start_beacon_spam`) |
 | `list_ssids` | Timeout (no explicit end marker, list ends after last indexed line) |
@@ -128,6 +132,8 @@ Every command response has a known end marker. Wait for it before proceeding:
 | `version` | `"JanOS version: X.Y.Z"` (single line, immediate) |
 
 For commands without explicit end markers, use a timeout with empty-read detection (e.g., 3 consecutive empty reads of 500ms each).
+
+`zig_recon_nodes` emits `[ZIG] node` lines for Mesh Recon consumers. Parse legacy fields first (`pan`, `addr_type`, `short`, `ext`, `role`, `packets`, `last_rssi`, `last_seen_ms`, `age_ms`) and treat appended fields as optional: `best_rssi`, `avg_rssi`, `lqi`, `sample_count`, `last_channel`, `vendor`, `device_hint`, `battery`. RSSI/LQI fields are signal hints only, not distance. For a passive Locate/track UI, suggested labels are `warming up` for `sample_count < 2`, `closer` when `last_rssi >= avg_rssi + 4`, `farther` when `last_rssi <= avg_rssi - 4`, and `steady` otherwise. Locate behaves as a toggle: selecting a node starts locate, selecting the same node again stops it, and selecting another PAN/network or leaving/collapsing the expanded network view clears the target.
 
 ### Key Parsing Recipes
 
