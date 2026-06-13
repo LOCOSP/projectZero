@@ -859,6 +859,13 @@ ADDR      ROLE         PKTS  RSSI  LAST
 - **Machine fields**: `pan`, `addr_type`, `short`, `ext`, `role`, `packets`, `last_rssi`, `best_rssi`, `avg_rssi`, `lqi`, `sample_count`, `last_channel`, `vendor`, `device_hint`, `battery`, `last_seen_ms`, `age_ms`.
 - **Notes**: `last_seen_ms` is device uptime timestamp in milliseconds; `age_ms` is the age of the observation and is the preferred UI field for "last seen".
 - **Signal notes**: `best_rssi`, `avg_rssi`, `sample_count`, `last_channel`, and `lqi` are passive signal hints, not distance. `vendor`, `device_hint`, and `battery` are `na` unless a later parser can prove them from observed frames.
+- **Locate/track UI guidance**: A UI may pin a node and refresh this line from repeated `zig_recon_nodes all` polling. Use `last_rssi`, `avg_rssi`, `best_rssi`, `lqi`, `sample_count`, `last_channel`, and `age_ms` to show a passive "Locate" panel. Suggested trend labels:
+  - `warming up`: `sample_count < 2`
+  - `closer`: `last_rssi >= avg_rssi + 4`
+  - `farther`: `last_rssi <= avg_rssi - 4`
+  - `steady`: otherwise
+  These labels mean relative signal trend only. Do not display meters or claim physical distance from RSSI.
+- **Locate UX contract**: selecting a node starts passive locate for that node; selecting the same node again stops locate. Selecting another PAN/network or leaving/collapsing the expanded network view must clear the current locate target.
 - **Addressing**: `addr_type=short` means `short` is a real 16-bit node address. `addr_type=ext` means no short address was present; use `ext` as the node key and display address. `short=na` must not be rendered as `0xFFFF`.
 - **Completion marker**: `"[ZIG] END"`.
 
