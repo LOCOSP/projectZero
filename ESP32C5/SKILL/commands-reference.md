@@ -798,6 +798,79 @@ SSID removed. 2 SSIDs remaining.
 
 ## Detection & Monitoring
 
+### `start_zig_recon`
+- **Syntax**: `start_zig_recon [all|11,15,20] [dwell_ms]`
+- **Description**: Starts passive IEEE 802.15.4 recon on native ESP32-C5 radio. Hops channels 11-26 by default and discovers PANs/nodes for Zigbee/Thread-style networks without joining or transmitting.
+- **Examples**:
+  - `start_zig_recon` -- all channels, 250 ms dwell
+  - `start_zig_recon all 500` -- all channels, 500 ms dwell
+  - `start_zig_recon 11,15,20 250` -- selected channels
+- **Output**:
+```
+802.15.4 recon started. channels=11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26 dwell_ms=250 mode=passive. Use 'stop' to end.
+```
+- **Error outputs**:
+  - `FAILED: radio busy (<mode>). Use 'stop' first.`
+  - `dwell_ms must be 50-5000`
+  - `FAILED: zig_recon_start: <esp_err>`
+- **Stop**: Send `stop`.
+- **Notes**: Exclusive radio mode. Refuses to start while Wi-Fi sniffing/wardrive/BLE scan/nRF24 or another active operation owns the radio.
+
+### `zig_recon_status`
+- **Syntax**: `zig_recon_status`
+- **Description**: Prints human-readable recon status and one machine-readable `[ZIG] status` line.
+- **Output**:
+```
+802.15.4 Recon: running
+Channel: 11  Packets: 55  Networks: 4  Dropped: 0
+Hopping: 11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26 dwell=250ms  Mode: passive
+[ZIG] status active=1 channel=11 packets=55 pans=4 nodes=6 dropped=0 dwell_ms=250 channels=0x07fff800
+[ZIG] END
+```
+- **Completion marker**: `"[ZIG] END"`.
+
+### `zig_recon_list`
+- **Syntax**: `zig_recon_list [all]`
+- **Description**: Lists discovered 802.15.4 PANs. Without `all`, hides broadcast PAN `0xFFFF` and prints at most 20 network PANs to avoid UART flooding.
+- **Output**:
+```
+PAN       Proto       Ch                 Nodes  Packets  RSSI  Last
+0x1A62    Zigbee      11,15                  6       48   -63  2s
+[ZIG] pan id=0x1A62 kind=network proto=zigbee confidence=probable channels=0x00008800 nodes=6 packets=48 best_rssi=-63 last_rssi=-67 last_seen_ms=123456 age_ms=2000
+[ZIG] END
+```
+- **Machine fields**: `id`, `kind`, `proto`, `confidence`, `channels`, `nodes`, `packets`, `best_rssi`, `last_rssi`, `last_seen_ms`, `age_ms`.
+- **Notes**: `kind=broadcast` is used for `PAN 0xFFFF`; it appears only with `zig_recon_list all`.
+- **Protocol tokens**: `ieee802154`, `zigbee`, `thread`, `matter_thread`. `matter_thread` is a best-effort passive hint and should be displayed as `Matter/Thread?` unless later evidence confirms it.
+- **Completion marker**: `"[ZIG] END"`.
+
+### `zig_recon_nodes`
+- **Syntax**: `zig_recon_nodes <pan_id|all>`
+- **Description**: Lists nodes seen in a PAN, or all nodes across all PANs for UI sync.
+- **Example**: `zig_recon_nodes 0x1A62`
+- **Output**:
+```
+PAN 0x1A62  Proto: Zigbee  Channels: 11,15  Packets: 48
+ADDR      ROLE         PKTS  RSSI  LAST
+0x0000    Coordinator    42   -63  2s
+[ZIG] node pan=0x1A62 addr_type=short short=0x0000 ext=na role=coordinator packets=42 last_rssi=-63 last_seen_ms=123456 age_ms=2000
+[ZIG] END
+```
+- **Machine fields**: `pan`, `addr_type`, `short`, `ext`, `role`, `packets`, `last_rssi`, `last_seen_ms`, `age_ms`.
+- **Notes**: `last_seen_ms` is device uptime timestamp in milliseconds; `age_ms` is the age of the observation and is the preferred UI field for "last seen".
+- **Addressing**: `addr_type=short` means `short` is a real 16-bit node address. `addr_type=ext` means no short address was present; use `ext` as the node key and display address. `short=na` must not be rendered as `0xFFFF`.
+- **Completion marker**: `"[ZIG] END"`.
+
+### `zig_recon_clear`
+- **Syntax**: `zig_recon_clear`
+- **Description**: Clears current 802.15.4 recon counters and discovered PAN/node tables.
+- **Output**:
+```
+[ZIG] cleared
+[ZIG] END
+```
+- **Completion marker**: `"[ZIG] END"`.
+
 ### `deauth_detector`
 - **Syntax**: `deauth_detector` or `deauth_detector [index1 index2 ...]`
 - **Description**: Detects deauth frames. No args = all channels; with indices = selected channels.

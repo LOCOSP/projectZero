@@ -120,6 +120,10 @@ Every command response has a known end marker. Wait for it before proceeding:
 | `list_probes` | Timeout (no explicit end marker) |
 | `wpasec_upload` | `"Done:"` |
 | `start_pcap` | `"PCAP radio capture started"` or `"PCAP net capture started"` (initial); on stop: `"PCAP saved:"` |
+| `zig_recon_status` | `"[ZIG] END"` |
+| `zig_recon_list` | `"[ZIG] END"` |
+| `zig_recon_nodes` | `"[ZIG] END"` |
+| `zig_recon_clear` | `"[ZIG] END"` |
 | `start_beacon_spam` | `"Beacon spam started. Use 'stop' to end."` |
 | `start_beacon_spam_ssids` | `"Beacon spam started. Use 'stop' to end."` (same as `start_beacon_spam`) |
 | `list_ssids` | Timeout (no explicit end marker, list ends after last indexed line) |

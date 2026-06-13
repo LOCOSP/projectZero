@@ -263,6 +263,25 @@ All attacks stop with `stop`.
 
 (See Part 1 for `start_antisurveillance`.)
 
+## 802.15.4 Recon
+
+- `start_zig_recon [all|11,15,20] [dwell_ms]` — passive IEEE 802.15.4 recon on ESP32-C5 native radio. Default is all channels 11-26 with 250 ms dwell. Refuses to start if another radio operation is active.
+- `zig_recon_status` — human status plus machine line, terminated by `[ZIG] END`.
+- `zig_recon_list [all]` — list discovered PANs. Without `all`, hides broadcast PAN `0xFFFF` and limits output to 20 network PANs. Each PAN also emits `[ZIG] pan ...`.
+- `zig_recon_nodes <pan_id|all>` — list nodes for a PAN or all nodes for UI sync, emits `[ZIG] node ...`.
+- `zig_recon_clear` — clear current recon counters and PAN/node tables.
+- `stop` — stops recon and releases the 802.15.4 radio.
+
+Protocol tokens are `ieee802154`, `zigbee`, `thread`, and `matter_thread`. `matter_thread` is a passive best-effort hint and should be shown as `Matter/Thread?`, not as confirmed Matter.
+
+Machine output example:
+```
+[ZIG] status active=1 channel=11 packets=55 pans=4 nodes=6 dropped=0 dwell_ms=250 channels=0x07fff800
+[ZIG] pan id=0x1A62 kind=network proto=zigbee confidence=probable channels=0x00008800 nodes=6 packets=48 best_rssi=-63 last_rssi=-67 last_seen_ms=123456 age_ms=2000
+[ZIG] node pan=0x1A62 addr_type=short short=0x0000 ext=na role=coordinator packets=42 last_rssi=-63 last_seen_ms=123456 age_ms=2000
+[ZIG] END
+```
+
 ## GPS
 
 - `gps_set [module]` — set/read GPS module: `m5`, `atgm`, `external`/`ext`/`usb`/`tab`/`tab5`, `cap`/`external_cap`. No arg = read.

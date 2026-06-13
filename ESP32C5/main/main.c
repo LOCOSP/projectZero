@@ -95,6 +95,7 @@
 #include "sniffer.h"
 #include "oled_display.h"
 #include "nrf24_jammer.h"
+#include "zig_recon.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -661,7 +662,8 @@ static volatile int64_t wdp_log_gate_until_us = 0; // drop all logging until thi
 typedef enum {
     RADIO_MODE_NONE,
     RADIO_MODE_WIFI,
-    RADIO_MODE_BLE
+    RADIO_MODE_BLE,
+    RADIO_MODE_IEEE802154
 } radio_mode_t;
 
 static radio_mode_t current_radio_mode = RADIO_MODE_NONE;
@@ -669,6 +671,7 @@ static bool wifi_initialized = false;
 static bool netif_initialized = false;
 static bool event_loop_initialized = false;
 static esp_netif_t *sta_netif_handle = NULL;
+static esp_netif_t *ap_netif_handle = NULL;
 static bool wifi_event_handler_registered = false;
 static bool ip_event_handler_registered = false;
 static bool ota_check_started = false;
@@ -1883,6 +1886,11 @@ static int cmd_start_pcap(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_init_nrf24(int argc, char **argv);
 static int cmd_start_jammer24(int argc, char **argv);
+static int cmd_start_zig_recon(int argc, char **argv);
+static int cmd_zig_recon_status(int argc, char **argv);
+static int cmd_zig_recon_list(int argc, char **argv);
+static int cmd_zig_recon_nodes(int argc, char **argv);
+static int cmd_zig_recon_clear(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
 static int cmd_list_hosts_vendor(int argc, char **argv);
@@ -3395,6 +3403,12 @@ static bool ensure_wifi_mode(void)
             current_radio_mode = RADIO_MODE_NONE;
             // Now initialize WiFi (recursive call with RADIO_MODE_NONE)
             return ensure_wifi_mode();
+
+        case RADIO_MODE_IEEE802154:
+            MY_LOG_INFO(TAG, "Switching from 802.15.4 to WiFi mode...");
+            zig_recon_stop();
+            current_radio_mode = RADIO_MODE_NONE;
+            return ensure_wifi_mode();
     }
     return false;
 }
@@ -3438,12 +3452,48 @@ static bool ensure_ble_mode(void)
             // Now initialize BLE (recursive call with RADIO_MODE_NONE)
             return ensure_ble_mode();
         }
+
+        case RADIO_MODE_IEEE802154:
+            MY_LOG_INFO(TAG, "Switching from 802.15.4 to BLE mode...");
+            zig_recon_stop();
+            current_radio_mode = RADIO_MODE_NONE;
+            return ensure_ble_mode();
     }
     return false;
 }
 
-// Track if AP netif was created
-static esp_netif_t *ap_netif_handle = NULL;
+static bool ensure_ieee802154_mode(void)
+{
+    switch (current_radio_mode) {
+        case RADIO_MODE_IEEE802154:
+            return true;
+
+        case RADIO_MODE_NONE:
+            current_radio_mode = RADIO_MODE_IEEE802154;
+            return true;
+
+        case RADIO_MODE_WIFI: {
+            MY_LOG_INFO(TAG, "Switching from WiFi to 802.15.4 mode...");
+            esp_wifi_stop();
+            esp_wifi_deinit();
+            esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if (ap_netif) {
+                esp_netif_destroy(ap_netif);
+            }
+            ap_netif_handle = NULL;
+            wifi_initialized = false;
+            current_radio_mode = RADIO_MODE_IEEE802154;
+            return true;
+        }
+
+        case RADIO_MODE_BLE:
+            MY_LOG_INFO(TAG, "Switching from BLE to 802.15.4 mode...");
+            bt_nimble_deinit();
+            current_radio_mode = RADIO_MODE_IEEE802154;
+            return true;
+    }
+    return false;
+}
 
 /**
  * Enable AP mode (switch to APSTA if needed) for Evil Twin, Portal, etc.
@@ -9562,6 +9612,13 @@ static int cmd_stop(int argc, char **argv) {
     // Stop nRF24 jammer if running
     nrf24_jammer_stop();
 
+    // Stop 802.15.4 recon if running
+    if (zig_recon_is_active() || current_radio_mode == RADIO_MODE_IEEE802154) {
+        zig_recon_stop();
+        current_radio_mode = RADIO_MODE_NONE;
+        MY_LOG_INFO(TAG, "802.15.4 recon stopped.");
+    }
+
     // Stop AP locator if running
     ap_locator_stop();
 
@@ -10081,6 +10138,373 @@ static int cmd_stop(int argc, char **argv) {
     return 0;
 }
 
+static bool zig_recon_radio_busy(char *reason, size_t reason_len)
+{
+    const char *why = NULL;
+    if (g_scan_in_progress) why = "wifi_scan";
+    else if (sniffer_active || sniffer_channel_task_handle != NULL) why = "sniffer";
+    else if (packet_monitor_active || packet_monitor_task_handle != NULL) why = "packet_monitor";
+    else if (ap_locator_active || ap_locator_task_handle != NULL) why = "ap_locator";
+    else if (channel_view_active || channel_view_task_handle != NULL) why = "channel_view";
+    else if (pcap_capture_active || pcap_writer_task_handle != NULL) why = "pcap";
+    else if (deauth_attack_active || deauth_attack_task_handle != NULL) why = "deauth";
+    else if (blackout_attack_active || blackout_attack_task_handle != NULL) why = "blackout";
+    else if (sae_attack_active || sae_attack_task_handle != NULL) why = "sae_overflow";
+    else if (sniffer_dog_active || sniffer_dog_task_handle != NULL) why = "sniffer_dog";
+    else if (deauth_detector_active || deauth_detector_task_handle != NULL) why = "deauth_detector";
+    else if (handshake_attack_active || handshake_attack_task_handle != NULL) why = "handshake";
+    else if (beacon_spam_active || beacon_spam_task_handle != NULL) why = "beacon_spam";
+    else if (portal_active || darksword_active) why = "portal";
+    else if (wardrive_active || wardrive_task_handle != NULL) why = "wardrive";
+    else if (wardrive_promisc_active || wardrive_promisc_task_handle != NULL) why = "wardrive_promisc";
+    else if (antisurv_active || antisurv_task_handle != NULL) why = "antisurveillance";
+    else if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) why = "ble_scan";
+    else if (nrf24_jammer_is_running()) why = "nrf24";
+
+    if (why && reason && reason_len) {
+        snprintf(reason, reason_len, "%s", why);
+    }
+    return why != NULL;
+}
+
+static bool zig_recon_parse_u16(const char *text, uint16_t *out)
+{
+    if (!text || !out || *text == '\0') {
+        return false;
+    }
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 0);
+    if (end == text || *end != '\0' || value > 0xffffUL) {
+        return false;
+    }
+    *out = (uint16_t)value;
+    return true;
+}
+
+static bool zig_recon_parse_channels(const char *arg, uint32_t *out_mask)
+{
+    if (!arg || !out_mask) {
+        return false;
+    }
+    if (strcasecmp(arg, "all") == 0) {
+        *out_mask = ZIG_RECON_ALL_CHANNELS_MASK;
+        return true;
+    }
+
+    char buf[96];
+    strlcpy(buf, arg, sizeof(buf));
+    uint32_t mask = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(buf, ",:", &saveptr); tok; tok = strtok_r(NULL, ",:", &saveptr)) {
+        char *end = NULL;
+        long ch = strtol(tok, &end, 10);
+        if (end == tok || *end != '\0' || ch < ZIG_RECON_MIN_CHANNEL || ch > ZIG_RECON_MAX_CHANNEL) {
+            return false;
+        }
+        mask |= (1UL << ch);
+    }
+    if (mask == 0) {
+        return false;
+    }
+    *out_mask = mask;
+    return true;
+}
+
+static void zig_recon_format_channels(uint32_t mask, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    bool first = true;
+    for (uint8_t ch = ZIG_RECON_MIN_CHANNEL; ch <= ZIG_RECON_MAX_CHANNEL; ch++) {
+        if (!(mask & (1UL << ch))) {
+            continue;
+        }
+        char part[8];
+        snprintf(part, sizeof(part), "%s%u", first ? "" : ",", ch);
+        strlcat(out, part, out_len);
+        first = false;
+    }
+    if (out[0] == '\0') {
+        strlcpy(out, "none", out_len);
+    }
+}
+
+static const char *zig_recon_pan_kind(uint16_t pan_id)
+{
+    return pan_id == 0xffff ? "broadcast" : "network";
+}
+
+static void zig_recon_format_ext(uint64_t value, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    snprintf(out, out_len, "%08lx%08lx",
+             (unsigned long)(value >> 32),
+             (unsigned long)(value & 0xffffffffUL));
+}
+
+static int cmd_start_zig_recon(int argc, char **argv)
+{
+    if (argc > 3) {
+        printf("Usage: start_zig_recon [all|11,15,20] [dwell_ms]\n");
+        return 1;
+    }
+    if (zig_recon_is_active()) {
+        printf("802.15.4 recon already running. Use 'stop' first.\n");
+        return 1;
+    }
+
+    char busy[32] = {0};
+    if (zig_recon_radio_busy(busy, sizeof(busy))) {
+        printf("FAILED: radio busy (%s). Use 'stop' first.\n", busy);
+        return 1;
+    }
+
+    zig_recon_config_t cfg = {
+        .channel_mask = ZIG_RECON_ALL_CHANNELS_MASK,
+        .dwell_ms = 250,
+    };
+    if (argc >= 2 && !zig_recon_parse_channels(argv[1], &cfg.channel_mask)) {
+        printf("Usage: start_zig_recon [all|11,15,20] [dwell_ms]\n");
+        return 1;
+    }
+    if (argc >= 3) {
+        int dwell = atoi(argv[2]);
+        if (dwell < 50 || dwell > 5000) {
+            printf("dwell_ms must be 50-5000\n");
+            return 1;
+        }
+        cfg.dwell_ms = (uint16_t)dwell;
+    }
+
+    if (!ensure_ieee802154_mode()) {
+        printf("FAILED: unable to switch to 802.15.4 radio mode\n");
+        return 1;
+    }
+
+    esp_err_t err = zig_recon_start(&cfg);
+    if (err != ESP_OK) {
+        current_radio_mode = RADIO_MODE_NONE;
+        printf("FAILED: zig_recon_start: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    operation_stop_requested = false;
+    char channels[64];
+    zig_recon_format_channels(cfg.channel_mask, channels, sizeof(channels));
+    printf("802.15.4 recon started. channels=%s dwell_ms=%u mode=passive. Use 'stop' to end.\n",
+           channels, cfg.dwell_ms);
+    oled_display_update_full("> 802.15.4", "  Recon active", "  passive RX", "  > stop to end");
+    return 0;
+}
+
+static int cmd_zig_recon_status(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    zig_recon_snapshot_t snap;
+    zig_recon_get_snapshot(&snap);
+    char channels[64];
+    zig_recon_format_channels(snap.channel_mask, channels, sizeof(channels));
+
+    printf("802.15.4 Recon: %s\n", snap.active ? "running" : "idle");
+    printf("Channel: %u  Packets: %lu  Networks: %u  Dropped: %lu\n",
+           snap.current_channel,
+           (unsigned long)snap.packets_total,
+           snap.pan_count,
+           (unsigned long)snap.dropped_frames);
+    printf("Hopping: %s dwell=%ums  Mode: passive\n", channels, snap.dwell_ms);
+    printf("[ZIG] status active=%d channel=%u packets=%lu pans=%u nodes=%u dropped=%lu dwell_ms=%u channels=0x%08lx\n",
+           snap.active ? 1 : 0,
+           snap.current_channel,
+           (unsigned long)snap.packets_total,
+           snap.pan_count,
+           snap.node_count,
+           (unsigned long)snap.dropped_frames,
+           snap.dwell_ms,
+           (unsigned long)snap.channel_mask);
+    printf("[ZIG] END\n");
+    return 0;
+}
+
+static int cmd_zig_recon_list(int argc, char **argv)
+{
+    bool show_all = argc >= 2 && strcasecmp(argv[1], "all") == 0;
+    if (argc > 2 || (argc == 2 && !show_all)) {
+        printf("Usage: zig_recon_list [all]\n");
+        return 1;
+    }
+
+    zig_recon_snapshot_t snap;
+    zig_recon_get_snapshot(&snap);
+    printf("PAN       Proto       Ch                 Nodes  Packets  RSSI  Last\n");
+    uint16_t printed = 0;
+    uint16_t hidden = 0;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    for (uint16_t i = 0; i < snap.pan_count; i++) {
+        const zig_recon_pan_t *pan = &snap.pans[i];
+        if (!show_all && pan->pan_id == 0xffff) {
+            hidden++;
+            continue;
+        }
+        if (!show_all && printed >= 20) {
+            hidden++;
+            continue;
+        }
+        char channels[64];
+        zig_recon_format_channels(pan->channel_mask, channels, sizeof(channels));
+        uint32_t age_ms = pan->last_seen_ms ? (now - pan->last_seen_ms) : 0;
+        uint32_t age_s = age_ms / 1000U;
+        printf("0x%04X    %-10s  %-17s  %5u  %7lu  %4d  %lus\n",
+               pan->pan_id,
+               zig_recon_proto_name(pan->proto),
+               channels,
+               pan->nodes,
+               (unsigned long)pan->packets,
+               pan->last_rssi,
+               (unsigned long)age_s);
+        printf("[ZIG] pan id=0x%04X kind=%s proto=%s confidence=%s channels=0x%08lx nodes=%u packets=%lu best_rssi=%d last_rssi=%d last_seen_ms=%lu age_ms=%lu\n",
+               pan->pan_id,
+               zig_recon_pan_kind(pan->pan_id),
+               zig_recon_proto_token(pan->proto),
+               zig_recon_confidence_token(pan->confidence),
+               (unsigned long)pan->channel_mask,
+               pan->nodes,
+               (unsigned long)pan->packets,
+               pan->best_rssi,
+               pan->last_rssi,
+               (unsigned long)pan->last_seen_ms,
+               (unsigned long)age_ms);
+        printed++;
+    }
+    if (!show_all && hidden > 0) {
+        printf("... %u more hidden PANs/broadcast entries (use zig_recon_list all)\n", hidden);
+    }
+    printf("[ZIG] END\n");
+    return 0;
+}
+
+static int cmd_zig_recon_nodes(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("Usage: zig_recon_nodes <pan_id|all>\n");
+        return 1;
+    }
+    bool show_all = strcasecmp(argv[1], "all") == 0;
+    uint16_t pan_id = 0;
+    if (!show_all && !zig_recon_parse_u16(argv[1], &pan_id)) {
+        printf("Usage: zig_recon_nodes <pan_id|all>\n");
+        return 1;
+    }
+
+    zig_recon_snapshot_t snap;
+    zig_recon_get_snapshot(&snap);
+    const zig_recon_pan_t *pan = NULL;
+    if (!show_all) {
+        for (uint16_t i = 0; i < snap.pan_count; i++) {
+            if (snap.pans[i].pan_id == pan_id) {
+                pan = &snap.pans[i];
+                break;
+            }
+        }
+        if (!pan) {
+            printf("PAN 0x%04X not found\n", pan_id);
+            printf("[ZIG] END\n");
+            return 1;
+        }
+    }
+
+    if (show_all) {
+        printf("All discovered 802.15.4 nodes\n");
+    } else {
+        char channels[64];
+        zig_recon_format_channels(pan->channel_mask, channels, sizeof(channels));
+        printf("PAN 0x%04X  Proto: %s  Channels: %s  Packets: %lu\n",
+               pan_id, zig_recon_proto_name(pan->proto), channels, (unsigned long)pan->packets);
+    }
+    printf(show_all ? "PAN       ADDR    ROLE         PKTS  RSSI  LAST\n"
+                    : "ADDR      ROLE         PKTS  RSSI  LAST\n");
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    for (uint16_t i = 0; i < snap.node_count; i++) {
+        const zig_recon_node_t *node = &snap.nodes[i];
+        if (!show_all && node->pan_id != pan_id) {
+            continue;
+        }
+        uint32_t age_ms = node->last_seen_ms ? (now - node->last_seen_ms) : 0;
+        uint32_t age_s = age_ms / 1000U;
+        char ext[17];
+        zig_recon_format_ext(node->ext_addr, ext, sizeof(ext));
+        char short_text[8];
+        char ext_text[19];
+        if (node->has_short_addr) {
+            snprintf(short_text, sizeof(short_text), "0x%04X", node->short_addr);
+        } else {
+            strlcpy(short_text, "na", sizeof(short_text));
+        }
+        if (node->has_ext_addr) {
+            snprintf(ext_text, sizeof(ext_text), "0x%s", ext);
+        } else {
+            strlcpy(ext_text, "na", sizeof(ext_text));
+        }
+        if (show_all) {
+            if (node->has_short_addr) {
+                printf("0x%04X    0x%04X  %-11s  %4lu  %4d  %lus\n",
+                       node->pan_id,
+                       node->short_addr,
+                       zig_recon_role_name(node->role),
+                       (unsigned long)node->packets,
+                       node->last_rssi,
+                       (unsigned long)age_s);
+            } else {
+                printf("0x%04X    EXT     %-11s  %4lu  %4d  %lus\n",
+                       node->pan_id,
+                       zig_recon_role_name(node->role),
+                       (unsigned long)node->packets,
+                       node->last_rssi,
+                       (unsigned long)age_s);
+            }
+        } else {
+            if (node->has_short_addr) {
+                printf("0x%04X    %-11s  %4lu  %4d  %lus\n",
+                       node->short_addr,
+                       zig_recon_role_name(node->role),
+                       (unsigned long)node->packets,
+                       node->last_rssi,
+                       (unsigned long)age_s);
+            } else {
+                printf("EXT       %-11s  %4lu  %4d  %lus\n",
+                       zig_recon_role_name(node->role),
+                       (unsigned long)node->packets,
+                       node->last_rssi,
+                       (unsigned long)age_s);
+            }
+        }
+        printf("[ZIG] node pan=0x%04X addr_type=%s short=%s ext=%s role=%s packets=%lu last_rssi=%d last_seen_ms=%lu age_ms=%lu\n",
+               node->pan_id,
+               node->has_short_addr ? "short" : (node->has_ext_addr ? "ext" : "unknown"),
+               short_text,
+               ext_text,
+               zig_recon_role_token(node->role),
+               (unsigned long)node->packets,
+               node->last_rssi,
+               (unsigned long)node->last_seen_ms,
+               (unsigned long)age_ms);
+    }
+    printf("[ZIG] END\n");
+    return 0;
+}
+
+static int cmd_zig_recon_clear(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    zig_recon_clear();
+    printf("[ZIG] cleared\n");
+    printf("[ZIG] END\n");
+    return 0;
+}
+
 static bool parse_ipv4_arg(const char *arg, esp_ip4_addr_t *out) {
     if (!arg || !out) {
         return false;
@@ -10124,6 +10548,8 @@ static const cli_hint_t k_cli_hints[] = {
     { "start_portal", " <SSID>" },
     { "start_karma", " <index>" },
     { "start_nmap", " [quick|medium|heavy] [IP]" },
+    { "start_zig_recon", " [all|11,15,20] [dwell_ms]" },
+    { "zig_recon_nodes", " <pan_id|all>" },
     { "vendor", " set <on|off> | read" },
     { "boot_button", " read|list|set <short|long> <command[, command...]> | status <short|long> <on|off>" },
     { "led", " set <on|off> | level <1-100> | read" },
@@ -18293,6 +18719,51 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&pcap_cmd));
+
+    const esp_console_cmd_t zig_recon_cmd = {
+        .command = "start_zig_recon",
+        .help = "Passive IEEE 802.15.4 recon: start_zig_recon [all|11,15,20] [dwell_ms]",
+        .hint = "[all|11,15,20] [dwell_ms]",
+        .func = &cmd_start_zig_recon,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_cmd));
+
+    const esp_console_cmd_t zig_recon_status_cmd = {
+        .command = "zig_recon_status",
+        .help = "Print IEEE 802.15.4 recon status and [ZIG] machine output",
+        .hint = NULL,
+        .func = &cmd_zig_recon_status,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_status_cmd));
+
+    const esp_console_cmd_t zig_recon_list_cmd = {
+        .command = "zig_recon_list",
+        .help = "List discovered IEEE 802.15.4 PANs: zig_recon_list [all]",
+        .hint = "[all]",
+        .func = &cmd_zig_recon_list,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_list_cmd));
+
+    const esp_console_cmd_t zig_recon_nodes_cmd = {
+        .command = "zig_recon_nodes",
+        .help = "List nodes for a discovered PAN or all PANs: zig_recon_nodes <pan_id|all>",
+        .hint = "<pan_id|all>",
+        .func = &cmd_zig_recon_nodes,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_nodes_cmd));
+
+    const esp_console_cmd_t zig_recon_clear_cmd = {
+        .command = "zig_recon_clear",
+        .help = "Clear IEEE 802.15.4 recon counters and discovered PANs",
+        .hint = NULL,
+        .func = &cmd_zig_recon_clear,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_clear_cmd));
 
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
