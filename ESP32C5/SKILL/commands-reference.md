@@ -541,12 +541,109 @@ F1:2E:71:9F:C8:68  RSSI: -90 dBm  Name: Forerunner 935
 
 ### `start_wardrive_promisc`
 - **Syntax**: `start_wardrive_promisc`
-- **Description**: Promiscuous wardrive with D-UCB channel selection algorithm.
-- **Output**: Same as `start_wardrive` plus periodic status:
+- **Description**: Promiscuous wardrive with D-UCB channel selection. Logs Wi-Fi APs **and** BLE devices to a WigleWifi-1.6 CSV at `/sdcard/lab/wardrives/wN.log`. Behaviour is controlled by the wardrive config block (see `get_wardrive_config` and the `set_wardrive_*` commands). Reads the config at start.
+- **Startup line** (after GPS fix): echoes the active config, e.g.
 ```
-Wardrive promisc: 29 unique networks, D-UCB best ch: 1 (5 visits), GPS: valid
+Wardrive config: bands=wifi24,wifi5,ble channels=popular wifi_delta=5 ble_delta=15 cooldown=0s memcap=40000
+Promiscuous wardrive started. Bands: wifi24,wifi5,ble, WiFi channels: 12
 ```
+- **Periodic status**:
+```
+Wardrive promisc: 58 unique networks, 48 BT devices, 12 relogs, D-UCB best ch: 1 (34 visits), GPS: valid, sats: 5, dist: 1240.0m
+```
+  - `relogs` = re-observation rows written (RSSI/position re-logging; rises with distance while driving).
+- **Notes**: Console prints first sightings live; re-logged rows go to the file only (BLE re-logs also print). With `bands=ble` only, runs a BLE-only wardrive (no channel hopping).
 - **Stop**: Send `stop`.
+
+### `start_wardrive_promisc_trace`
+- **Syntax**: `start_wardrive_promisc_trace`
+- **Description**: Same as `start_wardrive_promisc` plus a per-session KML track at `/sdcard/lab/wardrives/wN_track.kml`.
+- **Stop**: Send `stop`.
+
+### `get_wardrive_config`
+- **Syntax**: `get_wardrive_config`
+- **Description**: Prints the active wardrive configuration (stored in NVS).
+- **Output** (terminated by `[WDCFG] END`):
+```
+[WDCFG] bands=wifi24,wifi5,ble
+[WDCFG] channels=popular
+[WDCFG] custom=
+[WDCFG] wifi_rssi_delta=5
+[WDCFG] ble_rssi_delta=15
+[WDCFG] startup_cooldown=0
+[WDCFG] mem_cap=40000
+[WDCFG] antisurv_sensitivity=med
+[WDCFG] END
+```
+- **Completion marker**: `strstr("[WDCFG] END")`.
+- **Parse**: split each `[WDCFG] key=value` line on `=`.
+
+### `set_wardrive_bands`
+- **Syntax**: `set_wardrive_bands <wifi24|wifi5|ble>[,...]`
+- **Description**: Choose which radios the wardrive uses (any comma-separated mix). `ble` only = BLE-only wardrive.
+- **Examples**: `set_wardrive_bands wifi24,wifi5,ble`, `set_wardrive_bands wifi24,ble`, `set_wardrive_bands ble`
+- **Output**: `Wardrive bands set: wifi24,wifi5,ble`
+- **Errors**: `Unknown band '<x>'. Valid: wifi24, wifi5, ble`
+
+### `set_wardrive_channels`
+- **Syntax**: `set_wardrive_channels <popular|all|custom> [c1:c2:...]`
+- **Description**: Channel selection. `popular` = 2.4 GHz 1/6/11 + 5 GHz non-DFS; `all` = every tier (default); `custom` = colon-separated list (validated, tier auto-classified).
+- **Examples**: `set_wardrive_channels popular`, `set_wardrive_channels all`, `set_wardrive_channels custom 1:6:11:36:149`
+- **Output**: `Wardrive channels set: custom 1:6:11:36:149`
+
+### `set_wardrive_rssi_delta`
+- **Syntax**: `set_wardrive_rssi_delta <wifi|ble> <0-50>`
+- **Description**: Re-log threshold in dBm. A network/device is re-written when its RSSI changes by ≥ this (or after moving beyond GPS accuracy). `0` = legacy "log once".
+- **Examples**: `set_wardrive_rssi_delta wifi 5`, `set_wardrive_rssi_delta ble 15`, `set_wardrive_rssi_delta wifi 0`
+- **Output**: `Wardrive RSSI delta set: wifi=5 ble=15 (0=log once)`
+
+### `set_wardrive_memcap`
+- **Syntax**: `set_wardrive_memcap <1000-200000>`
+- **Description**: Max Wi-Fi entries in RAM before the oldest already-written entries are evicted. Default 40000.
+- **Output**: `Wardrive memory cap set: 40000 entries`
+
+### `set_wardrive_cooldown`
+- **Syntax**: `set_wardrive_cooldown <0-600>`
+- **Description**: Drop all scans during the first N seconds of a run (after GPS fix) so the start area is not logged. `0` = off (default).
+- **Output**: `Wardrive startup cooldown set: 30 s`
+
+### `wardrive_blacklist`
+- **Syntax**: `wardrive_blacklist <add|remove|list|clear> [MAC]`
+- **Description**: MAC blacklist (max 64) excluded from wardrive results, exports, and anti-surveillance. Stored in NVS.
+- **Examples**: `wardrive_blacklist add AA:BB:CC:DD:EE:FF`, `wardrive_blacklist list`, `wardrive_blacklist clear`
+- **List output** (terminated by `Blacklist END`):
+```
+Blacklist: 1/64 entries
+  AA:BB:CC:DD:EE:FF
+Blacklist END
+```
+
+---
+
+## Anti-Surveillance
+
+### `start_antisurveillance`
+- **Syntax**: `start_antisurveillance`
+- **Description**: Detects a BLE device that moves along with you (a possible tail). Runs a continuous BLE scan + GPS; flags a device as a follower when it has been present long enough AND you have travelled far enough while it stayed in range AND it was seen in the last 30 s. Does not log networks to SD. Thresholds come from `set_antisurv_sensitivity`. Blacklisted MACs are ignored.
+- **Alert line** (per newly flagged device):
+```
+[FOLLOWER] MAC=AA:BB:CC:DD:EE:FF name="Smart Tag" type=SmartTag rssi=-60 seen=240s travel=2100m
+```
+- **Parse**: `MAC=`, `name="..."`, `type=` (AirTag|SmartTag|device), `rssi=`, `seen=Ns`, `travel=Nm`.
+- **Notes**: Needs a GPS fix and movement. A loop back to start can flag a stationary device near the origin — blacklist your own devices; most reliable on a one-way route.
+- **Stop**: Send `stop`.
+
+### `set_antisurv_sensitivity`
+- **Syntax**: `set_antisurv_sensitivity <low|med|high>`
+- **Description**: Follower-detection sensitivity. Stored in NVS; also shown by `get_wardrive_config`.
+
+| Level | Min duration | Min travel | Randomized MACs |
+|-------|-------------|-----------|-----------------|
+| low   | 300 s       | 1000 m    | excluded |
+| med   | 180 s       | 500 m     | excluded |
+| high  | 120 s       | 300 m     | included |
+
+- **Output**: `Anti-surveillance sensitivity: high (>=120s present, >=300m travel, randoms=yes)`
 
 ---
 

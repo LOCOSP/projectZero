@@ -608,6 +608,7 @@ static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112
 #define WDP_PSRAM_RESERVE_BYTES   (64 * 1024)
 #define WDP_STATS_INTERVAL_US     (30 * 1000000LL)
 #define WDP_FILE_FLUSH_INTERVAL   50
+#define WDP_RELOG_DISTANCE_M      25.0   // re-log a known AP after moving this far (WiGLE trilateration)
 
 typedef enum {
     WDP_TIER_24_PRIMARY,
@@ -628,13 +629,19 @@ typedef struct {
     uint8_t  bssid[6];
     char     ssid[33];
     uint8_t  channel;
-    int8_t   rssi;
+    int8_t   rssi;                 // latest reading
     wifi_auth_mode_t authmode;
-    bool     written_to_file;
+    bool     needs_log;            // pending write to SD (new sighting or re-log)
+    int8_t   last_logged_rssi;     // RSSI at the last written row
+    bool     last_logged_valid;    // last_logged_lat/lon hold a real position
+    double   last_logged_lat;
+    double   last_logged_lon;
 } wdp_network_t;
 
 static bool wardrive_promisc_active = false;
 static TaskHandle_t wardrive_promisc_task_handle = NULL;
+static volatile bool antisurv_active = false;
+static TaskHandle_t antisurv_task_handle = NULL;
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
 static double wdp_ducb_discounted_total = 0.0;
@@ -643,6 +650,9 @@ static volatile int wdp_seen_count = 0;
 static volatile int wdp_seen_capacity = 0;
 static volatile bool wdp_needs_grow = false;
 static volatile int wdp_dwell_new_networks = 0;
+static volatile bool wdp_relog_pending = false;   // a known network needs re-logging (RSSI/position changed)
+static volatile int  wdp_relog_writes = 0;        // count of re-observation rows written this session
+static volatile int64_t wdp_log_gate_until_us = 0; // drop all logging until this time (startup cooldown)
 
 // ============================================================================
 // Radio Mode State (lazy initialization)
@@ -730,6 +740,20 @@ typedef struct {
     uint16_t company_id;
     bool is_airtag;
     bool is_smarttag;
+    // Wardrive re-log bookkeeping (used only while wardrive_promisc_active)
+    bool   needs_log;
+    int8_t last_logged_rssi;
+    bool   last_logged_valid;
+    double last_logged_lat;
+    double last_logged_lon;
+    // Anti-surveillance tracking (used only while antisurv_active)
+    int64_t as_first_us;        // first time this device was seen
+    int64_t as_last_us;         // most recent sighting
+    bool    as_has_origin;      // as_origin_lat/lon hold the first known position
+    double  as_origin_lat;
+    double  as_origin_lon;
+    double  as_max_dist_m;      // furthest we travelled from origin while it stayed visible
+    bool    as_alerted;         // already raised as a follower
 } bt_device_info_t;
 
 static bt_device_info_t *bt_devices = NULL;                 // ~5.5 KB in PSRAM
@@ -808,6 +832,470 @@ static void channel_time_load_state_from_nvs(void) {
         g_scan_max_channel_time = max_val;
     }
     nvs_close(handle);
+}
+
+// ============================================================================
+// Wardrive configuration (bands / channels / data-quality) — persisted in NVS
+// Foundation only: loaded at boot and exposed via get_wardrive_config.
+// Consumers (wdp_ducb_init, dedup, cooldown...) are wired in later steps.
+// ============================================================================
+
+typedef enum {
+    WD_BAND_24  = 1 << 0,   // 2.4 GHz WiFi
+    WD_BAND_5   = 1 << 1,   // 5 GHz WiFi
+    WD_BAND_BLE = 1 << 2,   // Bluetooth LE
+} wd_band_flags_t;
+
+#define WD_BAND_ALL (WD_BAND_24 | WD_BAND_5 | WD_BAND_BLE)
+
+typedef enum {
+    WD_CH_POPULAR = 0,   // 2.4: 1,6,11 + 5G non-DFS
+    WD_CH_ALL     = 1,   // all four tiers (default = current behavior)
+    WD_CH_CUSTOM  = 2,   // explicit list in custom_ch[]
+} wd_channel_mode_t;
+
+#define WD_CUSTOM_CH_MAX 64
+
+typedef struct {
+    uint8_t  bands;                         // wd_band_flags_t bitmask
+    uint8_t  ch_mode;                       // wd_channel_mode_t
+    uint8_t  custom_ch[WD_CUSTOM_CH_MAX];   // valid when ch_mode == WD_CH_CUSTOM
+    uint8_t  custom_ch_count;
+    int8_t   wifi_rssi_delta;               // re-log threshold dBm (0 = log once, current behavior)
+    int8_t   ble_rssi_delta;                // re-log threshold dBm
+    uint16_t startup_cooldown_s;            // drop scans during first N seconds
+    uint32_t mem_cap;                       // hard cap on in-RAM entries
+    uint8_t  antisurv_sensitivity;          // 0=low, 1=med, 2=high (follower detection)
+} wardrive_config_t;
+
+typedef enum {
+    WD_AS_LOW  = 0,
+    WD_AS_MED  = 1,
+    WD_AS_HIGH = 2,
+} wd_antisurv_sensitivity_t;
+
+static wardrive_config_t g_wd_cfg;
+
+#define WD_CFG_NVS_NAMESPACE    "wdcfg"
+#define WD_CFG_NVS_KEY_BANDS    "bands"
+#define WD_CFG_NVS_KEY_CHMODE   "chmode"
+#define WD_CFG_NVS_KEY_CUSTOM   "customch"     // blob
+#define WD_CFG_NVS_KEY_WDELTA   "wdelta"
+#define WD_CFG_NVS_KEY_BDELTA   "bdelta"
+#define WD_CFG_NVS_KEY_COOLDOWN "cooldown"
+#define WD_CFG_NVS_KEY_MEMCAP   "memcap"
+#define WD_CFG_NVS_KEY_ASSENS   "assens"
+
+static void wardrive_config_defaults(void) {
+    memset(&g_wd_cfg, 0, sizeof(g_wd_cfg));
+    g_wd_cfg.bands              = WD_BAND_ALL;
+    g_wd_cfg.ch_mode            = WD_CH_ALL;
+    g_wd_cfg.custom_ch_count    = 0;
+    g_wd_cfg.wifi_rssi_delta    = 5;
+    g_wd_cfg.ble_rssi_delta     = 15;
+    g_wd_cfg.startup_cooldown_s = 0;
+    g_wd_cfg.mem_cap            = 40000;
+    g_wd_cfg.antisurv_sensitivity = WD_AS_MED;
+}
+
+static void wardrive_config_persist(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WD_CFG_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wardrive cfg NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    nvs_set_u8(handle, WD_CFG_NVS_KEY_BANDS, g_wd_cfg.bands);
+    nvs_set_u8(handle, WD_CFG_NVS_KEY_CHMODE, g_wd_cfg.ch_mode);
+    nvs_set_blob(handle, WD_CFG_NVS_KEY_CUSTOM, g_wd_cfg.custom_ch, g_wd_cfg.custom_ch_count);
+    nvs_set_i8(handle, WD_CFG_NVS_KEY_WDELTA, g_wd_cfg.wifi_rssi_delta);
+    nvs_set_i8(handle, WD_CFG_NVS_KEY_BDELTA, g_wd_cfg.ble_rssi_delta);
+    nvs_set_u16(handle, WD_CFG_NVS_KEY_COOLDOWN, g_wd_cfg.startup_cooldown_s);
+    nvs_set_u32(handle, WD_CFG_NVS_KEY_MEMCAP, g_wd_cfg.mem_cap);
+    nvs_set_u8(handle, WD_CFG_NVS_KEY_ASSENS, g_wd_cfg.antisurv_sensitivity);
+    err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wardrive cfg NVS save failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void wardrive_config_load_from_nvs(void) {
+    wardrive_config_defaults();
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WD_CFG_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;   // first boot: keep defaults
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wardrive cfg NVS read open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t u8;
+    if (nvs_get_u8(handle, WD_CFG_NVS_KEY_BANDS, &u8) == ESP_OK && (u8 & WD_BAND_ALL)) {
+        g_wd_cfg.bands = u8 & WD_BAND_ALL;
+    }
+    if (nvs_get_u8(handle, WD_CFG_NVS_KEY_CHMODE, &u8) == ESP_OK && u8 <= WD_CH_CUSTOM) {
+        g_wd_cfg.ch_mode = u8;
+    }
+
+    uint8_t tmp[WD_CUSTOM_CH_MAX];
+    size_t blob_len = sizeof(tmp);
+    if (nvs_get_blob(handle, WD_CFG_NVS_KEY_CUSTOM, tmp, &blob_len) == ESP_OK &&
+        blob_len <= WD_CUSTOM_CH_MAX) {
+        memcpy(g_wd_cfg.custom_ch, tmp, blob_len);
+        g_wd_cfg.custom_ch_count = (uint8_t)blob_len;
+    }
+
+    int8_t i8;
+    if (nvs_get_i8(handle, WD_CFG_NVS_KEY_WDELTA, &i8) == ESP_OK && i8 >= 0 && i8 <= 50) {
+        g_wd_cfg.wifi_rssi_delta = i8;
+    }
+    if (nvs_get_i8(handle, WD_CFG_NVS_KEY_BDELTA, &i8) == ESP_OK && i8 >= 0 && i8 <= 50) {
+        g_wd_cfg.ble_rssi_delta = i8;
+    }
+
+    uint16_t u16;
+    if (nvs_get_u16(handle, WD_CFG_NVS_KEY_COOLDOWN, &u16) == ESP_OK) {
+        g_wd_cfg.startup_cooldown_s = u16;
+    }
+
+    uint32_t u32;
+    if (nvs_get_u32(handle, WD_CFG_NVS_KEY_MEMCAP, &u32) == ESP_OK && u32 >= 1000) {
+        g_wd_cfg.mem_cap = u32;
+    }
+
+    if (nvs_get_u8(handle, WD_CFG_NVS_KEY_ASSENS, &u8) == ESP_OK && u8 <= WD_AS_HIGH) {
+        g_wd_cfg.antisurv_sensitivity = u8;
+    }
+
+    nvs_close(handle);
+}
+
+// Format the active band mask into "wifi24,wifi5,ble" (caller buffer >= 24 bytes).
+static void wardrive_config_format_bands(char *out, size_t out_sz) {
+    snprintf(out, out_sz, "%s%s%s",
+             (g_wd_cfg.bands & WD_BAND_24)  ? "wifi24," : "",
+             (g_wd_cfg.bands & WD_BAND_5)   ? "wifi5,"  : "",
+             (g_wd_cfg.bands & WD_BAND_BLE) ? "ble,"    : "");
+    size_t len = strlen(out);
+    if (len > 0 && out[len - 1] == ',') out[len - 1] = '\0';   // strip trailing comma
+}
+
+// Format the custom channel list into "1:6:11:36" (caller buffer should be large).
+static void wardrive_config_format_custom(char *out, size_t out_sz) {
+    out[0] = '\0';
+    for (int i = 0; i < g_wd_cfg.custom_ch_count; i++) {
+        char part[6];
+        snprintf(part, sizeof(part), "%s%d", (i == 0) ? "" : ":", g_wd_cfg.custom_ch[i]);
+        size_t len = strlen(out);
+        if (len + strlen(part) + 1 >= out_sz) break;
+        strcpy(out + len, part);
+    }
+}
+
+// get_wardrive_config: dump active config (machine-parseable, "[WDCFG] END" marker).
+static int cmd_get_wardrive_config(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    char bands_str[24];
+    wardrive_config_format_bands(bands_str, sizeof(bands_str));
+
+    const char *chmode_str = (g_wd_cfg.ch_mode == WD_CH_POPULAR) ? "popular" :
+                             (g_wd_cfg.ch_mode == WD_CH_CUSTOM)  ? "custom"  : "all";
+
+    char custom_str[WD_CUSTOM_CH_MAX * 4];
+    wardrive_config_format_custom(custom_str, sizeof(custom_str));
+
+    printf("[WDCFG] bands=%s\n", bands_str);
+    printf("[WDCFG] channels=%s\n", chmode_str);
+    printf("[WDCFG] custom=%s\n", custom_str);
+    printf("[WDCFG] wifi_rssi_delta=%d\n", g_wd_cfg.wifi_rssi_delta);
+    printf("[WDCFG] ble_rssi_delta=%d\n", g_wd_cfg.ble_rssi_delta);
+    printf("[WDCFG] startup_cooldown=%u\n", (unsigned)g_wd_cfg.startup_cooldown_s);
+    printf("[WDCFG] mem_cap=%u\n", (unsigned)g_wd_cfg.mem_cap);
+    printf("[WDCFG] antisurv_sensitivity=%s\n",
+           (g_wd_cfg.antisurv_sensitivity == WD_AS_LOW)  ? "low" :
+           (g_wd_cfg.antisurv_sensitivity == WD_AS_HIGH) ? "high" : "med");
+    printf("[WDCFG] END\n");
+    return 0;
+}
+
+// Defined later with the wardrive-promisc helpers; needed by the set command below.
+static bool wdp_channel_is_known(int ch);
+
+// set_wardrive_bands wifi24,wifi5,ble — choose which radios the wardrive uses.
+static int cmd_set_wardrive_bands(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: set_wardrive_bands <wifi24|wifi5|ble>[,...]  (e.g. wifi24,ble)\n");
+        return 1;
+    }
+    char buf[64];
+    strncpy(buf, argv[1], sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    uint8_t mask = 0;
+    char *tok = strtok(buf, ",");
+    while (tok != NULL) {
+        if (strcmp(tok, "wifi24") == 0 || strcmp(tok, "24") == 0 || strcmp(tok, "2.4") == 0)
+            mask |= WD_BAND_24;
+        else if (strcmp(tok, "wifi5") == 0 || strcmp(tok, "5") == 0 || strcmp(tok, "5g") == 0)
+            mask |= WD_BAND_5;
+        else if (strcmp(tok, "ble") == 0 || strcmp(tok, "bt") == 0)
+            mask |= WD_BAND_BLE;
+        else {
+            printf("Unknown band '%s'. Valid: wifi24, wifi5, ble\n", tok);
+            return 1;
+        }
+        tok = strtok(NULL, ",");
+    }
+    if (mask == 0) {
+        printf("No valid bands given.\n");
+        return 1;
+    }
+    g_wd_cfg.bands = mask;
+    wardrive_config_persist();
+
+    char bands_str[24];
+    wardrive_config_format_bands(bands_str, sizeof(bands_str));
+    printf("Wardrive bands set: %s\n", bands_str);
+    return 0;
+}
+
+// set_wardrive_channels <popular|all|custom> [1:6:11:36] — channel selection.
+static int cmd_set_wardrive_channels(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: set_wardrive_channels <popular|all|custom> [1:6:11:36]\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "popular") == 0) {
+        g_wd_cfg.ch_mode = WD_CH_POPULAR;
+        g_wd_cfg.custom_ch_count = 0;
+    } else if (strcmp(argv[1], "all") == 0) {
+        g_wd_cfg.ch_mode = WD_CH_ALL;
+        g_wd_cfg.custom_ch_count = 0;
+    } else if (strcmp(argv[1], "custom") == 0) {
+        if (argc < 3) {
+            printf("custom needs a list, e.g. set_wardrive_channels custom 1:6:11:36\n");
+            return 1;
+        }
+        char buf[256];
+        strncpy(buf, argv[2], sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+
+        uint8_t list[WD_CUSTOM_CH_MAX];
+        int count = 0;
+        char *tok = strtok(buf, ":");
+        while (tok != NULL) {
+            int ch = atoi(tok);
+            if (!wdp_channel_is_known(ch)) {
+                printf("Channel %d is not a supported channel, ignoring.\n", ch);
+            } else if (count >= WD_CUSTOM_CH_MAX) {
+                printf("Too many channels (max %d), ignoring rest.\n", WD_CUSTOM_CH_MAX);
+                break;
+            } else {
+                bool dup = false;
+                for (int i = 0; i < count; i++) if (list[i] == ch) { dup = true; break; }
+                if (!dup) list[count++] = (uint8_t)ch;
+            }
+            tok = strtok(NULL, ":");
+        }
+        if (count == 0) {
+            printf("No valid channels parsed.\n");
+            return 1;
+        }
+        memcpy(g_wd_cfg.custom_ch, list, (size_t)count);
+        g_wd_cfg.custom_ch_count = (uint8_t)count;
+        g_wd_cfg.ch_mode = WD_CH_CUSTOM;
+    } else {
+        printf("Unknown mode '%s'. Valid: popular, all, custom\n", argv[1]);
+        return 1;
+    }
+    wardrive_config_persist();
+
+    const char *chmode_str = (g_wd_cfg.ch_mode == WD_CH_POPULAR) ? "popular" :
+                             (g_wd_cfg.ch_mode == WD_CH_CUSTOM)  ? "custom"  : "all";
+    if (g_wd_cfg.ch_mode == WD_CH_CUSTOM) {
+        char custom_str[WD_CUSTOM_CH_MAX * 4];
+        wardrive_config_format_custom(custom_str, sizeof(custom_str));
+        printf("Wardrive channels set: custom %s\n", custom_str);
+    } else {
+        printf("Wardrive channels set: %s\n", chmode_str);
+    }
+    return 0;
+}
+
+// set_wardrive_rssi_delta <wifi|ble> <0-50> — re-log threshold in dBm (0 = log once).
+static int cmd_set_wardrive_rssi_delta(int argc, char **argv) {
+    if (argc < 3) {
+        printf("Usage: set_wardrive_rssi_delta <wifi|ble> <0-50>  (0 = log once)\n");
+        return 1;
+    }
+    int val = atoi(argv[2]);
+    if (val < 0 || val > 50) {
+        printf("Delta must be 0-50 dBm.\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "wifi") == 0) {
+        g_wd_cfg.wifi_rssi_delta = (int8_t)val;
+    } else if (strcmp(argv[1], "ble") == 0) {
+        g_wd_cfg.ble_rssi_delta = (int8_t)val;
+    } else {
+        printf("Unknown target '%s'. Valid: wifi, ble\n", argv[1]);
+        return 1;
+    }
+    wardrive_config_persist();
+    printf("Wardrive RSSI delta set: wifi=%d ble=%d (0=log once)\n",
+           g_wd_cfg.wifi_rssi_delta, g_wd_cfg.ble_rssi_delta);
+    return 0;
+}
+
+// set_wardrive_memcap <1000-200000> — max WiFi entries in RAM before oldest are evicted.
+static int cmd_set_wardrive_memcap(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: set_wardrive_memcap <1000-200000>\n");
+        return 1;
+    }
+    long val = atol(argv[1]);
+    if (val < 1000 || val > 200000) {
+        printf("Memory cap must be 1000-200000 entries.\n");
+        return 1;
+    }
+    g_wd_cfg.mem_cap = (uint32_t)val;
+    wardrive_config_persist();
+    printf("Wardrive memory cap set: %u entries\n", (unsigned)g_wd_cfg.mem_cap);
+    return 0;
+}
+
+// set_wardrive_cooldown <0-600> — drop scans during the first N seconds (hide start area).
+static int cmd_set_wardrive_cooldown(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: set_wardrive_cooldown <0-600>  (seconds, 0 = off)\n");
+        return 1;
+    }
+    int val = atoi(argv[1]);
+    if (val < 0 || val > 600) {
+        printf("Cooldown must be 0-600 seconds.\n");
+        return 1;
+    }
+    g_wd_cfg.startup_cooldown_s = (uint16_t)val;
+    wardrive_config_persist();
+    printf("Wardrive startup cooldown set: %u s\n", (unsigned)g_wd_cfg.startup_cooldown_s);
+    return 0;
+}
+
+// ============================================================================
+// Wardrive device blacklist — MACs excluded from results and WiGLE exports (NVS-backed)
+// ============================================================================
+#define WD_BLACKLIST_MAX     64
+#define WD_BL_NVS_NAMESPACE  "wdbl"
+#define WD_BL_NVS_KEY        "macs"
+
+static uint8_t g_wd_blacklist[WD_BLACKLIST_MAX][6];
+static int     g_wd_blacklist_count = 0;
+
+static bool wardrive_blacklist_contains(const uint8_t *mac) {
+    for (int i = 0; i < g_wd_blacklist_count; i++) {
+        if (memcmp(g_wd_blacklist[i], mac, 6) == 0) return true;
+    }
+    return false;
+}
+
+static void wardrive_blacklist_load(void) {
+    g_wd_blacklist_count = 0;
+    nvs_handle_t handle;
+    if (nvs_open(WD_BL_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return;
+    size_t len = sizeof(g_wd_blacklist);
+    if (nvs_get_blob(handle, WD_BL_NVS_KEY, g_wd_blacklist, &len) == ESP_OK) {
+        g_wd_blacklist_count = (int)(len / 6);
+        if (g_wd_blacklist_count > WD_BLACKLIST_MAX) g_wd_blacklist_count = WD_BLACKLIST_MAX;
+    }
+    nvs_close(handle);
+}
+
+static void wardrive_blacklist_save(void) {
+    nvs_handle_t handle;
+    if (nvs_open(WD_BL_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGW(TAG, "Blacklist NVS open failed");
+        return;
+    }
+    nvs_set_blob(handle, WD_BL_NVS_KEY, g_wd_blacklist, (size_t)g_wd_blacklist_count * 6);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+// Parse "AA:BB:CC:DD:EE:FF" into 6 bytes. Returns true on success.
+static bool wardrive_parse_mac(const char *s, uint8_t *out) {
+    unsigned v[6];
+    if (sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x",
+               &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+    for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
+    return true;
+}
+
+// wardrive_blacklist <add|remove|list|clear> [MAC]
+static int cmd_wardrive_blacklist(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: wardrive_blacklist <add|remove|list|clear> [MAC]\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "list") == 0) {
+        printf("Blacklist: %d/%d entries\n", g_wd_blacklist_count, WD_BLACKLIST_MAX);
+        for (int i = 0; i < g_wd_blacklist_count; i++) {
+            printf("  %02X:%02X:%02X:%02X:%02X:%02X\n",
+                   g_wd_blacklist[i][0], g_wd_blacklist[i][1], g_wd_blacklist[i][2],
+                   g_wd_blacklist[i][3], g_wd_blacklist[i][4], g_wd_blacklist[i][5]);
+        }
+        printf("Blacklist END\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "clear") == 0) {
+        g_wd_blacklist_count = 0;
+        wardrive_blacklist_save();
+        printf("Blacklist cleared.\n");
+        return 0;
+    }
+    if (argc < 3) {
+        printf("'%s' needs a MAC, e.g. wardrive_blacklist add AA:BB:CC:DD:EE:FF\n", argv[1]);
+        return 1;
+    }
+    uint8_t mac[6];
+    if (!wardrive_parse_mac(argv[2], mac)) {
+        printf("Invalid MAC: %s\n", argv[2]);
+        return 1;
+    }
+    if (strcmp(argv[1], "add") == 0) {
+        if (wardrive_blacklist_contains(mac)) {
+            printf("Already blacklisted.\n");
+            return 0;
+        }
+        if (g_wd_blacklist_count >= WD_BLACKLIST_MAX) {
+            printf("Blacklist full (max %d).\n", WD_BLACKLIST_MAX);
+            return 1;
+        }
+        memcpy(g_wd_blacklist[g_wd_blacklist_count++], mac, 6);
+        wardrive_blacklist_save();
+        printf("Blacklisted %s (%d total)\n", argv[2], g_wd_blacklist_count);
+        return 0;
+    }
+    if (strcmp(argv[1], "remove") == 0) {
+        for (int i = 0; i < g_wd_blacklist_count; i++) {
+            if (memcmp(g_wd_blacklist[i], mac, 6) == 0) {
+                for (int j = i; j < g_wd_blacklist_count - 1; j++)
+                    memcpy(g_wd_blacklist[j], g_wd_blacklist[j + 1], 6);
+                g_wd_blacklist_count--;
+                wardrive_blacklist_save();
+                printf("Removed %s (%d total)\n", argv[2], g_wd_blacklist_count);
+                return 0;
+            }
+        }
+        printf("Not found in blacklist.\n");
+        return 1;
+    }
+    printf("Unknown subcommand '%s'. Valid: add, remove, list, clear\n", argv[1]);
+    return 1;
 }
 
 // Calculate dynamic scan timeout based on channel times
@@ -1451,7 +1939,7 @@ static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *a
 static bool hs_save_handshake_to_sd(int ap_idx);
 static void gps_raw_task(void *pvParameters);
 // Wardrive promisc helpers
-static void wdp_ducb_init(void);
+static void wdp_ducb_init(const wardrive_config_t *cfg);
 static int wdp_ducb_select_channel(void);
 static void wdp_ducb_update(int channel_idx, double reward);
 static int wdp_get_dwell_ms(wdp_channel_tier_t tier);
@@ -4939,41 +5427,78 @@ static void ducb_update(int channel_idx, double reward) {
 // Wardrive Promisc: D-UCB, Dedup, Promiscuous Callback, Task
 // ============================================================================
 
-static void wdp_ducb_init(void) {
+// Append one channel to the D-UCB table. Primary 2.4 tier gets a warm-start reward.
+static void wdp_ducb_add_channel(int channel, wdp_channel_tier_t tier) {
+    if (wdp_ducb_channel_count >= WDP_TOTAL_CHANNELS) return;
+    wdp_ducb_channels[wdp_ducb_channel_count].channel = channel;
+    wdp_ducb_channels[wdp_ducb_channel_count].tier = tier;
+    wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = (tier == WDP_TIER_24_PRIMARY) ? 0.5 : 0.0;
+    wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+    wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+    wdp_ducb_channel_count++;
+}
+
+// Map a channel number to its tier (used for custom lists).
+static wdp_channel_tier_t wdp_classify_channel(int ch) {
+    if (ch <= 14) {
+        for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++)
+            if (wdp_ch_24_primary[i] == ch) return WDP_TIER_24_PRIMARY;
+        return WDP_TIER_24_SECONDARY;
+    }
+    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++)
+        if (wdp_ch_5_dfs[i] == ch) return WDP_TIER_5_DFS;
+    return WDP_TIER_5_NON_DFS;
+}
+
+// Is the channel part of any known tier? (validation for custom lists)
+static bool wdp_channel_is_known(int ch) {
+    if (ch <= 14) {
+        for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++)   if (wdp_ch_24_primary[i] == ch)   return true;
+        for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++) if (wdp_ch_24_secondary[i] == ch) return true;
+        return false;
+    }
+    for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) if (wdp_ch_5_non_dfs[i] == ch) return true;
+    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++)     if (wdp_ch_5_dfs[i] == ch)     return true;
+    return false;
+}
+
+// Build the D-UCB channel table from the active config (bands + channel mode).
+// With bands=all + ch_mode=all this reproduces the original full table exactly.
+static void wdp_ducb_init(const wardrive_config_t *cfg) {
     wdp_ducb_channel_count = 0;
     wdp_ducb_discounted_total = 0.0;
 
-    for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_primary[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_PRIMARY;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.5;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+    const bool want_24 = (cfg->bands & WD_BAND_24) != 0;
+    const bool want_5  = (cfg->bands & WD_BAND_5) != 0;
+
+    if (cfg->ch_mode == WD_CH_CUSTOM) {
+        for (int i = 0; i < cfg->custom_ch_count; i++) {
+            int ch = cfg->custom_ch[i];
+            bool is_24 = (ch <= 14);
+            if (is_24 && !want_24) continue;
+            if (!is_24 && !want_5)  continue;
+            wdp_ducb_add_channel(ch, wdp_classify_channel(ch));
+        }
+        return;
     }
-    for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_secondary[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_SECONDARY;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+
+    // POPULAR = primary 2.4 + 5G non-DFS only.  ALL = every tier.
+    const bool include_secondary = (cfg->ch_mode == WD_CH_ALL);
+    const bool include_dfs       = (cfg->ch_mode == WD_CH_ALL);
+
+    if (want_24) {
+        for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++)
+            wdp_ducb_add_channel(wdp_ch_24_primary[i], WDP_TIER_24_PRIMARY);
+        if (include_secondary)
+            for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++)
+                wdp_ducb_add_channel(wdp_ch_24_secondary[i], WDP_TIER_24_SECONDARY);
     }
-    for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
-    }
-    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+    if (want_5) {
+        for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++)
+            wdp_ducb_add_channel(wdp_ch_5_non_dfs[i], WDP_TIER_5_NON_DFS);
+        if (include_dfs)
+            for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++)
+                wdp_ducb_add_channel(wdp_ch_5_dfs[i], WDP_TIER_5_DFS);
     }
 }
 
@@ -5032,6 +5557,7 @@ static int wdp_find_bssid(const uint8_t *bssid) {
 static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!wardrive_promisc_active) return;
     if (type != WIFI_PKT_MGMT) return;
+    if (esp_timer_get_time() < wdp_log_gate_until_us) return;  // startup cooldown
 
     const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
     const uint8_t *frame = pkt->payload;
@@ -5043,6 +5569,7 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (frame_type != 0x80) return; // Only beacons
 
     const uint8_t *ap_bssid = &frame[10]; // addr2 = transmitter = AP
+    if (wardrive_blacklist_contains(ap_bssid)) return;  // excluded device
 
     const uint8_t *body = frame + 24 + 12;
     int body_len = len - 24 - 12;
@@ -5076,8 +5603,30 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
     int existing = wdp_find_bssid(ap_bssid);
     if (existing >= 0) {
-        if (pkt->rx_ctrl.rssi > wdp_seen_networks[existing].rssi) {
-            wdp_seen_networks[existing].rssi = (int8_t)pkt->rx_ctrl.rssi;
+        int8_t cur_rssi = (int8_t)pkt->rx_ctrl.rssi;
+        wdp_seen_networks[existing].rssi = cur_rssi;   // keep the latest reading for re-log
+
+        // Re-log this AP if its signal or our position moved enough since the last row.
+        // wifi_rssi_delta == 0 keeps the legacy "log once" behavior.
+        if (g_wd_cfg.wifi_rssi_delta > 0 && !wdp_seen_networks[existing].needs_log) {
+            bool trig = false;
+            int rd = cur_rssi - wdp_seen_networks[existing].last_logged_rssi;
+            if (rd < 0) rd = -rd;
+            if (rd >= g_wd_cfg.wifi_rssi_delta) {
+                trig = true;
+            } else if (current_gps.valid && wdp_seen_networks[existing].last_logged_valid) {
+                double moved = gps_distance_meters(wdp_seen_networks[existing].last_logged_lat,
+                                                   wdp_seen_networks[existing].last_logged_lon,
+                                                   current_gps.latitude, current_gps.longitude);
+                // Require real movement beyond GPS noise: max(fixed threshold, reported accuracy).
+                double thresh = WDP_RELOG_DISTANCE_M;
+                if (current_gps.accuracy > thresh) thresh = current_gps.accuracy;
+                if (moved >= thresh) trig = true;
+            }
+            if (trig) {
+                wdp_seen_networks[existing].needs_log = true;
+                wdp_relog_pending = true;
+            }
         }
         return;
     }
@@ -5094,7 +5643,8 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].channel = beacon_channel;
     wdp_seen_networks[idx].rssi = (int8_t)pkt->rx_ctrl.rssi;
     wdp_seen_networks[idx].authmode = authmode;
-    wdp_seen_networks[idx].written_to_file = false;
+    wdp_seen_networks[idx].needs_log = true;        // pending first write
+    wdp_seen_networks[idx].last_logged_valid = false;
     wdp_seen_count++;
 
     wdp_dwell_new_networks++;
@@ -5125,8 +5675,34 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
+// Evict up to `target` of the oldest already-written (not pending) entries, compacting
+// the array toward the front. Returns how many were freed.
+// Safe to call ONLY with promiscuous disabled (mutates the array the callback reads).
+static int wdp_evict_written_networks(int target) {
+    int to_evict = target;
+    int evicted = 0;
+    int write_idx = 0;
+    for (int read_idx = 0; read_idx < wdp_seen_count; read_idx++) {
+        if (to_evict > 0 && !wdp_seen_networks[read_idx].needs_log) {
+            to_evict--;
+            evicted++;
+            continue;  // drop this (oldest written) entry
+        }
+        if (write_idx != read_idx) {
+            wdp_seen_networks[write_idx] = wdp_seen_networks[read_idx];
+        }
+        write_idx++;
+    }
+    wdp_seen_count = write_idx;
+    return evicted;
+}
+
 static bool wdp_grow_network_buffer(void) {
+    if (wdp_seen_capacity >= (int)g_wd_cfg.mem_cap) {
+        return false;  // at the configured memory cap — caller evicts instead of growing
+    }
     int new_capacity = wdp_seen_capacity * 2;
+    if (new_capacity > (int)g_wd_cfg.mem_cap) new_capacity = (int)g_wd_cfg.mem_cap;
     size_t new_size = (size_t)new_capacity * sizeof(wdp_network_t);
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 
@@ -5208,25 +5784,49 @@ static void wardrive_promisc_task(void *pvParameters) {
     wdp_seen_count = 0;
     wdp_dwell_new_networks = 0;
     wdp_needs_grow = false;
+    wdp_relog_pending = false;
+    wdp_relog_writes = 0;
     memset(wdp_seen_networks, 0, (size_t)wdp_seen_capacity * sizeof(wdp_network_t));
-    wdp_ducb_init();
+    wdp_ducb_init(&g_wd_cfg);
 
-    wifi_promiscuous_filter_t filter = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
-    };
-    esp_wifi_set_promiscuous_filter(&filter);
-    esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
-    esp_wifi_set_promiscuous(true);
+    // No WiFi channels selected => BLE-only mode (no promiscuous, no channel hop).
+    const bool wifi_scan_enabled = (wdp_ducb_channel_count > 0);
 
-    MY_LOG_INFO(TAG, "Promiscuous wardrive started. Channels: %d (2.4 primary: %d, secondary: %d, 5GHz: %d, DFS: %d)",
-                wdp_ducb_channel_count,
-                (int)WDP_CH_24_PRIMARY_COUNT, (int)WDP_CH_24_SECONDARY_COUNT,
-                (int)WDP_CH_5_NON_DFS_COUNT, (int)WDP_CH_5_DFS_COUNT);
+    if (wifi_scan_enabled) {
+        // Match the band mode to the selected bands so set_channel can reach 5 GHz.
+        // 2.4+5 must be AUTO; single-band uses the dedicated mode (less RF overhead).
+        const bool want_24 = (g_wd_cfg.bands & WD_BAND_24) != 0;
+        const bool want_5  = (g_wd_cfg.bands & WD_BAND_5) != 0;
+        wifi_band_mode_t band_mode = WIFI_BAND_MODE_AUTO;
+        if (want_24 && want_5)  band_mode = WIFI_BAND_MODE_AUTO;
+        else if (want_5)        band_mode = WIFI_BAND_MODE_5G_ONLY;
+        else                    band_mode = WIFI_BAND_MODE_2G_ONLY;
+        esp_err_t bm_err = esp_wifi_set_band_mode(band_mode);
+        if (bm_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "esp_wifi_set_band_mode(%d) failed: %s (continuing)",
+                        (int)band_mode, esp_err_to_name(bm_err));
+        }
+
+        wifi_promiscuous_filter_t filter = {
+            .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
+        };
+        esp_wifi_set_promiscuous_filter(&filter);
+        esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
+        esp_wifi_set_promiscuous(true);
+    }
+
+    {
+        char wd_bands[24];
+        wardrive_config_format_bands(wd_bands, sizeof(wd_bands));
+        MY_LOG_INFO(TAG, "Promiscuous wardrive started. Bands: %s, WiFi channels: %d%s",
+                    wd_bands, wdp_ducb_channel_count,
+                    wifi_scan_enabled ? "" : " (BLE-only mode)");
+    }
     MY_LOG_INFO(TAG, "Use 'stop' command to stop.");
 
     // Start BLE scanning in background (coexistence handled by ESP-IDF)
     bt_reset_counters();
-    bool wdp_bt_enabled = nimble_initialized;
+    bool wdp_bt_enabled = nimble_initialized && (g_wd_cfg.bands & WD_BAND_BLE);
     bool wdp_bt_running = false;
     if (wdp_bt_enabled) {
         wdp_bt_running = (bt_start_scan_coex() == 0);
@@ -5244,6 +5844,14 @@ static void wardrive_promisc_task(void *pvParameters) {
     int gps_fix_lost_count = 0;
     #define WDP_GPS_FIX_LOST_THRESHOLD 3
 
+    // Startup cooldown: drop everything seen in the first N seconds so the start area
+    // (e.g. home) is not logged. Counts from here (after the initial GPS fix).
+    wdp_log_gate_until_us = esp_timer_get_time() + (int64_t)g_wd_cfg.startup_cooldown_s * 1000000LL;
+    if (g_wd_cfg.startup_cooldown_s > 0) {
+        MY_LOG_INFO(TAG, "Startup cooldown: dropping scans for the first %u s",
+                    (unsigned)g_wd_cfg.startup_cooldown_s);
+    }
+
     while (wardrive_promisc_active && !operation_stop_requested) {
         if (external_feed) {
             gps_sync_from_selected_external_source();
@@ -5251,7 +5859,7 @@ static void wardrive_promisc_task(void *pvParameters) {
         if (external_feed && !current_gps.valid) {
             MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
             oled_display_update_full("> Wardrive Pro", "  GPS fix lost!", "  Pausing...", "");
-            esp_wifi_set_promiscuous(false);
+            if (wifi_scan_enabled) esp_wifi_set_promiscuous(false);
             if (wdp_bt_running) {
                 bt_stop_scan();
                 wdp_bt_running = false;
@@ -5264,7 +5872,7 @@ static void wardrive_promisc_task(void *pvParameters) {
             MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
                         current_gps.latitude, current_gps.longitude);
             oled_display_update_full("> Wardrive Pro", "  GPS recovered!", "  Resuming...", "");
-            esp_wifi_set_promiscuous(true);
+            if (wifi_scan_enabled) esp_wifi_set_promiscuous(true);
             if (wdp_bt_enabled) {
                 wdp_bt_running = (bt_start_scan_coex() == 0);
                 if (!wdp_bt_running) {
@@ -5273,19 +5881,28 @@ static void wardrive_promisc_task(void *pvParameters) {
             }
         }
 
-        int ch_idx = wdp_ducb_select_channel();
-        int channel = wdp_ducb_channels[ch_idx].channel;
-        int dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
+        int ch_idx = 0;
+        int channel = 0;
+        int dwell_ms = WDP_DWELL_DEFAULT_MS;
+        if (wifi_scan_enabled) {
+            ch_idx = wdp_ducb_select_channel();
+            channel = wdp_ducb_channels[ch_idx].channel;
+            dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
+            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        } else {
+            dwell_ms = 1000;  // BLE-only: no channel hop, steady dwell
+        }
 
-        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-        
         {
             static int64_t wdp_oled_last_us = 0;
             int64_t wdp_now_us = esp_timer_get_time();
             if (wdp_now_us - wdp_oled_last_us > 2000000) {
                 wdp_oled_last_us = wdp_now_us;
                 char wdp_l2[64], wdp_l3[64], wdp_l4[64];
-                snprintf(wdp_l2, sizeof(wdp_l2), "  Ch %d  D-UCB", channel);
+                if (wifi_scan_enabled)
+                    snprintf(wdp_l2, sizeof(wdp_l2), "  Ch %d  D-UCB", channel);
+                else
+                    snprintf(wdp_l2, sizeof(wdp_l2), "  BLE-only scan");
                 snprintf(wdp_l3, sizeof(wdp_l3), "  %d networks", wdp_seen_count);
                 snprintf(wdp_l4, sizeof(wdp_l4), "  GPS:%s SAT:%d",
                          current_gps.valid ? "OK" : "LOST", current_gps.satellites);
@@ -5305,8 +5922,16 @@ static void wardrive_promisc_task(void *pvParameters) {
             if (wdp_grow_network_buffer()) {
                 MY_LOG_INFO(TAG, "Network buffer expanded, capacity now %d", wdp_seen_capacity);
             } else {
-                MY_LOG_INFO(TAG, "Network buffer growth failed, continuing with %d/%d",
-                            wdp_seen_count, wdp_seen_capacity);
+                // At the memory cap (or PSRAM exhausted): reclaim slots by evicting the
+                // oldest entries already written to SD. Their data is safe in the CSV.
+                int evicted = wdp_evict_written_networks((int)(g_wd_cfg.mem_cap / 4));
+                if (evicted > 0) {
+                    MY_LOG_INFO(TAG, "Memory cap %u reached: evicted %d oldest logged entries (now %d/%d)",
+                                (unsigned)g_wd_cfg.mem_cap, evicted, wdp_seen_count, wdp_seen_capacity);
+                } else {
+                    MY_LOG_INFO(TAG, "Memory cap %u reached, nothing flushed to evict yet (%d/%d)",
+                                (unsigned)g_wd_cfg.mem_cap, wdp_seen_count, wdp_seen_capacity);
+                }
                 wdp_needs_grow = false;
             }
             esp_wifi_set_promiscuous(true);
@@ -5359,7 +5984,7 @@ static void wardrive_promisc_task(void *pvParameters) {
 
         if (gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
             MY_LOG_INFO(TAG, "GPS fix lost for %d cycles! Pausing wardrive...", gps_fix_lost_count);
-            esp_wifi_set_promiscuous(false);
+            if (wifi_scan_enabled) esp_wifi_set_promiscuous(false);
             if (wdp_bt_running) {
                 bt_stop_scan();
                 wdp_bt_running = false;
@@ -5387,7 +6012,7 @@ static void wardrive_promisc_task(void *pvParameters) {
 
             MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
                         current_gps.latitude, current_gps.longitude);
-            esp_wifi_set_promiscuous(true);
+            if (wifi_scan_enabled) esp_wifi_set_promiscuous(true);
             if (wdp_bt_enabled) {
                 wdp_bt_running = (bt_start_scan_coex() == 0);
                 if (!wdp_bt_running) {
@@ -5397,17 +6022,24 @@ static void wardrive_promisc_task(void *pvParameters) {
             gps_fix_lost_count = 0;
         }
 
-        double reward = (double)wdp_dwell_new_networks;
-        wdp_ducb_update(ch_idx, reward);
+        if (wifi_scan_enabled) {
+            double reward = (double)wdp_dwell_new_networks;
+            wdp_ducb_update(ch_idx, reward);
+        }
 
         // Flush new entries to SD file periodically
         int current_count = wdp_seen_count;
         int bt_pending = wdp_bt_enabled ? (bt_device_count - wdp_bt_flush_count) : 0;
         bool bt_flush_due = wdp_bt_enabled && bt_pending > 0 &&
                             ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US);
+        bool relog_flush_due = wdp_relog_pending &&
+                            ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US);
         if ((current_count - last_flush_count) >= WDP_FILE_FLUSH_INTERVAL ||
             ((current_count > last_flush_count) && ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US)) ||
-            bt_flush_due) {
+            bt_flush_due || relog_flush_due) {
+
+            // Clear before the write loop; any re-log marked during the loop re-arms it.
+            wdp_relog_pending = false;
 
             char filename[64];
             snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", file_number);
@@ -5429,7 +6061,7 @@ static void wardrive_promisc_task(void *pvParameters) {
                     get_timestamp_string(timestamp, sizeof(timestamp));
 
                     for (int i = 0; i < current_count; i++) {
-                        if (wdp_seen_networks[i].written_to_file) continue;
+                        if (!wdp_seen_networks[i].needs_log) continue;
 
                         char mac_str[18];
                         snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -5454,13 +6086,22 @@ static void wardrive_promisc_task(void *pvParameters) {
                                     mac_str, escaped_ssid, auth_str, timestamp,
                                     wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi);
                         }
-                        wdp_seen_networks[i].written_to_file = true;
+                        // Record the baseline for the next re-log decision.
+                        if (wdp_seen_networks[i].last_logged_valid) wdp_relog_writes++;  // re-observation row
+                        wdp_seen_networks[i].needs_log = false;
+                        wdp_seen_networks[i].last_logged_rssi = wdp_seen_networks[i].rssi;
+                        if (current_gps.valid) {
+                            wdp_seen_networks[i].last_logged_lat = current_gps.latitude;
+                            wdp_seen_networks[i].last_logged_lon = current_gps.longitude;
+                            wdp_seen_networks[i].last_logged_valid = true;
+                        }
                     }
 
                     // Flush BT devices collected since last flush
                     if (wdp_bt_enabled) {
                         int bt_total = bt_device_count;
-                        for (int i = wdp_bt_flush_count; i < bt_total; i++) {
+                        for (int i = 0; i < bt_total; i++) {
+                            if (!bt_devices[i].needs_log) continue;
                             char bt_mac[18];
                             char escaped_bt_name[64];
                             char bt_mfgr_id[8];
@@ -5492,6 +6133,15 @@ static void wardrive_promisc_task(void *pvParameters) {
                                        bt_mac, escaped_bt_name, bt_cap, timestamp,
                                        (int)bt_devices[i].rssi, bt_mfgr_id);
                             }
+                            // Baseline for the next re-log decision.
+                            if (bt_devices[i].last_logged_valid) wdp_relog_writes++;
+                            bt_devices[i].needs_log = false;
+                            bt_devices[i].last_logged_rssi = bt_devices[i].rssi;
+                            if (current_gps.valid) {
+                                bt_devices[i].last_logged_lat = current_gps.latitude;
+                                bt_devices[i].last_logged_lon = current_gps.longitude;
+                                bt_devices[i].last_logged_valid = true;
+                            }
                         }
                         wdp_bt_flush_count = bt_total;
                     }
@@ -5520,15 +6170,19 @@ static void wardrive_promisc_task(void *pvParameters) {
                     top_ch = wdp_ducb_channels[i].channel;
                 }
             }
-            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, %d BT devices, D-UCB best ch: %d (%d visits), GPS: %s, sats: %d, dist: %.1fm",
-                        wdp_seen_count, bt_device_count, top_ch, top_pulls,
+            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, %d BT devices, %d relogs, D-UCB best ch: %d (%d visits), GPS: %s, sats: %d, dist: %.1fm",
+                        wdp_seen_count, bt_device_count, wdp_relog_writes, top_ch, top_pulls,
                         current_gps.valid ? "valid" : "no fix",
                         current_gps.satellites, wdp_total_distance_m);
             last_stats_time = now;
         }
     }
 
-    esp_wifi_set_promiscuous(false);
+    if (wifi_scan_enabled) {
+        esp_wifi_set_promiscuous(false);
+        // Restore default band mode so later 2.4-only features aren't left on a single band.
+        esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+    }
 
     // Stop BLE scan if it was started
     if (wdp_bt_running) {
@@ -5557,6 +6211,19 @@ cleanup:
 static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_enabled) {
     (void)argc; (void)argv;
     wardrive_promisc_trace_enabled = trace_enabled;
+
+    {
+        // Config loaded at boot; log active settings. Bands/channels are now applied
+        // in the task (wdp_ducb_init + band mode); deltas/cooldown wired in later steps.
+        char wd_bands[24];
+        wardrive_config_format_bands(wd_bands, sizeof(wd_bands));
+        const char *wd_chmode = (g_wd_cfg.ch_mode == WD_CH_POPULAR) ? "popular" :
+                                (g_wd_cfg.ch_mode == WD_CH_CUSTOM)  ? "custom"  : "all";
+        MY_LOG_INFO(TAG, "Wardrive config: bands=%s channels=%s wifi_delta=%d ble_delta=%d cooldown=%us memcap=%u",
+                    wd_bands, wd_chmode, g_wd_cfg.wifi_rssi_delta, g_wd_cfg.ble_rssi_delta,
+                    (unsigned)g_wd_cfg.startup_cooldown_s, (unsigned)g_wd_cfg.mem_cap);
+    }
+
     oled_display_update_full("> Wardrive Pro", "  Promiscuous", "  GPS + SD log", "  Active...");
     log_memory_info("start_wardrive_promisc");
 
@@ -5646,6 +6313,209 @@ static int cmd_start_wardrive_promisc(int argc, char **argv) {
 
 static int cmd_start_wardrive_promisc_trace(int argc, char **argv) {
     return cmd_start_wardrive_promisc_impl(argc, argv, true);
+}
+
+// ============================================================================
+// Anti-Surveillance: detect a BLE device that moves along with you (a "tail").
+// Uses the BLE scan + GPS streams already in place. A follower = a device that
+// stays in range over a long enough time AND a long enough travelled distance.
+// ============================================================================
+
+#define ANTISURV_LOST_TIMEOUT_US   (30 * 1000000LL)   // must have been seen this recently to count
+
+// Map sensitivity to detection thresholds.
+static void antisurv_thresholds(uint8_t sens, int *min_dur_s, int *min_dist_m, bool *include_random) {
+    switch (sens) {
+        case WD_AS_LOW:  *min_dur_s = 300; *min_dist_m = 1000; *include_random = false; break;
+        case WD_AS_HIGH: *min_dur_s = 120; *min_dist_m = 300;  *include_random = true;  break;
+        case WD_AS_MED:
+        default:         *min_dur_s = 180; *min_dist_m = 500;  *include_random = false; break;
+    }
+}
+
+// A locally-administered (randomized) BLE address has bit 1 of the first octet set.
+// Such devices rotate their MAC (~every 15 min) so they can't be tracked long-term.
+static inline bool antisurv_is_random_mac(const uint8_t *addr) {
+    return (addr[0] & 0x02) != 0;
+}
+
+// Scan tracked devices, raise an alert for any that newly qualify as a follower.
+static int antisurv_evaluate_and_alert(void) {
+    int min_dur_s, min_dist_m;
+    bool include_random;
+    antisurv_thresholds(g_wd_cfg.antisurv_sensitivity, &min_dur_s, &min_dist_m, &include_random);
+
+    int64_t now = esp_timer_get_time();
+    int n = bt_device_count;
+    int alerts = 0;
+
+    for (int i = 0; i < n; i++) {
+        bt_device_info_t *d = &bt_devices[i];
+        if (d->as_alerted) continue;
+        if (!d->as_has_origin) continue;
+        if (!include_random && antisurv_is_random_mac(d->addr)) continue;
+        if ((now - d->as_last_us) > ANTISURV_LOST_TIMEOUT_US) continue;   // not currently in range
+        int dur_s = (int)((d->as_last_us - d->as_first_us) / 1000000LL);
+        if (dur_s < min_dur_s) continue;
+        if (d->as_max_dist_m < (double)min_dist_m) continue;
+
+        char addr_str[18];
+        bt_format_addr(d->addr, addr_str);
+        const char *type = d->is_airtag ? "AirTag" : d->is_smarttag ? "SmartTag" : "device";
+        MY_LOG_INFO(TAG, "[FOLLOWER] MAC=%s name=\"%s\" type=%s rssi=%d seen=%ds travel=%.0fm",
+                    addr_str, d->name[0] ? d->name : "", type, d->rssi, dur_s, d->as_max_dist_m);
+        d->as_alerted = true;
+        alerts++;
+    }
+    return alerts;
+}
+
+static int antisurv_total_alerted(void) {
+    int c = 0;
+    for (int i = 0; i < bt_device_count; i++) if (bt_devices[i].as_alerted) c++;
+    return c;
+}
+
+static void antisurv_task(void *pvParameters) {
+    (void)pvParameters;
+    MY_LOG_INFO(TAG, "Anti-surveillance task started.");
+
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+
+    bt_reset_counters();
+    if (bt_start_scan() != 0) {
+        MY_LOG_INFO(TAG, "Anti-surveillance: BLE scan failed to start.");
+        antisurv_active = false;
+        antisurv_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    led_set_color(180, 0, 200);   // purple = watching
+
+    int min_dur_s, min_dist_m; bool include_random;
+    antisurv_thresholds(g_wd_cfg.antisurv_sensitivity, &min_dur_s, &min_dist_m, &include_random);
+    const char *sens_str = (g_wd_cfg.antisurv_sensitivity == WD_AS_LOW)  ? "low" :
+                           (g_wd_cfg.antisurv_sensitivity == WD_AS_HIGH) ? "high" : "med";
+    MY_LOG_INFO(TAG, "Anti-surveillance: sensitivity=%s (>=%ds, >=%dm, randoms=%s). Use 'stop'.",
+                sens_str, min_dur_s, min_dist_m, include_random ? "yes" : "no");
+    oled_display_update_full("> Anti-Surveil", "  Watching...", "  Need GPS+move", "  Use 'stop'");
+
+    int64_t last_eval_us = esp_timer_get_time();
+    int64_t last_oled_us = 0;
+
+    while (antisurv_active && !operation_stop_requested) {
+        // Read GPS (mirror of the wardrive loop).
+        if (external_feed) {
+            gps_sync_from_selected_external_source();
+            vTaskDelay(pdMS_TO_TICKS(200));
+        } else {
+            int gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer,
+                                          GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+            if (gps_len > 0) {
+                wardrive_gps_buffer[gps_len] = '\0';
+                char *line = strtok(wardrive_gps_buffer, "\r\n");
+                while (line != NULL) { parse_gps_nmea(line); line = strtok(NULL, "\r\n"); }
+            }
+        }
+
+        int64_t now = esp_timer_get_time();
+        if (now - last_eval_us >= 3000000LL) {       // evaluate every ~3 s
+            last_eval_us = now;
+            if (antisurv_evaluate_and_alert() > 0) {
+                oled_display_update_full("> Anti-Surveil", "  ! FOLLOWER !",
+                                         "  Check serial", "  Use 'stop'");
+                led_set_color(255, 0, 0);            // red flash on detection
+            }
+        }
+
+        if (now - last_oled_us >= 2000000LL) {
+            last_oled_us = now;
+            char l2[64], l3[64], l4[64];
+            snprintf(l2, sizeof(l2), "  %d devices", bt_device_count);
+            snprintf(l3, sizeof(l3), "  %d followers", antisurv_total_alerted());
+            snprintf(l4, sizeof(l4), "  GPS:%s SAT:%d", current_gps.valid ? "OK" : "--",
+                     current_gps.satellites);
+            oled_display_update_full("> Anti-Surveil", l2, l3, l4);
+        }
+    }
+
+    bt_stop_scan();
+    led_set_idle();
+    MY_LOG_INFO(TAG, "Anti-surveillance stopped. Devices seen: %d, followers flagged: %d",
+                bt_device_count, antisurv_total_alerted());
+    antisurv_active = false;
+    antisurv_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static int cmd_start_antisurveillance(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    if (antisurv_active || antisurv_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Anti-surveillance already running. Use 'stop' first.");
+        return 1;
+    }
+    if (wardrive_promisc_active || wardrive_promisc_task_handle != NULL ||
+        wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start anti-surveillance while wardrive is running. Use 'stop' first.");
+        return 1;
+    }
+    if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start anti-surveillance while a BT scan is running. Use 'stop' first.");
+        return 1;
+    }
+
+    operation_stop_requested = false;
+
+    esp_err_t bt_ret = bt_nimble_init();
+    if (bt_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Anti-surveillance: BLE init failed (%s).", esp_err_to_name(bt_ret));
+        return 1;
+    }
+
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+    if (!external_feed) {
+        int baud = gps_get_baud_for_module(current_gps_module);
+        if (init_gps_uart(baud) != ESP_OK) {
+            MY_LOG_INFO(TAG, "Anti-surveillance: failed to init GPS UART.");
+            return 1;
+        }
+        MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
+                    GPS_TX_PIN, GPS_RX_PIN, baud);
+    } else {
+        MY_LOG_INFO(TAG, "Using external GPS feed for anti-surveillance.");
+    }
+
+    antisurv_active = true;
+    BaseType_t result = xTaskCreate(antisurv_task, "antisurv_task", 8192, NULL, 5, &antisurv_task_handle);
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create anti-surveillance task!");
+        antisurv_active = false;
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "Anti-surveillance started. Use 'stop' to stop.");
+    return 0;
+}
+
+static int cmd_set_antisurv_sensitivity(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: set_antisurv_sensitivity <low|med|high>\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "low") == 0)       g_wd_cfg.antisurv_sensitivity = WD_AS_LOW;
+    else if (strcmp(argv[1], "med") == 0)  g_wd_cfg.antisurv_sensitivity = WD_AS_MED;
+    else if (strcmp(argv[1], "high") == 0) g_wd_cfg.antisurv_sensitivity = WD_AS_HIGH;
+    else {
+        printf("Unknown level '%s'. Valid: low, med, high\n", argv[1]);
+        return 1;
+    }
+    wardrive_config_persist();
+    int dur, dist; bool rnd;
+    antisurv_thresholds(g_wd_cfg.antisurv_sensitivity, &dur, &dist, &rnd);
+    printf("Anti-surveillance sensitivity: %s (>=%ds present, >=%dm travel, randoms=%s)\n",
+           argv[1], dur, dist, rnd ? "yes" : "no");
+    return 0;
 }
 
 // ============================================================================
@@ -9039,7 +9909,23 @@ static int cmd_stop(int argc, char **argv) {
             MY_LOG_INFO(TAG, "Wardrive promisc task forcefully stopped.");
         }
     }
-    
+
+    // Stop anti-surveillance task if running
+    if (antisurv_active || antisurv_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping anti-surveillance task...");
+        antisurv_active = false;
+        bt_stop_scan();
+
+        for (int i = 0; i < 20 && antisurv_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (antisurv_task_handle != NULL) {
+            vTaskDelete(antisurv_task_handle);
+            antisurv_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Anti-surveillance task forcefully stopped.");
+        }
+    }
+
     // Stop DarkSword if active
     if (darksword_active) {
         MY_LOG_INFO(TAG, "Stopping DarkSword...");
@@ -16158,24 +17044,77 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     
     // Check if this is a Scan Response packet (contains names more often)
     bool is_scan_response = (desc->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
-    
+
+    // Wardrive-only gates: startup cooldown + device blacklist (don't affect scan_bt).
+    if (wardrive_promisc_active) {
+        if (esp_timer_get_time() < wdp_log_gate_until_us) return 0;       // startup cooldown
+        if (wardrive_blacklist_contains(desc->addr.val)) return 0;        // excluded device
+    }
+    // Anti-surveillance: skip blacklisted MACs so your own devices aren't flagged as followers.
+    if (antisurv_active && wardrive_blacklist_contains(desc->addr.val)) return 0;
+
     // Check if device already seen
     bool already_seen = bt_is_device_found(desc->addr.val);
     
-    // If already seen, only process scan responses to update names
+    // If already seen: update name from scan responses, and (during wardrive) re-log.
     if (already_seen) {
+        bool want_name = is_scan_response && fields.name != NULL && fields.name_len > 0;
+        int dev_idx = (want_name || wardrive_promisc_active || antisurv_active)
+                      ? bt_find_device_index(desc->addr.val) : -1;
+
         // Try to update name from scan response if we don't have one
-        if (is_scan_response && fields.name != NULL && fields.name_len > 0) {
-            int dev_idx = bt_find_device_index(desc->addr.val);
-            if (dev_idx >= 0 && bt_devices[dev_idx].name[0] == '\0') {
-                int name_len = fields.name_len < 31 ? fields.name_len : 31;
-                memcpy(bt_devices[dev_idx].name, fields.name, name_len);
-                bt_devices[dev_idx].name[name_len] = '\0';
+        if (dev_idx >= 0 && want_name && bt_devices[dev_idx].name[0] == '\0') {
+            int name_len = fields.name_len < 31 ? fields.name_len : 31;
+            memcpy(bt_devices[dev_idx].name, fields.name, name_len);
+            bt_devices[dev_idx].name[name_len] = '\0';
+        }
+
+        // Wardrive re-log: re-emit a row when signal or position moved enough.
+        // ble_rssi_delta == 0 keeps the legacy "log once" behavior.
+        if (dev_idx >= 0 && wardrive_promisc_active) {
+            int8_t cur = desc->rssi;
+            bt_devices[dev_idx].rssi = cur;
+            if (g_wd_cfg.ble_rssi_delta > 0 && !bt_devices[dev_idx].needs_log) {
+                bool trig = false;
+                int rd = cur - bt_devices[dev_idx].last_logged_rssi;
+                if (rd < 0) rd = -rd;
+                if (rd >= g_wd_cfg.ble_rssi_delta) {
+                    trig = true;
+                } else if (current_gps.valid && bt_devices[dev_idx].last_logged_valid) {
+                    double moved = gps_distance_meters(bt_devices[dev_idx].last_logged_lat,
+                                                       bt_devices[dev_idx].last_logged_lon,
+                                                       current_gps.latitude, current_gps.longitude);
+                    double thresh = WDP_RELOG_DISTANCE_M;
+                    if (current_gps.accuracy > thresh) thresh = current_gps.accuracy;
+                    if (moved >= thresh) trig = true;
+                }
+                if (trig) {
+                    bt_devices[dev_idx].needs_log = true;
+                    wdp_relog_pending = true;
+                }
+            }
+        }
+
+        // Anti-surveillance: track presence over time + travel distance from origin.
+        if (dev_idx >= 0 && antisurv_active) {
+            bt_devices[dev_idx].rssi = desc->rssi;
+            bt_devices[dev_idx].as_last_us = esp_timer_get_time();
+            if (current_gps.valid) {
+                if (!bt_devices[dev_idx].as_has_origin) {
+                    bt_devices[dev_idx].as_origin_lat = current_gps.latitude;
+                    bt_devices[dev_idx].as_origin_lon = current_gps.longitude;
+                    bt_devices[dev_idx].as_has_origin = true;
+                } else {
+                    double d = gps_distance_meters(bt_devices[dev_idx].as_origin_lat,
+                                                   bt_devices[dev_idx].as_origin_lon,
+                                                   current_gps.latitude, current_gps.longitude);
+                    if (d > bt_devices[dev_idx].as_max_dist_m) bt_devices[dev_idx].as_max_dist_m = d;
+                }
             }
         }
         return 0;
     }
-    
+
     // Add to found devices list
     if (!bt_add_found_device(desc->addr.val)) {
         return 0;
@@ -16192,6 +17131,18 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     dev->company_id = 0;
     dev->is_airtag = false;
     dev->is_smarttag = false;
+    dev->needs_log = true;          // pending first write to SD
+    dev->last_logged_valid = false;
+    dev->as_first_us = esp_timer_get_time();
+    dev->as_last_us = dev->as_first_us;
+    dev->as_has_origin = false;
+    dev->as_max_dist_m = 0.0;
+    dev->as_alerted = false;
+    if (antisurv_active && current_gps.valid) {
+        dev->as_origin_lat = current_gps.latitude;
+        dev->as_origin_lon = current_gps.longitude;
+        dev->as_has_origin = true;
+    }
     
     // Extract device name if available (standard AD field)
     bool has_name = (fields.name != NULL && fields.name_len > 0);
@@ -17145,6 +18096,87 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cmd));
 
+    const esp_console_cmd_t get_wardrive_config_cmd = {
+        .command = "get_wardrive_config",
+        .help = "Print active wardrive config (bands, channels, deltas, cooldown, mem cap)",
+        .hint = NULL,
+        .func = &cmd_get_wardrive_config,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&get_wardrive_config_cmd));
+
+    const esp_console_cmd_t set_wardrive_bands_cmd = {
+        .command = "set_wardrive_bands",
+        .help = "Select wardrive radios: set_wardrive_bands wifi24,wifi5,ble",
+        .hint = NULL,
+        .func = &cmd_set_wardrive_bands,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_bands_cmd));
+
+    const esp_console_cmd_t set_wardrive_channels_cmd = {
+        .command = "set_wardrive_channels",
+        .help = "Select channels: set_wardrive_channels <popular|all|custom> [1:6:11:36]",
+        .hint = NULL,
+        .func = &cmd_set_wardrive_channels,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_channels_cmd));
+
+    const esp_console_cmd_t set_wardrive_rssi_delta_cmd = {
+        .command = "set_wardrive_rssi_delta",
+        .help = "Re-log threshold: set_wardrive_rssi_delta <wifi|ble> <0-50> (0 = log once)",
+        .hint = NULL,
+        .func = &cmd_set_wardrive_rssi_delta,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_rssi_delta_cmd));
+
+    const esp_console_cmd_t set_wardrive_memcap_cmd = {
+        .command = "set_wardrive_memcap",
+        .help = "Max WiFi entries in RAM before eviction: set_wardrive_memcap <1000-200000>",
+        .hint = NULL,
+        .func = &cmd_set_wardrive_memcap,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_memcap_cmd));
+
+    const esp_console_cmd_t set_wardrive_cooldown_cmd = {
+        .command = "set_wardrive_cooldown",
+        .help = "Drop scans for the first N seconds (hide start): set_wardrive_cooldown <0-600>",
+        .hint = NULL,
+        .func = &cmd_set_wardrive_cooldown,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_cooldown_cmd));
+
+    const esp_console_cmd_t wardrive_blacklist_cmd = {
+        .command = "wardrive_blacklist",
+        .help = "Exclude devices: wardrive_blacklist <add|remove|list|clear> [MAC]",
+        .hint = NULL,
+        .func = &cmd_wardrive_blacklist,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_blacklist_cmd));
+
+    const esp_console_cmd_t start_antisurv_cmd = {
+        .command = "start_antisurveillance",
+        .help = "Detect a BLE device following you (uses GPS + BLE). Use 'stop' to end.",
+        .hint = NULL,
+        .func = &cmd_start_antisurveillance,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&start_antisurv_cmd));
+
+    const esp_console_cmd_t set_antisurv_sens_cmd = {
+        .command = "set_antisurv_sensitivity",
+        .help = "Follower-detection sensitivity: set_antisurv_sensitivity <low|med|high>",
+        .hint = NULL,
+        .func = &cmd_set_antisurv_sensitivity,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_antisurv_sens_cmd));
+
     const esp_console_cmd_t wardrive_promisc_cmd = {
         .command = "start_wardrive_promisc",
         .help = "Promiscuous wardrive with D-UCB channel selection",
@@ -17638,6 +18670,8 @@ void app_main(void) {
     //printf("NVS initialized OK\n");
 
     channel_time_load_state_from_nvs();
+    wardrive_config_load_from_nvs();
+    wardrive_blacklist_load();
     gps_load_state_from_nvs();
     led_load_state_from_nvs();
     oled_display_update_full(NULL, "  NVS: OK", "  Init LED...", "");
