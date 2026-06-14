@@ -156,8 +156,14 @@
 #define WDGWARS_NVS_NAMESPACE "wdgwars"
 #define WDGWARS_NVS_KEY       "api_key"
 #define WDGWARS_URL           "https://wdgwars.pl/api/upload-csv"
+#define WDGWARS_V2_URL        "https://wdgwars.pl/api/v2/upload-csv"
+#define WDGWARS_V2_JOB_URL_BASE "https://wdgwars.pl/api/v2/upload-job/"
 #define WDGWARS_HISTORY_URL   "https://wdgwars.pl/api/upload-history?limit=5"
 #define WDGWARS_KEY_MAX_LEN   65
+#define WDGWARS_MAX_UPLOAD_BYTES (60L * 1024L * 1024L)
+#define WDGWARS_RESULT_RATE_LIMITED 3
+#define WDGWARS_BACKOFF_BASE_MS 15000
+#define WDGWARS_BACKOFF_MAX_MS 120000
 
 #define DISPLAY_NVS_NAMESPACE "display"
 #define DISPLAY_NVS_KEY_MODE  "mode"
@@ -295,6 +301,8 @@ static char wpasec_api_key[WPASEC_KEY_MAX_LEN] = "";
 static char wigle_api_name[WIGLE_KEY_MAX_LEN] = "";
 static char wigle_api_token[WIGLE_KEY_MAX_LEN] = "";
 static char wdgwars_api_key[WDGWARS_KEY_MAX_LEN] = "";
+static int64_t wdgwars_circuit_open_until_us = 0;
+static int wdgwars_rate_limit_streak = 0;
 
 // ARP ban state
 static volatile bool arp_ban_active = false;
@@ -1908,6 +1916,10 @@ static int cmd_wigle_key(int argc, char **argv);
 static int cmd_wigle_upload(int argc, char **argv);
 static int cmd_wdgwars_key(int argc, char **argv);
 static int cmd_wdgwars_upload(int argc, char **argv);
+static int cmd_upload_state(int argc, char **argv);
+static int cmd_wardrive_files(int argc, char **argv);
+static int cmd_wardrive_cleanup(int argc, char **argv);
+static int cmd_wardrive_fix(int argc, char **argv);
 static int cmd_channel_time(int argc, char **argv);
 static int cmd_ota_check(int argc, char **argv);
 static int cmd_ota_list(int argc, char **argv);
@@ -3806,10 +3818,22 @@ static bool check_channel_changes(void) {
 
 static void escape_csv_field(const char* input, char* output, size_t output_size) {
     if (!input || !output || output_size < 2) return;
-    
+
     size_t input_len = strlen(input);
     size_t out_pos = 0;
-    
+    bool needs_quotes = false;
+
+    for (size_t i = 0; i < input_len; i++) {
+        if (input[i] == ',' || input[i] == '"' || input[i] == '\r' || input[i] == '\n') {
+            needs_quotes = true;
+            break;
+        }
+    }
+
+    if (needs_quotes && out_pos < output_size - 1) {
+        output[out_pos++] = '"';
+    }
+
     for (size_t i = 0; i < input_len && out_pos < output_size - 2; i++) {
         if (input[i] == '"') {
             if (out_pos < output_size - 3) {
@@ -3819,6 +3843,9 @@ static void escape_csv_field(const char* input, char* output, size_t output_size
         } else {
             output[out_pos++] = input[i];
         }
+    }
+    if (needs_quotes && out_pos < output_size - 1) {
+        output[out_pos++] = '"';
     }
     output[out_pos] = '\0';
 }
@@ -7661,6 +7688,9 @@ static bool wigle_is_upload_candidate(const char *filename) {
     if (!filename) {
         return false;
     }
+    if (filename[0] == '.' || strcmp(filename, "upload_state.csv") == 0) {
+        return false;
+    }
     size_t len = strlen(filename);
     if (len > 4 && strcasecmp(filename + len - 4, ".log") == 0) {
         return true;
@@ -7678,11 +7708,17 @@ static bool wdgwars_is_upload_candidate(const char *filename) {
     if (!filename) {
         return false;
     }
+    if (filename[0] == '.' || strcmp(filename, "upload_state.csv") == 0) {
+        return false;
+    }
     size_t len = strlen(filename);
     if (len > 4 && strcasecmp(filename + len - 4, ".log") == 0) {
         return true;
     }
     if (len > 4 && strcasecmp(filename + len - 4, ".csv") == 0) {
+        return true;
+    }
+    if (len > 3 && strcasecmp(filename + len - 3, ".gz") == 0) {
         return true;
     }
     return false;
@@ -7765,6 +7801,820 @@ static bool wdgwars_resolve_upload_target(const char *arg, char *out_path, size_
         return false;
     }
     return true;
+}
+
+typedef struct {
+    int data_rows;
+    int wifi_rows;
+    int ble_rows;
+    int bt_rows;
+    int bad_rows;
+    bool has_wigle_header;
+    bool has_schema_header;
+} wdgwars_wigle_stats_t;
+
+#define WDGWARS_SANITIZED_UPLOAD_PATH "/sdcard/lab/wardrives/.wdgwars_upload.tmp"
+#define UPLOAD_STATE_PATH "/sdcard/lab/wardrives/upload_state.csv"
+#define WDGWARS_WIGLE_HEADER "WigleWifi-1.6,appRelease=v1.1,model=MonsterC5,release=v1.0,device=MonsterC5,display=SPI TFT,board=ESP32C5,brand=LAB5"
+#define WDGWARS_WIGLE_SCHEMA "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type"
+
+static int count_csv_fields_simple(const char *line) {
+    if (!line || line[0] == '\0') {
+        return 0;
+    }
+
+    int fields = 1;
+    bool quoted = false;
+    for (const char *p = line; *p != '\0'; p++) {
+        if (*p == '"') {
+            if (quoted && p[1] == '"') {
+                p++;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (*p == ',' && !quoted) {
+            fields++;
+        }
+    }
+    return fields;
+}
+
+static bool csv_last_field_is_type(const char *line, const char *type) {
+    if (!line || !type) {
+        return false;
+    }
+
+    const char *last = strrchr(line, ',');
+    if (!last) {
+        return false;
+    }
+    last++;
+    while (*last == ' ' || *last == '\t') {
+        last++;
+    }
+    return strcasecmp(last, type) == 0;
+}
+
+static bool wdgwars_sanitize_wigle_file(const char *filepath, wdgwars_wigle_stats_t *stats, bool *use_sanitized) {
+    if (use_sanitized) {
+        *use_sanitized = false;
+    }
+    if (!filepath || !stats || !use_sanitized) {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    size_t path_len = strlen(filepath);
+    if (path_len > 3 && strcasecmp(filepath + path_len - 3, ".gz") == 0) {
+        MY_LOG_INFO(TAG, "  Preflight WigleWifi-1.6: skipped for compressed .gz file");
+        return true;
+    }
+
+    FILE *in = fopen(filepath, "r");
+    if (!in) {
+        MY_LOG_INFO(TAG, "  Preflight: cannot open file for schema check");
+        return false;
+    }
+
+    FILE *out = fopen(WDGWARS_SANITIZED_UPLOAD_PATH, "w");
+    if (!out) {
+        fclose(in);
+        MY_LOG_INFO(TAG, "  Preflight: cannot create sanitized upload file");
+        return false;
+    }
+
+    fprintf(out, "%s\n%s\n", WDGWARS_WIGLE_HEADER, WDGWARS_WIGLE_SCHEMA);
+
+    char line[512];
+    while (fgets(line, sizeof(line), in)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (strncmp(line, "WigleWifi-1.6", 13) == 0) {
+            stats->has_wigle_header = true;
+            continue;
+        }
+        if (strcmp(line, WDGWARS_WIGLE_SCHEMA) == 0) {
+            stats->has_schema_header = true;
+            continue;
+        }
+        if (strncmp(line, "MAC,SSID,", 9) == 0) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        int fields = count_csv_fields_simple(line);
+        if (fields != 14) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        const char *type = NULL;
+        if (csv_last_field_is_type(line, "WIFI")) {
+            stats->wifi_rows++;
+            type = "WIFI";
+        } else if (csv_last_field_is_type(line, "BLE")) {
+            stats->ble_rows++;
+            type = "BLE";
+        } else if (csv_last_field_is_type(line, "BT")) {
+            stats->bt_rows++;
+            type = "BT";
+        }
+
+        if (!type) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        stats->data_rows++;
+        fprintf(out, "%s\n", line);
+    }
+
+    fclose(in);
+    fclose(out);
+
+    bool changed = stats->bad_rows > 0 || !stats->has_wigle_header || !stats->has_schema_header;
+    *use_sanitized = changed;
+
+    MY_LOG_INFO(TAG, "  Preflight WigleWifi-1.6: header=%s schema=%s rows=%d wifi=%d ble=%d bt=%d bad=%d",
+                stats->has_wigle_header ? "yes" : "no",
+                stats->has_schema_header ? "yes" : "no",
+                stats->data_rows, stats->wifi_rows, stats->ble_rows,
+                stats->bt_rows, stats->bad_rows);
+
+    if (changed) {
+        MY_LOG_INFO(TAG, "  Sanitized copy prepared: removed %d bad row(s), added missing headers if needed",
+                    stats->bad_rows);
+    } else {
+        unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+    }
+    return true;
+}
+
+static void wardrive_build_fixed_path(const char *filename, char *out, size_t out_sz) {
+    char base[128];
+    snprintf(base, sizeof(base), "%s", filename ? filename : "wardrive.log");
+    char *dot = strrchr(base, '.');
+    if (dot && dot != base) {
+        *dot = '\0';
+    }
+    snprintf(out, out_sz, "/sdcard/lab/wardrives/%s.fixed.log", base);
+}
+
+static bool wardrive_fix_file_soft(const char *filepath, const char *filename,
+                                   char *out_path, size_t out_path_sz,
+                                   wdgwars_wigle_stats_t *stats) {
+    if (!filepath || !filename || !out_path || out_path_sz == 0 || !stats) {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    size_t path_len = strlen(filepath);
+    if (path_len > 3 && strcasecmp(filepath + path_len - 3, ".gz") == 0) {
+        MY_LOG_INFO(TAG, "wardrive_fix does not repair compressed .gz files");
+        return false;
+    }
+
+    FILE *in = fopen(filepath, "r");
+    if (!in) {
+        MY_LOG_INFO(TAG, "wardrive_fix: cannot open %s", filepath);
+        return false;
+    }
+
+    wardrive_build_fixed_path(filename, out_path, out_path_sz);
+    FILE *out = fopen(out_path, "w");
+    if (!out) {
+        fclose(in);
+        MY_LOG_INFO(TAG, "wardrive_fix: cannot create %s", out_path);
+        return false;
+    }
+
+    fprintf(out, "%s\n%s\n", WDGWARS_WIGLE_HEADER, WDGWARS_WIGLE_SCHEMA);
+
+    char line[512];
+    while (fgets(line, sizeof(line), in)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (strncmp(line, "WigleWifi-1.6", 13) == 0) {
+            stats->has_wigle_header = true;
+            continue;
+        }
+        if (strcmp(line, WDGWARS_WIGLE_SCHEMA) == 0) {
+            stats->has_schema_header = true;
+            continue;
+        }
+        if (strncmp(line, "MAC,SSID,", 9) == 0) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        if (count_csv_fields_simple(line) != 14) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        if (csv_last_field_is_type(line, "WIFI")) {
+            stats->wifi_rows++;
+        } else if (csv_last_field_is_type(line, "BLE")) {
+            stats->ble_rows++;
+        } else if (csv_last_field_is_type(line, "BT")) {
+            stats->bt_rows++;
+        } else {
+            stats->bad_rows++;
+            continue;
+        }
+
+        stats->data_rows++;
+        fprintf(out, "%s\n", line);
+    }
+
+    fclose(in);
+    fclose(out);
+    sd_sync();
+
+    // Future hard-repair concept:
+    // Keep a bounded accumulator (for example 2 KB), append up to a few physical
+    // lines when CSV quotes are unbalanced or field count is wrong, and emit the
+    // merged record only if it becomes a valid 14-field WigleWifi row. This is
+    // intentionally not automatic yet because guessing broken records can corrupt
+    // coordinates or device identity; the soft mode only drops unsafe rows.
+    return true;
+}
+
+static bool wardrive_collect_file_id(const char *filepath, long *out_size, uint32_t *out_hash) {
+    const size_t CHUNK_SIZE = 2048;
+    FILE *f = fopen(filepath, "rb");
+    if (!f) {
+        return false;
+    }
+
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (!buf) {
+        fclose(f);
+        return false;
+    }
+
+    uint32_t hash = 2166136261u; // FNV-1a 32-bit
+    long size = 0;
+    while (1) {
+        size_t n = fread(buf, 1, CHUNK_SIZE, f);
+        for (size_t i = 0; i < n; i++) {
+            hash ^= buf[i];
+            hash *= 16777619u;
+        }
+        size += (long)n;
+        if (n < CHUNK_SIZE) {
+            if (ferror(f)) {
+                free(buf);
+                fclose(f);
+                return false;
+            }
+            break;
+        }
+    }
+
+    free(buf);
+    fclose(f);
+    if (out_size) {
+        *out_size = size;
+    }
+    if (out_hash) {
+        *out_hash = hash;
+    }
+    return true;
+}
+
+static bool upload_state_ensure_file(void) {
+    struct stat st;
+    if (stat(UPLOAD_STATE_PATH, &st) == 0) {
+        return true;
+    }
+
+    FILE *f = fopen(UPLOAD_STATE_PATH, "w");
+    if (!f) {
+        MY_LOG_INFO(TAG, "Upload state: cannot create %s", UPLOAD_STATE_PATH);
+        return false;
+    }
+    fprintf(f, "service,filename,size,hash,status,uploaded_at,wifi,ble,bt,bad\n");
+    fclose(f);
+    sd_sync();
+    return true;
+}
+
+static bool upload_state_parse_line(char *line, char *service, size_t service_sz,
+                                    char *filename, size_t filename_sz, long *size,
+                                    uint32_t *hash, char *status, size_t status_sz,
+                                    int *wifi, int *ble, int *bt, int *bad) {
+    if (!line || strncmp(line, "service,", 8) == 0) {
+        return false;
+    }
+
+    char *fields[10] = {0};
+    int count = 0;
+    char *save = NULL;
+    char *tok = strtok_r(line, ",", &save);
+    while (tok && count < 10) {
+        fields[count++] = tok;
+        tok = strtok_r(NULL, ",", &save);
+    }
+    if (count < 10) {
+        return false;
+    }
+
+    snprintf(service, service_sz, "%s", fields[0]);
+    snprintf(filename, filename_sz, "%s", fields[1]);
+    if (size) {
+        *size = strtol(fields[2], NULL, 10);
+    }
+    if (hash) {
+        *hash = (uint32_t)strtoul(fields[3], NULL, 16);
+    }
+    snprintf(status, status_sz, "%s", fields[4]);
+    if (wifi) *wifi = atoi(fields[6]);
+    if (ble)  *ble  = atoi(fields[7]);
+    if (bt)   *bt   = atoi(fields[8]);
+    if (bad)  *bad  = atoi(fields[9]);
+    return true;
+}
+
+static bool upload_state_is_done(const char *service, const char *filename, long size, uint32_t hash) {
+    FILE *f = fopen(UPLOAD_STATE_PATH, "r");
+    if (!f) {
+        return false;
+    }
+
+    bool done = false;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char svc[16], fn[128], status[16];
+        long rec_size = 0;
+        uint32_t rec_hash = 0;
+        if (!upload_state_parse_line(line, svc, sizeof(svc), fn, sizeof(fn),
+                                     &rec_size, &rec_hash, status, sizeof(status),
+                                     NULL, NULL, NULL, NULL)) {
+            continue;
+        }
+        if (strcmp(svc, service) == 0 && strcmp(fn, filename) == 0 &&
+            rec_size == size && rec_hash == hash) {
+            if (strcmp(status, "done") == 0) {
+                done = true;
+            }
+        }
+    }
+    fclose(f);
+    return done;
+}
+
+static bool upload_state_append(const char *service, const char *filename, long size,
+                                uint32_t hash, const char *status,
+                                const wdgwars_wigle_stats_t *stats) {
+    if (!upload_state_ensure_file()) {
+        return false;
+    }
+
+    FILE *f = fopen(UPLOAD_STATE_PATH, "a");
+    if (!f) {
+        MY_LOG_INFO(TAG, "Upload state: cannot append to %s", UPLOAD_STATE_PATH);
+        return false;
+    }
+
+    char timestamp[32];
+    get_timestamp_string(timestamp, sizeof(timestamp));
+    fprintf(f, "%s,%s,%ld,%08lX,%s,%s,%d,%d,%d,%d\n",
+            service, filename, size, (unsigned long)hash, status, timestamp,
+            stats ? stats->wifi_rows : 0,
+            stats ? stats->ble_rows : 0,
+            stats ? stats->bt_rows : 0,
+            stats ? stats->bad_rows : 0);
+    fclose(f);
+    sd_sync();
+    return true;
+}
+
+static void upload_state_get_status(const char *service, const char *filename, long size,
+                                    uint32_t hash, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "pending");
+    FILE *f = fopen(UPLOAD_STATE_PATH, "r");
+    if (!f) {
+        return;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char svc[16], fn[128], status[16];
+        long rec_size = 0;
+        uint32_t rec_hash = 0;
+        if (!upload_state_parse_line(line, svc, sizeof(svc), fn, sizeof(fn),
+                                     &rec_size, &rec_hash, status, sizeof(status),
+                                     NULL, NULL, NULL, NULL)) {
+            continue;
+        }
+        if (strcmp(svc, service) == 0 && strcmp(fn, filename) == 0 &&
+            rec_size == size && rec_hash == hash) {
+            if (strcmp(out, "done") == 0) {
+                continue;
+            }
+            snprintf(out, out_sz, "%s", status);
+        }
+    }
+    fclose(f);
+}
+
+static int cmd_upload_state(int argc, char **argv) {
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    if (argc > 1 && strcasecmp(argv[1], "clear") == 0) {
+        unlink(UPLOAD_STATE_PATH);
+        if (upload_state_ensure_file()) {
+            MY_LOG_INFO(TAG, "Upload state cleared: %s", UPLOAD_STATE_PATH);
+            return 0;
+        }
+        return 1;
+    }
+
+    upload_state_ensure_file();
+
+    FILE *f = fopen(UPLOAD_STATE_PATH, "r");
+    printf("[UPLOAD_STATE] BEGIN\n");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            char svc[16], fn[128], status[16];
+            long size = 0;
+            uint32_t hash = 0;
+            int wifi = 0, ble = 0, bt = 0, bad = 0;
+            if (!upload_state_parse_line(line, svc, sizeof(svc), fn, sizeof(fn),
+                                         &size, &hash, status, sizeof(status),
+                                         &wifi, &ble, &bt, &bad)) {
+                continue;
+            }
+            printf("[UPLOAD_STATE] service=%s filename=%s size=%ld hash=%08lX status=%s wifi=%d ble=%d bt=%d bad=%d\n",
+                   svc, fn, size, (unsigned long)hash, status, wifi, ble, bt, bad);
+        }
+        fclose(f);
+    }
+    printf("[UPLOAD_STATE] END\n");
+    return 0;
+}
+
+static int cmd_wardrive_files(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    upload_state_ensure_file();
+
+    DIR *dir = opendir("/sdcard/lab/wardrives");
+    if (!dir) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        return 1;
+    }
+
+    printf("[WARD_FILE] BEGIN\n");
+    int total_files = 0;
+    long total_bytes = 0;
+    int total_rows = 0;
+    int total_wifi = 0;
+    int total_ble = 0;
+    int total_bt = 0;
+    int total_bad = 0;
+    int wigle_pending = 0;
+    int wigle_ok = 0;
+    int wigle_failed = 0;
+    int wigle_rate_limited = 0;
+    int wdgwars_pending = 0;
+    int wdgwars_ok = 0;
+    int wdgwars_failed = 0;
+    int wdgwars_rate_limited = 0;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        char filepath[280];
+        snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
+        long size = 0;
+        uint32_t hash = 0;
+        if (!wardrive_collect_file_id(filepath, &size, &hash)) {
+            continue;
+        }
+
+        wdgwars_wigle_stats_t stats = {0};
+        bool use_sanitized = false;
+        wdgwars_sanitize_wigle_file(filepath, &stats, &use_sanitized);
+        if (use_sanitized) {
+            unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+        }
+
+        char wigle_status[16], wdgwars_status[16];
+        upload_state_get_status("wigle", entry->d_name, size, hash, wigle_status, sizeof(wigle_status));
+        upload_state_get_status("wdgwars", entry->d_name, size, hash, wdgwars_status, sizeof(wdgwars_status));
+
+        total_files++;
+        total_bytes += size;
+        total_rows += stats.data_rows;
+        total_wifi += stats.wifi_rows;
+        total_ble += stats.ble_rows;
+        total_bt += stats.bt_rows;
+        total_bad += stats.bad_rows;
+
+        if (strcmp(wigle_status, "done") == 0) {
+            wigle_ok++;
+        } else if (strcmp(wigle_status, "failed") == 0) {
+            wigle_failed++;
+        } else if (strcmp(wigle_status, "rate_limited") == 0) {
+            wigle_rate_limited++;
+        } else {
+            wigle_pending++;
+        }
+
+        if (strcmp(wdgwars_status, "done") == 0) {
+            wdgwars_ok++;
+        } else if (strcmp(wdgwars_status, "failed") == 0) {
+            wdgwars_failed++;
+        } else if (strcmp(wdgwars_status, "rate_limited") == 0) {
+            wdgwars_rate_limited++;
+        } else {
+            wdgwars_pending++;
+        }
+
+        printf("[WARD_FILE] filename=%s size=%ld hash=%08lX wifi=%d ble=%d bt=%d bad=%d wigle=%s wdgwars=%s\n",
+               entry->d_name, size, (unsigned long)hash,
+               stats.wifi_rows, stats.ble_rows, stats.bt_rows, stats.bad_rows,
+               wigle_status, wdgwars_status);
+    }
+    closedir(dir);
+    printf("[WARD_FILE] SUMMARY files=%d bytes=%ld rows=%d devices=%d wifi=%d ble=%d bt=%d bad=%d wigle_ok=%d wigle_pending=%d wigle_failed=%d wigle_rate_limited=%d wdgwars_ok=%d wdgwars_pending=%d wdgwars_failed=%d wdgwars_rate_limited=%d\n",
+           total_files, total_bytes, total_rows, total_rows, total_wifi, total_ble, total_bt, total_bad,
+           wigle_ok, wigle_pending, wigle_failed, wigle_rate_limited,
+           wdgwars_ok, wdgwars_pending, wdgwars_failed, wdgwars_rate_limited);
+    printf("[WARD_FILE] END\n");
+    return 0;
+}
+
+static bool wardrive_cleanup_valid_service(const char *service) {
+    return service &&
+           (strcasecmp(service, "wigle") == 0 ||
+            strcasecmp(service, "wdgwars") == 0 ||
+            strcasecmp(service, "all") == 0);
+}
+
+static bool wardrive_cleanup_valid_status(const char *status) {
+    return status &&
+           (strcasecmp(status, "pending") == 0 ||
+            strcasecmp(status, "done") == 0 ||
+            strcasecmp(status, "ok") == 0 ||
+            strcasecmp(status, "failed") == 0 ||
+            strcasecmp(status, "fail") == 0 ||
+            strcasecmp(status, "rate_limited") == 0);
+}
+
+static const char *wardrive_cleanup_normalize_status(const char *status) {
+    if (status && strcasecmp(status, "ok") == 0) {
+        return "done";
+    }
+    if (status && strcasecmp(status, "fail") == 0) {
+        return "failed";
+    }
+    if (status && strcasecmp(status, "pending") == 0) {
+        return "pending";
+    }
+    if (status && strcasecmp(status, "done") == 0) {
+        return "done";
+    }
+    if (status && strcasecmp(status, "failed") == 0) {
+        return "failed";
+    }
+    if (status && strcasecmp(status, "rate_limited") == 0) {
+        return "rate_limited";
+    }
+    return status;
+}
+
+static const char *wardrive_cleanup_normalize_service(const char *service) {
+    if (service && strcasecmp(service, "wigle") == 0) {
+        return "wigle";
+    }
+    if (service && strcasecmp(service, "wdgwars") == 0) {
+        return "wdgwars";
+    }
+    if (service && strcasecmp(service, "all") == 0) {
+        return "all";
+    }
+    return service;
+}
+
+static bool wardrive_cleanup_status_matches(const char *service, const char *wanted_status,
+                                            const char *wigle_status, const char *wdgwars_status) {
+    if (strcasecmp(service, "all") == 0) {
+        return strcmp(wigle_status, wanted_status) == 0 &&
+               strcmp(wdgwars_status, wanted_status) == 0;
+    }
+    if (strcasecmp(service, "wigle") == 0) {
+        return strcmp(wigle_status, wanted_status) == 0;
+    }
+    return strcmp(wdgwars_status, wanted_status) == 0;
+}
+
+static bool wardrive_cleanup_ensure_dir(const char *service, const char *status, char *out_dir, size_t out_sz) {
+    if (!service || !status || !out_dir || out_sz == 0) {
+        return false;
+    }
+
+    mkdir("/sdcard/lab/wardrives/uploaded", 0755);
+
+    char service_dir[384];
+    int ret = snprintf(service_dir, sizeof(service_dir), "/sdcard/lab/wardrives/uploaded/%s", service);
+    if (ret <= 0 || ret >= (int)sizeof(service_dir)) {
+        return false;
+    }
+    mkdir(service_dir, 0755);
+
+    ret = snprintf(out_dir, out_sz, "%s/%s", service_dir, status);
+    if (ret <= 0 || ret >= (int)out_sz) {
+        return false;
+    }
+    mkdir(out_dir, 0755);
+    return true;
+}
+
+static int cmd_wardrive_cleanup(int argc, char **argv) {
+    if (argc < 3 || argc > 4 ||
+        !wardrive_cleanup_valid_service(argv[1]) ||
+        !wardrive_cleanup_valid_status(argv[2])) {
+        MY_LOG_INFO(TAG, "Usage: wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]");
+        return 1;
+    }
+
+    if (argc == 4 && strcasecmp(argv[3], "move") != 0) {
+        MY_LOG_INFO(TAG, "Usage: wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]");
+        return 1;
+    }
+
+    const char *service = wardrive_cleanup_normalize_service(argv[1]);
+    const char *status = wardrive_cleanup_normalize_status(argv[2]);
+    bool do_move = (argc >= 4 && strcasecmp(argv[3], "move") == 0);
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    upload_state_ensure_file();
+
+    char target_dir[384];
+    if (!wardrive_cleanup_ensure_dir(service, status, target_dir, sizeof(target_dir))) {
+        MY_LOG_INFO(TAG, "wardrive_cleanup: failed to prepare target directory");
+        return 1;
+    }
+
+    DIR *dir = opendir("/sdcard/lab/wardrives");
+    if (!dir) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        return 1;
+    }
+
+    printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target=%s\n",
+           service, status, do_move ? "move" : "dry-run", target_dir);
+
+    int scanned = 0;
+    int matched = 0;
+    int moved = 0;
+    int failed = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        char filepath[384];
+        int path_len = snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
+        if (path_len <= 0 || path_len >= (int)sizeof(filepath)) {
+            failed++;
+            printf("[WARD_CLEANUP] filename=%s action=failed reason=path_too_long\n", entry->d_name);
+            continue;
+        }
+        long size = 0;
+        uint32_t hash = 0;
+        if (!wardrive_collect_file_id(filepath, &size, &hash)) {
+            continue;
+        }
+        scanned++;
+
+        char wigle_status[16], wdgwars_status[16];
+        upload_state_get_status("wigle", entry->d_name, size, hash, wigle_status, sizeof(wigle_status));
+        upload_state_get_status("wdgwars", entry->d_name, size, hash, wdgwars_status, sizeof(wdgwars_status));
+
+        if (!wardrive_cleanup_status_matches(service, status, wigle_status, wdgwars_status)) {
+            continue;
+        }
+        matched++;
+
+        char target_path[512];
+        path_len = snprintf(target_path, sizeof(target_path), "%s/%s", target_dir, entry->d_name);
+        if (path_len <= 0 || path_len >= (int)sizeof(target_path)) {
+            failed++;
+            printf("[WARD_CLEANUP] filename=%s size=%ld hash=%08lX wigle=%s wdgwars=%s action=failed reason=target_path_too_long\n",
+                   entry->d_name, size, (unsigned long)hash, wigle_status, wdgwars_status);
+            continue;
+        }
+
+        if (!do_move) {
+            printf("[WARD_CLEANUP] filename=%s size=%ld hash=%08lX wigle=%s wdgwars=%s action=would_move target=%s\n",
+                   entry->d_name, size, (unsigned long)hash, wigle_status, wdgwars_status, target_path);
+            continue;
+        }
+
+        if (rename(filepath, target_path) == 0) {
+            moved++;
+            printf("[WARD_CLEANUP] filename=%s size=%ld hash=%08lX wigle=%s wdgwars=%s action=moved target=%s\n",
+                   entry->d_name, size, (unsigned long)hash, wigle_status, wdgwars_status, target_path);
+        } else {
+            failed++;
+            printf("[WARD_CLEANUP] filename=%s size=%ld hash=%08lX wigle=%s wdgwars=%s action=failed errno=%d target=%s\n",
+                   entry->d_name, size, (unsigned long)hash, wigle_status, wdgwars_status, errno, target_path);
+        }
+    }
+
+    closedir(dir);
+    if (do_move && moved > 0) {
+        sd_sync();
+    }
+
+    printf("[WARD_CLEANUP] SUMMARY scanned=%d matched=%d moved=%d failed=%d dry_run=%d\n",
+           scanned, matched, moved, failed, do_move ? 0 : 1);
+    printf("[WARD_CLEANUP] END\n");
+    return failed > 0 ? 1 : 0;
+}
+
+static int cmd_wardrive_fix(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: wardrive_fix <file>");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char filepath[280];
+    char upload_name[128];
+    if (!wdgwars_resolve_upload_target(argv[1], filepath, sizeof(filepath), upload_name, sizeof(upload_name)) &&
+        !wigle_resolve_upload_target(argv[1], filepath, sizeof(filepath), upload_name, sizeof(upload_name))) {
+        MY_LOG_INFO(TAG, "wardrive_fix: invalid/missing file: %s", argv[1]);
+        return 1;
+    }
+
+    char fixed_path[280];
+    wdgwars_wigle_stats_t stats;
+    printf("[WARD_FIX] BEGIN\n");
+    if (!wardrive_fix_file_soft(filepath, upload_name, fixed_path, sizeof(fixed_path), &stats)) {
+        printf("[WARD_FIX] filename=%s status=failed\n", upload_name);
+        printf("[WARD_FIX] END\n");
+        return 1;
+    }
+
+    const char *fixed_name = wigle_basename(fixed_path);
+    long fixed_size = 0;
+    uint32_t fixed_hash = 0;
+    wardrive_collect_file_id(fixed_path, &fixed_size, &fixed_hash);
+
+    printf("[WARD_FIX] filename=%s output=%s size=%ld hash=%08lX kept=%d dropped=%d wifi=%d ble=%d bt=%d bad=%d status=ok\n",
+           upload_name, fixed_name ? fixed_name : fixed_path,
+           fixed_size, (unsigned long)fixed_hash,
+           stats.data_rows, stats.bad_rows,
+           stats.wifi_rows, stats.ble_rows, stats.bt_rows, stats.bad_rows);
+    printf("[WARD_FIX] END\n");
+    return 0;
 }
 
 static int cmd_wpasec_key(int argc, char **argv) {
@@ -8374,9 +9224,10 @@ static int cmd_wigle_upload(int argc, char **argv) {
     int skipped = 0;
     int failed = 0;
     bool auth_failed = false;
+    bool force_all = (argc > 1 && strcasecmp(argv[1], "all") == 0);
 
     // If files are passed as args, upload only those selected files.
-    if (argc > 1) {
+    if (argc > 1 && !force_all) {
         int total_files = argc - 1;
         MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to api.wigle.net...", total_files);
 
@@ -8397,11 +9248,39 @@ static int cmd_wigle_upload(int argc, char **argv) {
                 fsize = (long)st.st_size;
             }
 
-            int result = wigle_upload_file(filepath, upload_name);
+            uint32_t hash = 0;
+            if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", i, total_files, upload_name);
+                failed++;
+                continue;
+            }
+
+            wdgwars_wigle_stats_t wigle_stats;
+            bool use_sanitized = false;
+            if (!wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", i, total_files, upload_name, fsize);
+                failed++;
+                continue;
+            }
+
+            if (upload_state_is_done("wigle", upload_name, fsize, hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
+                skipped++;
+                if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+                continue;
+            }
+
+            const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
+            int result = wigle_upload_file(upload_path, upload_name);
+            if (use_sanitized) {
+                unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+            }
             if (result == 0) {
+                upload_state_append("wigle", upload_name, fsize, hash, "done", &wigle_stats);
                 MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
                 uploaded++;
             } else if (result == 1) {
+                upload_state_append("wigle", upload_name, fsize, hash, "done", &wigle_stats);
                 MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (duplicate)", i, total_files, upload_name, fsize);
                 skipped++;
             } else if (result == 2) {
@@ -8411,6 +9290,7 @@ static int cmd_wigle_upload(int argc, char **argv) {
                 auth_failed = true;
                 break;
             } else {
+                upload_state_append("wigle", upload_name, fsize, hash, "failed", &wigle_stats);
                 MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", i, total_files, upload_name, fsize);
                 failed++;
             }
@@ -8449,7 +9329,8 @@ static int cmd_wigle_upload(int argc, char **argv) {
         return 0;
     }
 
-    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to api.wigle.net...", total_files);
+    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to api.wigle.net%s...", total_files,
+                force_all ? " (force all)" : "");
 
     rewinddir(dir);
     int current = 0;
@@ -8472,11 +9353,39 @@ static int cmd_wigle_upload(int argc, char **argv) {
             fsize = (long)st.st_size;
         }
 
-        int result = wigle_upload_file(filepath, entry->d_name);
+        uint32_t hash = 0;
+        if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", current, total_files, entry->d_name);
+            failed++;
+            continue;
+        }
+
+        wdgwars_wigle_stats_t wigle_stats;
+        bool use_sanitized = false;
+        if (!wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", current, total_files, entry->d_name, fsize);
+            failed++;
+            continue;
+        }
+
+        if (!force_all && upload_state_is_done("wigle", entry->d_name, fsize, hash)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
+            skipped++;
+            if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+            continue;
+        }
+
+        const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
+        int result = wigle_upload_file(upload_path, entry->d_name);
+        if (use_sanitized) {
+            unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+        }
         if (result == 0) {
+            upload_state_append("wigle", entry->d_name, fsize, hash, "done", &wigle_stats);
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
             uploaded++;
         } else if (result == 1) {
+            upload_state_append("wigle", entry->d_name, fsize, hash, "done", &wigle_stats);
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (duplicate)", current, total_files, entry->d_name, fsize);
             skipped++;
         } else if (result == 2) {
@@ -8486,6 +9395,7 @@ static int cmd_wigle_upload(int argc, char **argv) {
             auth_failed = true;
             break;
         } else {
+            upload_state_append("wigle", entry->d_name, fsize, hash, "failed", &wigle_stats);
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
             failed++;
         }
@@ -8502,8 +9412,213 @@ static int cmd_wigle_upload(int argc, char **argv) {
     return (failed > 0) ? 1 : 0;
 }
 
+static int wdgwars_parse_retry_after_ms(const char *resp) {
+    if (!resp) {
+        return 0;
+    }
+
+    const char *p = strcasestr(resp, "Retry-After:");
+    if (!p) {
+        return 0;
+    }
+    p += strlen("Retry-After:");
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    int seconds = atoi(p);
+    if (seconds <= 0) {
+        return 0;
+    }
+    if (seconds > 3600) {
+        seconds = 3600;
+    }
+    return seconds * 1000;
+}
+
+static int wdgwars_next_backoff_ms(int retry_after_ms) {
+    if (retry_after_ms > 0) {
+        return retry_after_ms;
+    }
+
+    int shift = wdgwars_rate_limit_streak;
+    if (shift < 0) shift = 0;
+    if (shift > 3) shift = 3;
+    int backoff = WDGWARS_BACKOFF_BASE_MS << shift;
+    if (backoff > WDGWARS_BACKOFF_MAX_MS) {
+        backoff = WDGWARS_BACKOFF_MAX_MS;
+    }
+    backoff += (int)((esp_timer_get_time() / 1000) % 5000); // small deterministic jitter
+    return backoff;
+}
+
+static void wdgwars_note_rate_limited(int retry_after_ms) {
+    wdgwars_rate_limit_streak++;
+    int backoff_ms = wdgwars_next_backoff_ms(retry_after_ms);
+    wdgwars_circuit_open_until_us = esp_timer_get_time() + ((int64_t)backoff_ms * 1000LL);
+    MY_LOG_INFO(TAG, "WDGWars rate limited (HTTP 429). Circuit open for %d s.",
+                (backoff_ms + 999) / 1000);
+}
+
+static void wdgwars_note_success(void) {
+    wdgwars_rate_limit_streak = 0;
+    wdgwars_circuit_open_until_us = 0;
+}
+
+static bool wdgwars_circuit_allows_request(void) {
+    int64_t now = esp_timer_get_time();
+    if (wdgwars_circuit_open_until_us > now) {
+        int wait_s = (int)((wdgwars_circuit_open_until_us - now + 999999LL) / 1000000LL);
+        MY_LOG_INFO(TAG, "WDGWars circuit open, retry after %d s", wait_s);
+        return false;
+    }
+    return true;
+}
+
+static int wdgwars_poll_upload_job(int job_id) {
+    const size_t REQ_BUF_SZ = 384;
+    const size_t RESP_BUF_SZ = 1536;
+    int result = -1;
+    esp_tls_t *tls = NULL;
+    char *req_buf = NULL;
+    char *resp_buf = NULL;
+
+    req_buf = (char *)heap_caps_malloc(REQ_BUF_SZ, MALLOC_CAP_8BIT);
+    resp_buf = (char *)heap_caps_malloc(RESP_BUF_SZ, MALLOC_CAP_8BIT);
+    if (!req_buf || !resp_buf) {
+        MY_LOG_INFO(TAG, "  Poll buffer allocation failed");
+        goto cleanup;
+    }
+
+    for (int attempt = 0; attempt < 90; attempt++) {
+        char url[128];
+        snprintf(url, sizeof(url), "%s%d", WDGWARS_V2_JOB_URL_BASE, job_id);
+
+        int req_len = snprintf(req_buf, REQ_BUF_SZ,
+                               "GET /api/v2/upload-job/%d HTTP/1.1\r\n"
+                               "Host: wdgwars.pl\r\n"
+                               "X-API-Key: %s\r\n"
+                               "User-Agent: projectZero-wdgwars\r\n"
+                               "Connection: close\r\n"
+                               "\r\n",
+                               job_id, wdgwars_api_key);
+        if (req_len <= 0 || req_len >= (int)REQ_BUF_SZ) {
+            MY_LOG_INFO(TAG, "  Failed to build poll request");
+            goto cleanup;
+        }
+
+        esp_tls_cfg_t tls_cfg = { .crt_bundle_attach = NULL, .timeout_ms = 15000 };
+        tls = esp_tls_init();
+        if (!tls) {
+            MY_LOG_INFO(TAG, "  Poll TLS init failed");
+            goto cleanup;
+        }
+        if (esp_tls_conn_http_new_sync(url, &tls_cfg, tls) < 0) {
+            MY_LOG_INFO(TAG, "  Poll TLS connection failed");
+            goto cleanup;
+        }
+        if (wpasec_tls_write_all(tls, req_buf, req_len) < 0) {
+            MY_LOG_INFO(TAG, "  Failed to send poll request");
+            goto cleanup;
+        }
+
+        memset(resp_buf, 0, RESP_BUF_SZ);
+        int total_read = 0;
+        while (total_read < (int)RESP_BUF_SZ - 1) {
+            int ret = esp_tls_conn_read(tls, resp_buf + total_read, RESP_BUF_SZ - 1 - total_read);
+            if (ret <= 0) break;
+            total_read += ret;
+        }
+        resp_buf[total_read] = '\0';
+        esp_tls_conn_destroy(tls);
+        tls = NULL;
+
+        int http_status = 0;
+        if (total_read > 12 && strncmp(resp_buf, "HTTP/", 5) == 0) {
+            const char *sp = strchr(resp_buf, ' ');
+            if (sp) {
+                http_status = atoi(sp + 1);
+            }
+        }
+        if (http_status == 401 || http_status == 403) {
+            result = 2;
+            goto cleanup;
+        }
+        if (http_status == 429) {
+            wdgwars_note_rate_limited(wdgwars_parse_retry_after_ms(resp_buf));
+            result = WDGWARS_RESULT_RATE_LIMITED;
+            goto cleanup;
+        }
+        if (http_status != 200) {
+            MY_LOG_INFO(TAG, "  Poll HTTP error %d", http_status);
+            goto cleanup;
+        }
+
+        const char *json = strchr(resp_buf, '{');
+        if (!json) {
+            MY_LOG_INFO(TAG, "  Poll response missing JSON");
+            goto cleanup;
+        }
+
+        if (strstr(json, "\"status\":\"done\"") ||
+            strstr(json, "\"status\": \"done\"")) {
+            result = 0;
+            goto cleanup;
+        }
+        if (strstr(json, "\"status\":\"failed\"") ||
+            strstr(json, "\"status\": \"failed\"")) {
+            MY_LOG_INFO(TAG, "  WDGWars job failed");
+            goto cleanup;
+        }
+
+        cJSON *root = cJSON_Parse(json);
+        if (!root) {
+            MY_LOG_INFO(TAG, "  Poll JSON parse failed");
+            goto cleanup;
+        }
+
+        cJSON *status = cJSON_GetObjectItem(root, "status");
+        if (cJSON_IsString(status) && status->valuestring) {
+            if (strcmp(status->valuestring, "done") == 0) {
+                cJSON_Delete(root);
+                result = 0;
+                goto cleanup;
+            }
+            if (strcmp(status->valuestring, "failed") == 0) {
+                cJSON *err = cJSON_GetObjectItem(root, "error");
+                if (cJSON_IsString(err) && err->valuestring) {
+                    MY_LOG_INFO(TAG, "  WDGWars job failed: %s", err->valuestring);
+                } else {
+                    MY_LOG_INFO(TAG, "  WDGWars job failed");
+                }
+                cJSON_Delete(root);
+                goto cleanup;
+            }
+        }
+        cJSON_Delete(root);
+
+        if ((attempt % 5) == 0) {
+            MY_LOG_INFO(TAG, "  WDGWars job %d pending...", job_id);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    MY_LOG_INFO(TAG, "  WDGWars job %d poll timeout", job_id);
+
+cleanup:
+    if (tls) {
+        esp_tls_conn_destroy(tls);
+    }
+    if (req_buf) {
+        free(req_buf);
+    }
+    if (resp_buf) {
+        free(resp_buf);
+    }
+    return result;
+}
+
 /**
- * @brief Upload a single Wardrive file (.log/.csv) to wdgwars.pl
+ * @brief Upload a single Wardrive file (.log/.csv/.gz) to wdgwars.pl v2 queue
  *
  * @return 0 on success, 1 on duplicate/skipped, 2 on auth error, -1 on error
  */
@@ -8527,7 +9642,7 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (file_size <= 0 || file_size > 16L * 1024L * 1024L) {
+    if (file_size <= 0 || file_size > WDGWARS_MAX_UPLOAD_BYTES) {
         MY_LOG_INFO(TAG, "  Invalid file size: %ld bytes", file_size);
         goto cleanup;
     }
@@ -8539,6 +9654,8 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
     size_t name_len = strlen(filename);
     if (name_len >= 4 && strcasecmp(filename + name_len - 4, ".log") == 0) {
         content_type = "text/plain";
+    } else if (name_len >= 3 && strcasecmp(filename + name_len - 3, ".gz") == 0) {
+        content_type = "application/gzip";
     }
 
     char body_start[256];
@@ -8578,7 +9695,7 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
     }
 
     int hdr_len = snprintf(http_headers, HDR_BUF_SZ,
-                           "POST /api/upload-csv HTTP/1.1\r\n"
+                           "POST /api/v2/upload-csv HTTP/1.1\r\n"
                            "Host: wdgwars.pl\r\n"
                            "X-API-Key: %s\r\n"
                            "Content-Type: multipart/form-data; boundary=%s\r\n"
@@ -8603,7 +9720,7 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
         goto cleanup;
     }
 
-    int ret = esp_tls_conn_http_new_sync(WDGWARS_URL, &tls_cfg, tls);
+    int ret = esp_tls_conn_http_new_sync(WDGWARS_V2_URL, &tls_cfg, tls);
     if (ret < 0) {
         MY_LOG_INFO(TAG, "  TLS connection failed");
         goto cleanup;
@@ -8654,18 +9771,46 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
         }
     }
 
-    bool duplicate = (strstr(resp_buf, "already") != NULL ||
-                      strstr(resp_buf, "Already") != NULL ||
-                      strstr(resp_buf, "duplicate") != NULL ||
-                      strstr(resp_buf, "Duplicate") != NULL);
-
-    if (status == 200 || status == 201 || status == 202) {
-        result = duplicate ? 1 : 0;
+    if (status == 401 || status == 403) {
+        result = 2;
+        goto cleanup;
+    }
+    if (status == 429) {
+        wdgwars_note_rate_limited(wdgwars_parse_retry_after_ms(resp_buf));
+        result = WDGWARS_RESULT_RATE_LIMITED;
         goto cleanup;
     }
 
-    if (status == 401 || status == 403) {
-        result = 2;
+    if (status == 200 || status == 201 || status == 202) {
+        const char *json = strchr(resp_buf, '{');
+        if (!json) {
+            result = 0;
+            goto cleanup;
+        }
+
+        cJSON *root = cJSON_Parse(json);
+        if (!root) {
+            MY_LOG_INFO(TAG, "  WDGWars response JSON parse failed");
+            goto cleanup;
+        }
+
+        cJSON *job_id = cJSON_GetObjectItem(root, "job_id");
+        if (cJSON_IsNumber(job_id)) {
+            int id = job_id->valueint;
+            cJSON_Delete(root);
+            MY_LOG_INFO(TAG, "  WDGWars job %d queued", id);
+            result = wdgwars_poll_upload_job(id);
+            goto cleanup;
+        }
+
+        cJSON *ok = cJSON_GetObjectItem(root, "ok");
+        if (cJSON_IsBool(ok) && cJSON_IsTrue(ok)) {
+            result = 0;
+        } else {
+            MY_LOG_INFO(TAG, "  WDGWars response missing job_id");
+            result = -1;
+        }
+        cJSON_Delete(root);
         goto cleanup;
     }
     if (status == 409) {
@@ -8737,12 +9882,49 @@ static int cmd_wdgwars_key(int argc, char **argv) {
     return 0;
 }
 
+static void wdgwars_log_history_result(cJSON *entry) {
+    if (!entry) {
+        return;
+    }
+
+    cJSON *endpoint = cJSON_GetObjectItem(entry, "endpoint");
+    cJSON *file_size = cJSON_GetObjectItem(entry, "file_size");
+    cJSON *created_at = cJSON_GetObjectItem(entry, "created_at");
+    cJSON *result = cJSON_GetObjectItem(entry, "result");
+
+    const char *endpoint_str = (cJSON_IsString(endpoint) && endpoint->valuestring) ? endpoint->valuestring : "unknown";
+    const char *created_str = (cJSON_IsString(created_at) && created_at->valuestring) ? created_at->valuestring : "unknown";
+    int size_val = cJSON_IsNumber(file_size) ? file_size->valueint : -1;
+
+    MY_LOG_INFO(TAG, "  Upload history: endpoint=%s size=%d at=%s",
+                endpoint_str, size_val, created_str);
+
+    if (cJSON_IsObject(result)) {
+        cJSON *imported = cJSON_GetObjectItem(result, "imported");
+        cJSON *captured = cJSON_GetObjectItem(result, "captured");
+        cJSON *updated = cJSON_GetObjectItem(result, "updated");
+        cJSON *duplicates = cJSON_GetObjectItem(result, "duplicates");
+        cJSON *no_gps = cJSON_GetObjectItem(result, "no_gps");
+        cJSON *bad_rows = cJSON_GetObjectItem(result, "bad_rows");
+        cJSON *cooldown = cJSON_GetObjectItem(result, "cooldown");
+
+        MY_LOG_INFO(TAG, "  Result: imported=%d captured=%d updated=%d duplicates=%d no_gps=%d bad_rows=%d cooldown=%d",
+                    cJSON_IsNumber(imported) ? imported->valueint : 0,
+                    cJSON_IsNumber(captured) ? captured->valueint : 0,
+                    cJSON_IsNumber(updated) ? updated->valueint : 0,
+                    cJSON_IsNumber(duplicates) ? duplicates->valueint : 0,
+                    cJSON_IsNumber(no_gps) ? no_gps->valueint : 0,
+                    cJSON_IsNumber(bad_rows) ? bad_rows->valueint : 0,
+                    cJSON_IsNumber(cooldown) ? cooldown->valueint : 0);
+    }
+}
+
 /**
- * @brief Query upload history and check if filename appears in the last 5 uploads.
+ * @brief Query upload history and check if filename appears in the last uploads.
  * @return true if found (upload confirmed), false otherwise
  */
 static bool wdgwars_check_in_history(const char *filename) {
-    const size_t RESP_BUF_SZ = 2048;
+    const size_t RESP_BUF_SZ = 4096;
     bool found = false;
     esp_tls_t *tls = NULL;
     char *resp_buf = NULL;
@@ -8794,6 +9976,7 @@ static bool wdgwars_check_in_history(const char *filename) {
             if (cJSON_IsString(fn) && fn->valuestring &&
                 strcmp(fn->valuestring, filename) == 0) {
                 found = true;
+                wdgwars_log_history_result(entry);
             }
         }
     }
@@ -8807,7 +9990,22 @@ hist_cleanup:
 }
 
 static int wdgwars_upload_file_with_retry(const char *filepath, const char *filename) {
+    if (!wdgwars_circuit_allows_request()) {
+        return WDGWARS_RESULT_RATE_LIMITED;
+    }
+
     int result = wdgwars_upload_file(filepath, filename);
+    if (result == WDGWARS_RESULT_RATE_LIMITED) {
+        return result;
+    }
+    if (result == 0) {
+        wdgwars_note_success();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (wdgwars_check_in_history(filename)) {
+            MY_LOG_INFO(TAG, "  Upload confirmed via history");
+        }
+        return 0;
+    }
     if (result != -1) return result;
 
     // HTTP error (likely timeout reading response) — verify via history before retrying
@@ -8820,11 +10018,21 @@ static int wdgwars_upload_file_with_retry(const char *filepath, const char *file
 
     // Not in history yet — try once more
     MY_LOG_INFO(TAG, "  Not found in history, retrying upload...");
+    if (!wdgwars_circuit_allows_request()) {
+        return WDGWARS_RESULT_RATE_LIMITED;
+    }
     result = wdgwars_upload_file(filepath, filename);
+    if (result == WDGWARS_RESULT_RATE_LIMITED) {
+        return result;
+    }
     if (result == 1) {
         // Duplicate on retry = first attempt landed after all
+        wdgwars_note_success();
         MY_LOG_INFO(TAG, "  Upload confirmed (duplicate on retry)");
         return 0;
+    }
+    if (result == 0) {
+        wdgwars_note_success();
     }
     return result;
 }
@@ -8845,6 +10053,10 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
         return 1;
     }
 
+    if (!wdgwars_circuit_allows_request()) {
+        return 0;
+    }
+
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
@@ -8854,9 +10066,11 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
     int uploaded = 0;
     int skipped = 0;
     int failed = 0;
+    int rate_limited = 0;
     bool auth_failed = false;
+    bool force_all = (argc > 1 && strcasecmp(argv[1], "all") == 0);
 
-    if (argc > 1) {
+    if (argc > 1 && !force_all) {
         int total_files = argc - 1;
         MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to wdgwars.pl...", total_files);
 
@@ -8877,28 +10091,65 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
                 fsize = (long)st.st_size;
             }
 
-            int result = wdgwars_upload_file_with_retry(filepath, upload_name);
-            if (result == 0) {
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
-                uploaded++;
-            } else if (result == 1) {
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped", i, total_files, upload_name, fsize);
-                skipped++;
-            } else if (result == 2) {
-                MY_LOG_INFO(TAG, "WDGWARS AUTH FAILED");
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", i, total_files, upload_name, fsize);
+            wdgwars_wigle_stats_t wigle_stats;
+            bool use_sanitized = false;
+            uint32_t hash = 0;
+            if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", i, total_files, upload_name);
                 failed++;
-                auth_failed = true;
-                break;
+                continue;
+            }
+
+            if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
+                if (upload_state_is_done("wdgwars", upload_name, fsize, hash)) {
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
+                    skipped++;
+                    if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+                    continue;
+                }
+
+                const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
+                if (use_sanitized && stat(upload_path, &st) == 0) {
+                    /* Keep fsize/hash from the original file for upload_state identity. */
+                }
+
+                int result = wdgwars_upload_file_with_retry(upload_path, upload_name);
+                if (use_sanitized) {
+                    unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+                }
+                if (result == 0) {
+                    upload_state_append("wdgwars", upload_name, fsize, hash, "done", &wigle_stats);
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
+                    uploaded++;
+                } else if (result == 1) {
+                    upload_state_append("wdgwars", upload_name, fsize, hash, "done", &wigle_stats);
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped", i, total_files, upload_name, fsize);
+                    skipped++;
+                } else if (result == 2) {
+                    MY_LOG_INFO(TAG, "WDGWARS AUTH FAILED");
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", i, total_files, upload_name, fsize);
+                    failed++;
+                    auth_failed = true;
+                    break;
+                } else if (result == WDGWARS_RESULT_RATE_LIMITED) {
+                    upload_state_append("wdgwars", upload_name, fsize, hash, "rate_limited", &wigle_stats);
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> RATE LIMITED", i, total_files, upload_name, fsize);
+                    rate_limited++;
+                    break;
+                } else {
+                    upload_state_append("wdgwars", upload_name, fsize, hash, "failed", &wigle_stats);
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", i, total_files, upload_name, fsize);
+                    failed++;
+                }
             } else {
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", i, total_files, upload_name, fsize);
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", i, total_files, upload_name, fsize);
                 failed++;
             }
 
             vTaskDelay(pdMS_TO_TICKS(250));
         }
 
-        MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+        MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed, %d rate_limited", uploaded, skipped, failed, rate_limited);
         if (auth_failed) {
             return 1;
         }
@@ -8923,13 +10174,14 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
     }
 
     if (total_files == 0) {
-        MY_LOG_INFO(TAG, "No Wardrive files (.log/.csv) found in /sdcard/lab/wardrives/");
+        MY_LOG_INFO(TAG, "No Wardrive files (.log/.csv/.gz) found in /sdcard/lab/wardrives/");
         MY_LOG_INFO(TAG, "Done: 0 uploaded, 0 skipped, 0 failed");
         closedir(dir);
         return 0;
     }
 
-    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to wdgwars.pl...", total_files);
+    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to wdgwars.pl%s...", total_files,
+                force_all ? " (force all)" : "");
 
     rewinddir(dir);
     int current = 0;
@@ -8952,21 +10204,58 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
             fsize = (long)st.st_size;
         }
 
-        int result = wdgwars_upload_file_with_retry(filepath, entry->d_name);
-        if (result == 0) {
-            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
-            uploaded++;
-        } else if (result == 1) {
-            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped", current, total_files, entry->d_name, fsize);
-            skipped++;
-        } else if (result == 2) {
-            MY_LOG_INFO(TAG, "WDGWARS AUTH FAILED");
-            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", current, total_files, entry->d_name, fsize);
+        wdgwars_wigle_stats_t wigle_stats;
+        bool use_sanitized = false;
+        uint32_t hash = 0;
+        if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", current, total_files, entry->d_name);
             failed++;
-            auth_failed = true;
-            break;
+            continue;
+        }
+
+        if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
+            if (!force_all && upload_state_is_done("wdgwars", entry->d_name, fsize, hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
+                skipped++;
+                if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+                continue;
+            }
+
+            const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
+            if (use_sanitized && stat(upload_path, &st) == 0) {
+                /* Keep fsize/hash from the original file for upload_state identity. */
+            }
+
+            int result = wdgwars_upload_file_with_retry(upload_path, entry->d_name);
+            if (use_sanitized) {
+                unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+            }
+            if (result == 0) {
+                upload_state_append("wdgwars", entry->d_name, fsize, hash, "done", &wigle_stats);
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
+                uploaded++;
+            } else if (result == 1) {
+                upload_state_append("wdgwars", entry->d_name, fsize, hash, "done", &wigle_stats);
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped", current, total_files, entry->d_name, fsize);
+                skipped++;
+            } else if (result == 2) {
+                MY_LOG_INFO(TAG, "WDGWARS AUTH FAILED");
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", current, total_files, entry->d_name, fsize);
+                failed++;
+                auth_failed = true;
+                break;
+            } else if (result == WDGWARS_RESULT_RATE_LIMITED) {
+                upload_state_append("wdgwars", entry->d_name, fsize, hash, "rate_limited", &wigle_stats);
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> RATE LIMITED", current, total_files, entry->d_name, fsize);
+                rate_limited++;
+                break;
+            } else {
+                upload_state_append("wdgwars", entry->d_name, fsize, hash, "failed", &wigle_stats);
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
+                failed++;
+            }
         } else {
-            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", current, total_files, entry->d_name, fsize);
             failed++;
         }
 
@@ -8975,7 +10264,7 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
 
     closedir(dir);
 
-    MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+    MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed, %d rate_limited", uploaded, skipped, failed, rate_limited);
     if (auth_failed) {
         return 1;
     }
@@ -10595,7 +11884,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "boot_button", " read|list|set <short|long> <command[, command...]> | status <short|long> <on|off>" },
     { "led", " set <on|off> | level <1-100> | read" },
     { "channel_time", " set <min|max> <ms> | read <min|max>" },
-    { "wifi_connect", " <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
+    { "wifi_connect", " <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
     { "ota_channel", " [main|dev]" },
     { "ota_boot", " <ota_0|ota_1>" },
     { "arp_ban", " <MAC> [IP]" },
@@ -10610,6 +11899,10 @@ static const cli_hint_t k_cli_hints[] = {
     { "wigle_upload", " [file1 file2 ...]" },
     { "wdgwars_key", " set <key> | read" },
     { "wdgwars_upload", " [file1 file2 ...]" },
+    { "upload_state", "" },
+    { "wardrive_files", "" },
+    { "wardrive_cleanup", " <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]" },
+    { "wardrive_fix", " <file>" },
     { "add_ssid", " <SSID>" },
     { "remove_ssid", " <index>" },
 };
@@ -10627,8 +11920,8 @@ static const char *lookup_cli_hint(const char *command) {
 }
 
 static const char *wifi_connect_dynamic_hint(const char *buf, int *color, int *bold) {
-    static const char *hint_ssid = " <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
-    static const char *hint_pass = " [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_ssid = " <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_pass = " [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_optional = " [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_ip_optional = " [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_mask = " <Netmask> <GW> [DNS1] [DNS2]";
@@ -10800,17 +12093,150 @@ static int cmd_wifi_disconnect(int argc, char **argv) {
     return 0;
 }
 
+static bool csv_get_quoted_field(const char *line, int wanted_idx, char *out, size_t out_sz) {
+    if (!line || !out || out_sz == 0 || wanted_idx < 0) {
+        return false;
+    }
+
+    int idx = 0;
+    const char *p = line;
+    while (*p) {
+        while (*p && *p != '"') {
+            p++;
+        }
+        if (*p != '"') {
+            return false;
+        }
+        p++;
+
+        char tmp[128];
+        size_t pos = 0;
+        while (*p) {
+            if (*p == '"') {
+                if (p[1] == '"') {
+                    if (pos < sizeof(tmp) - 1) {
+                        tmp[pos++] = '"';
+                    }
+                    p += 2;
+                    continue;
+                }
+                p++;
+                break;
+            }
+            if (pos < sizeof(tmp) - 1) {
+                tmp[pos++] = *p;
+            }
+            p++;
+        }
+        tmp[pos] = '\0';
+
+        if (idx == wanted_idx) {
+            snprintf(out, out_sz, "%s", tmp);
+            return true;
+        }
+        idx++;
+    }
+    return false;
+}
+
+static bool wifi_lookup_eviltwin_password(const char *ssid, char *out, size_t out_sz) {
+    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "r");
+    if (!file) {
+        return false;
+    }
+
+    bool found = false;
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        char saved_ssid[64];
+        char saved_pass[96];
+        if (csv_get_quoted_field(line, 0, saved_ssid, sizeof(saved_ssid)) &&
+            csv_get_quoted_field(line, 1, saved_pass, sizeof(saved_pass)) &&
+            strcmp(saved_ssid, ssid) == 0 && saved_pass[0] != '\0') {
+            snprintf(out, out_sz, "%s", saved_pass);
+            found = true;
+        }
+    }
+    fclose(file);
+    return found;
+}
+
+static bool wifi_lookup_portal_password(const char *ssid, char *out, size_t out_sz) {
+    FILE *file = fopen("/sdcard/lab/portals.txt", "r");
+    if (!file) {
+        return false;
+    }
+
+    bool found = false;
+    char line[384];
+    while (fgets(line, sizeof(line), file)) {
+        char saved_ssid[64];
+        if (!csv_get_quoted_field(line, 0, saved_ssid, sizeof(saved_ssid)) ||
+            strcmp(saved_ssid, ssid) != 0) {
+            continue;
+        }
+
+        for (int i = 1; i < 12; i++) {
+            char field[128];
+            if (!csv_get_quoted_field(line, i, field, sizeof(field))) {
+                break;
+            }
+            char *eq = strchr(field, '=');
+            if (!eq) {
+                continue;
+            }
+            *eq = '\0';
+            const char *key = field;
+            const char *val = eq + 1;
+            if ((strcasecmp(key, "password") == 0 ||
+                 strcasecmp(key, "pass") == 0 ||
+                 strcasecmp(key, "wifi_password") == 0) &&
+                val[0] != '\0') {
+                snprintf(out, out_sz, "%s", val);
+                found = true;
+            }
+        }
+    }
+    fclose(file);
+    return found;
+}
+
+static bool wifi_lookup_known_password(const char *ssid, char *out, size_t out_sz) {
+    if (!ssid || !out || out_sz == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        return false;
+    }
+
+    if (wifi_lookup_eviltwin_password(ssid, out, out_sz)) {
+        MY_LOG_INFO(TAG, "wifi_connect: using saved password from eviltwin.txt for '%s'", ssid);
+        return true;
+    }
+    if (wifi_lookup_portal_password(ssid, out, out_sz)) {
+        MY_LOG_INFO(TAG, "wifi_connect: using saved password from portals.txt for '%s'", ssid);
+        return true;
+    }
+    return false;
+}
+
 static int cmd_wifi_connect(int argc, char **argv) {
     oled_display_update_full("> WiFi Connect",
         argc >= 2 ? argv[1] : "  No SSID",
         "  STA Mode", "  Connecting...");
     if (argc < 2 || argc > 9) {
-        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
     }
     
     const char *ssid = argv[1];
-    const char *password = (argc >= 3) ? argv[2] : "";
+    char saved_password[65] = "";
+    bool use_saved_password = (argc >= 3 && strcasecmp(argv[2], "--saved") == 0);
+    bool explicit_password = (argc >= 3 && !use_saved_password && strcasecmp(argv[2], "ota") != 0);
+    const char *password = explicit_password ? argv[2] : "";
     bool ota_after_connect = false;
     bool use_static_ip = false;
     esp_ip4_addr_t static_ip = { 0 };
@@ -10821,7 +12247,16 @@ static int cmd_wifi_connect(int argc, char **argv) {
     esp_ip4_addr_t static_dns1 = { 0 };
     esp_ip4_addr_t static_dns2 = { 0 };
 
-    int argi = (argc >= 3) ? 3 : 2;
+    if (use_saved_password) {
+        wifi_lookup_known_password(ssid, saved_password, sizeof(saved_password));
+        if (saved_password[0] != '\0') {
+            password = saved_password;
+        } else {
+            MY_LOG_INFO(TAG, "wifi_connect: no saved password found for '%s'", ssid);
+        }
+    }
+
+    int argi = (explicit_password || use_saved_password) ? 3 : 2;
     if (argc > argi && strcasecmp(argv[argi], "ota") == 0) {
         ota_after_connect = true;
         argi++;
@@ -10829,7 +12264,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
 
     int remaining = argc - argi;
     if (remaining != 0 && remaining != 3 && remaining != 4 && remaining != 5) {
-        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
     }
     if (remaining >= 3) {
@@ -10857,6 +12292,13 @@ static int cmd_wifi_connect(int argc, char **argv) {
     }
     
     MY_LOG_INFO(TAG, "Connecting to AP '%s'...", ssid);
+    if (password[0] != '\0') {
+        MY_LOG_INFO(TAG, "wifi_connect: password source=%s", explicit_password ? "argument" : "saved");
+    } else if (use_saved_password) {
+        MY_LOG_INFO(TAG, "wifi_connect: saved password requested but missing, trying open network");
+    } else {
+        MY_LOG_INFO(TAG, "wifi_connect: trying open network");
+    }
     
     // Reset WiFi (same as mode switching)
     esp_wifi_disconnect();
@@ -18457,7 +19899,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t wigle_upload_cmd = {
         .command = "wigle_upload",
-        .help = "Upload Wardrive files to WiGLE: wigle_upload [file1 file2 ...] (no args = upload all)",
+        .help = "Upload Wardrive files to WiGLE: wigle_upload [file1 file2 ...|all] (no args = pending only)",
         .hint = NULL,
         .func = &cmd_wigle_upload,
         .argtable = NULL
@@ -18475,12 +19917,48 @@ static void register_commands(void)
 
     const esp_console_cmd_t wdgwars_upload_cmd = {
         .command = "wdgwars_upload",
-        .help = "Upload Wardrive files to WDGWars: wdgwars_upload [file1 file2 ...] (no args = upload all)",
+        .help = "Upload Wardrive files to WDGWars: wdgwars_upload [file1 file2 ...|all] (no args = pending only)",
         .hint = NULL,
         .func = &cmd_wdgwars_upload,
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wdgwars_upload_cmd));
+
+    const esp_console_cmd_t upload_state_cmd = {
+        .command = "upload_state",
+        .help = "Print/clear local wardrive upload manifest: upload_state [clear]",
+        .hint = NULL,
+        .func = &cmd_upload_state,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&upload_state_cmd));
+
+    const esp_console_cmd_t wardrive_files_cmd = {
+        .command = "wardrive_files",
+        .help = "List wardrive files with local stats and upload status",
+        .hint = NULL,
+        .func = &cmd_wardrive_files,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_files_cmd));
+
+    const esp_console_cmd_t wardrive_cleanup_cmd = {
+        .command = "wardrive_cleanup",
+        .help = "Dry-run or move wardrive files by upload status: wardrive_cleanup <service> <status> [move]",
+        .hint = "<wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]",
+        .func = &cmd_wardrive_cleanup,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cleanup_cmd));
+
+    const esp_console_cmd_t wardrive_fix_cmd = {
+        .command = "wardrive_fix",
+        .help = "Create a soft-fixed WigleWifi copy: wardrive_fix <file>",
+        .hint = NULL,
+        .func = &cmd_wardrive_fix,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_fix_cmd));
 
        const esp_console_cmd_t sae_overflow_cmd = {
         .command = "sae_overflow",
@@ -18835,8 +20313,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t wifi_connect_cmd = {
         .command = "wifi_connect",
-        .help = "Connect to AP as STA: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
-        .hint = "<SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
+        .help = "Connect to AP as STA: wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
+        .hint = "<SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
         .func = &cmd_wifi_connect,
         .argtable = NULL
     };
@@ -19291,6 +20769,7 @@ void app_main(void) {
     esp_err_t sd_init_ret = init_sd_card();
     if (sd_init_ret == ESP_OK) {
         create_sd_directories();
+        upload_state_ensure_file();
         report_ssid_file_status();
         ensure_ssids_file();
         if (vendor_is_enabled()) {
@@ -21336,6 +22815,7 @@ static esp_err_t create_sd_directories(void) {
         "/sdcard/lab/htmls",
         "/sdcard/lab/handshakes",
         "/sdcard/lab/wardrives",
+        "/sdcard/lab/wardrives/uploaded",
         "/sdcard/lab/pcaps",
     };
     for (int i = 0; i < (int)(sizeof(dirs) / sizeof(dirs[0])); i++) {

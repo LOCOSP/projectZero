@@ -439,6 +439,7 @@ scan_networks → select_networks → list_sd → user picks HTML
 // For open networks, omit the password:
 wifi_connect <SSID>              // open network
 wifi_connect <SSID> <password>   // WPA/WPA2 network
+wifi_connect <SSID> --saved      // explicitly use saved password lookup
   → wait for "SUCCESS" / "FAILED" / "TIMEOUT"
 
 list_hosts
@@ -455,7 +456,7 @@ stop
 ### 3b. Connect-NMAP (Port Scan)
 
 ```
-wifi_connect <SSID> [password]
+wifi_connect <SSID> [password|--saved]
   → wait for "SUCCESS" / "FAILED" / "TIMEOUT"
 
 start_nmap [quick|medium|heavy] [IP]
@@ -491,6 +492,36 @@ start_wardrive   // or start_wardrive_promisc
   → stop
 ```
 
+Wardrive upload/status for GUI clients:
+```
+wardrive_files
+  → parse marker lines:
+    [WARD_FILE] filename=<file> size=<bytes> hash=<hex> wifi=<n> ble=<n> bt=<n> bad=<n> wigle=<pending|done|failed> wdgwars=<pending|done|failed|rate_limited>
+    [WARD_FILE] SUMMARY files=<n> bytes=<n> rows=<n> devices=<n> wifi=<n> ble=<n> bt=<n> bad=<n> wigle_ok=<n> wigle_pending=<n> wigle_failed=<n> wigle_rate_limited=<n> wdgwars_ok=<n> wdgwars_pending=<n> wdgwars_failed=<n> wdgwars_rate_limited=<n>
+
+upload_state
+  → parse marker lines:
+    [UPLOAD_STATE] service=<wigle|wdgwars> filename=<file> size=<bytes> hash=<hex> status=<done|failed|rate_limited> wifi=<n> ble=<n> bt=<n> bad=<n>
+
+wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited>
+  → dry-run only; parse marker lines:
+    [WARD_CLEANUP] filename=<file> size=<bytes> hash=<hex> wigle=<status> wdgwars=<status> action=would_move target=<path>
+    [WARD_CLEANUP] SUMMARY scanned=<n> matched=<n> moved=<n> failed=<n> dry_run=1
+wardrive_cleanup <service> <status> move
+  → moves matching files to /sdcard/lab/wardrives/uploaded/<service>/<status>/
+  → use only after user confirmation; "all done" requires both services to be done
+
+wardrive_fix <file>
+  → creates <file>.fixed.log without changing the original
+  → parse marker lines:
+    [WARD_FIX] filename=<file> output=<fixed-file> size=<bytes> hash=<hex> kept=<n> dropped=<n> wifi=<n> ble=<n> bt=<n> bad=<n> status=<ok|failed>
+
+wigle_upload        // pending only according to upload_state.csv
+wdgwars_upload      // pending only according to upload_state.csv
+wigle_upload all    // force retry all local files
+wdgwars_upload all  // force retry all local files
+```
+
 ### 6. Beacon Spam from SSID File
 
 ```
@@ -518,7 +549,7 @@ start_pcap radio
   → stop → "PCAP saved: ... (N frames, M drops)"
 
 // Net mode (requires WiFi connection):
-wifi_connect <SSID> [password]
+wifi_connect <SSID> [password|--saved]
   → wait for "SUCCESS"
 start_pcap net
   → wait for "PCAP net capture started -> ..."

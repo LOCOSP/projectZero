@@ -326,11 +326,12 @@ Connect to 'MojaSiec' WiFi network to access the portal
 ## WiFi Connection (STA Mode)
 
 ### `wifi_connect`
-- **Syntax**: `wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]`
-- **Description**: Connects to an AP as STA. Password is optional -- omit it for open (no-password) networks. Optional static IP config.
+- **Syntax**: `wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]`
+- **Description**: Connects to an AP as STA. If password is omitted, firmware tries open auth. Use `--saved` to explicitly load a saved password from `/sdcard/lab/eviltwin.txt` or `/sdcard/lab/portals.txt`. Optional static IP config.
 - **Examples**:
   - WPA2 network: `wifi_connect AX4 ruletka2022`
   - Open network: `wifi_connect BRW`
+  - Saved password: `wifi_connect AX4 --saved`
   - With OTA: `wifi_connect AX4 ruletka2022 ota`
   - Static IP: `wifi_connect AX4 ruletka2022 192.168.1.50 255.255.255.0 192.168.1.1`
 - **Output**:
@@ -346,7 +347,7 @@ DHCP IP: 192.168.0.5, Netmask: 255.255.255.0, GW: 192.168.0.1
 ```
 - **Success marker**: `strstr("SUCCESS")`
 - **Failure markers**: `strstr("FAILED")` or `strstr("TIMEOUT")`
-- **Notes**: When password is omitted, firmware sets `authmode = WIFI_AUTH_OPEN`. When password is provided, `authmode = WIFI_AUTH_WPA2_PSK`. The `ota` flag triggers OTA check after successful connection.
+- **Notes**: When password is omitted, firmware sets `authmode = WIFI_AUTH_OPEN`. Saved credentials are used only when `--saved` is passed. The `ota` flag triggers OTA check after successful connection.
 
 ### `wifi_disconnect`
 - **Syntax**: `wifi_disconnect`
@@ -790,9 +791,64 @@ SSID removed. 2 SSIDs remaining.
 - **Description**: Set or read WiGLE API credentials.
 
 ### `wigle_upload`
-- **Syntax**: `wigle_upload` or `wigle_upload [file1 file2 ...]`
-- **Description**: Uploads wardrive files to WiGLE. No args = upload all.
+- **Syntax**: `wigle_upload` or `wigle_upload [file1 file2 ...]` or `wigle_upload all`
+- **Description**: Uploads wardrive files to WiGLE. No args = upload files not marked `wigle=done` in `/sdcard/lab/wardrives/upload_state.csv`; `all` ignores the local manifest.
 - **Prerequisite**: WiFi connected, `wigle_key` set.
+- **Output markers**: Upload state is also exposed via `upload_state` / `wardrive_files`.
+
+### `wdgwars_key`
+- **Syntax**: `wdgwars_key set <key>` or `wdgwars_key read`
+- **Description**: Set or read WDGWars API key.
+
+### `wdgwars_upload`
+- **Syntax**: `wdgwars_upload` or `wdgwars_upload [file1 file2 ...]` or `wdgwars_upload all`
+- **Description**: Uploads wardrive files to WDGWars. No args = upload files not marked `wdgwars=done`; `all` ignores the local manifest. Uses the v2 queued CSV upload API and local WigleWifi-1.6 preflight/sanitization. HTTP 429 opens a local circuit breaker/backoff and stops the batch.
+- **Prerequisite**: WiFi connected, `wdgwars_key` set.
+- **Output**: `"Done: U uploaded, S skipped, F failed, R rate_limited"`. A rate-limited stop is a controlled pause and should not be treated as a fatal command error.
+
+### `upload_state`
+- **Syntax**: `upload_state` or `upload_state clear`
+- **Description**: Prints or clears `/sdcard/lab/wardrives/upload_state.csv`. Clearing does not delete wardrive files.
+- **Output**:
+```
+[UPLOAD_STATE] BEGIN
+[UPLOAD_STATE] service=wdgwars filename=w21.log size=123456 hash=8F3A91C2 status=done wifi=900 ble=334 bt=0 bad=0
+[UPLOAD_STATE] END
+```
+Status may be `done`, `failed`, or `rate_limited`.
+
+### `wardrive_files`
+- **Syntax**: `wardrive_files`
+- **Description**: Lists local wardrive files with streaming hash, local row stats, and upload status for WiGLE/WDGWars.
+- **Output**:
+```
+[WARD_FILE] BEGIN
+[WARD_FILE] filename=w21.log size=123456 hash=8F3A91C2 wifi=900 ble=334 bt=0 bad=0 wigle=done wdgwars=pending
+[WARD_FILE] SUMMARY files=1 bytes=123456 rows=1234 devices=1234 wifi=900 ble=334 bt=0 bad=0 wigle_ok=1 wigle_pending=0 wigle_failed=0 wigle_rate_limited=0 wdgwars_ok=0 wdgwars_pending=1 wdgwars_failed=0 wdgwars_rate_limited=0
+[WARD_FILE] END
+```
+Upload status may be `pending`, `done`, `failed`, or `rate_limited`. The `SUMMARY` line appears before `END`; `*_ok` means files marked `done`, and `devices` is an alias for valid data `rows`.
+
+### `wardrive_cleanup`
+- **Syntax**: `wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]`
+- **Description**: Dry-run or move wardrive files by local upload status. Matching files are moved to `/sdcard/lab/wardrives/uploaded/<service>/<status>/` only when `move` is passed. `ok` = `done`; `fail` = `failed`. For `all`, both WiGLE and WDGWars statuses must match.
+- **Output**:
+```
+[WARD_CLEANUP] BEGIN service=wdgwars status=done mode=dry-run target=/sdcard/lab/wardrives/uploaded/wdgwars/done
+[WARD_CLEANUP] filename=w21.log size=123456 hash=8F3A91C2 wigle=pending wdgwars=done action=would_move target=/sdcard/lab/wardrives/uploaded/wdgwars/done/w21.log
+[WARD_CLEANUP] SUMMARY scanned=23 matched=4 moved=0 failed=0 dry_run=1
+[WARD_CLEANUP] END
+```
+
+### `wardrive_fix`
+- **Syntax**: `wardrive_fix <file>`
+- **Description**: Creates a soft-fixed `.fixed.log` copy with canonical WigleWifi-1.6 headers and only valid 14-field `WIFI/BLE/BT` rows. Original file is unchanged.
+- **Output**:
+```
+[WARD_FIX] BEGIN
+[WARD_FIX] filename=w21.log output=w21.fixed.log size=120000 hash=41D2A003 kept=11880 dropped=80 wifi=9000 ble=2880 bt=0 bad=80 status=ok
+[WARD_FIX] END
+```
 
 ---
 

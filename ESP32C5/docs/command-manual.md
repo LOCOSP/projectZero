@@ -246,7 +246,7 @@ All attacks stop with `stop`.
 
 ## WiFi connection (STA)
 
-- `wifi_connect <SSID> [Password] [ota] [<IP> <Mask> <GW> [DNS1] [DNS2]]` — join an AP. Omit password for open networks; `ota` triggers an update check; optional static IP. Success marker `SUCCESS`, failure `FAILED`/`TIMEOUT`.
+- `wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Mask> <GW> [DNS1] [DNS2]]` — join an AP. If password is omitted, tries open auth. Use `--saved` to explicitly load a saved password from `/sdcard/lab/eviltwin.txt` or `/sdcard/lab/portals.txt`. `ota` triggers an update check; optional static IP. Success marker `SUCCESS`, failure `FAILED`/`TIMEOUT`.
 - `wifi_disconnect` — disconnect from the current AP.
 
 ## ARP & LAN
@@ -311,8 +311,12 @@ Recon PAN/node tables and CLI snapshots are allocated in PSRAM. The RX queue rem
 - `wpasec_key set <key>` / `wpasec_key read` — wpa‑sec.stanev.org API key.
 - `wpasec_upload` — upload all `.pcap` handshakes to wpa‑sec. Prereq WiFi + key. Result `Done: U uploaded, D duplicate, F failed`.
 - `wigle_key set <name> <token>` (or `set <name:token>`) / `wigle_key read` — WiGLE credentials.
-- `wigle_upload [file ...]` — upload wardrive files to WiGLE (no args = all). Prereq WiFi + key.
-- `wdgwars_key ...` / `wdgwars_upload` — WardrivingWars integration (key set/read + upload), same pattern as the others.
+- `wigle_upload [file ...|all]` — upload wardrive files to WiGLE. No args = only files not marked `wigle=done` in `/sdcard/lab/wardrives/upload_state.csv`; `all` ignores the local manifest. Prereq WiFi + key.
+- `wdgwars_key ...` / `wdgwars_upload [file ...|all]` — WardrivingWars integration (key set/read + upload). Uses `X-API-Key` and multipart field `file`; accepts `.log`, `.csv`, and `.gz` wardrive files through the v2 queued upload API (max 60 MB). Before upload, validates the WigleWifi-1.6 schema and prints local `wifi/ble/bt/bad` row counts; if needed, uploads a temporary sanitized copy with bad rows removed and canonical headers added, leaving the original file unchanged. No args = only files not marked `wdgwars=done`; `all` ignores the local manifest. HTTP 429 opens a local circuit breaker/backoff and stops the batch to avoid Cloudflare spam. After upload, checks `/api/upload-history?limit=5` and prints the import counters when the file appears there.
+- `upload_state [clear]` — print or clear the local upload manifest. Output is marker-delimited with `[UPLOAD_STATE] ...` lines for ADV/Tab5 parsing.
+- `wardrive_files` — list local wardrive files with `size`, `hash`, `wifi/ble/bt/bad`, and `wigle`/`wdgwars` status. Output is marker-delimited with `[WARD_FILE] ...` lines and includes a final `[WARD_FILE] SUMMARY ...` before `END` with total `files/bytes/rows/wifi/ble/bt/bad` plus per-service `ok/pending/failed/rate_limited` counts.
+- `wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]` — dry-run or move matching wardrive files to `/sdcard/lab/wardrives/uploaded/<service>/<status>/`. Without `move`, only prints `[WARD_CLEANUP] ... action=would_move`. `ok` = `done`, `fail` = `failed`. `all done` matches only files done for both WiGLE and WDGWars.
+- `wardrive_fix <file>` — create a soft-fixed `.fixed.log` copy with canonical WigleWifi-1.6 headers and only valid 14-field `WIFI/BLE/BT` rows. The original file is unchanged. Output is marker-delimited with `[WARD_FIX] ...` lines.
 
 ## Settings
 
