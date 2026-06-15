@@ -503,12 +503,14 @@ upload_state
   → parse marker lines:
     [UPLOAD_STATE] service=<wigle|wdgwars> filename=<file> size=<bytes> hash=<hex> status=<done|failed|rate_limited> wifi=<n> ble=<n> bt=<n> bad=<n>
 
-wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited>
+wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]
   → dry-run only; parse marker lines:
     [WARD_CLEANUP] filename=<file> size=<bytes> hash=<hex> wigle=<status> wdgwars=<status> action=would_move target=<path>
     [WARD_CLEANUP] SUMMARY scanned=<n> matched=<n> moved=<n> failed=<n> dry_run=1
 wardrive_cleanup <service> <status> move
   → moves matching files to /sdcard/lab/wardrives/uploaded/<service>/<status>/
+wardrive_cleanup <service> <status> move <destination>
+  → moves matching files and companion *_track.kml files to /sdcard/lab/wardrives/uploaded/<service>/<status>/<destination>/
   → use only after user confirmation; "all done" requires both services to be done
 
 wardrive_fix <file>

@@ -8440,7 +8440,21 @@ static bool wardrive_cleanup_status_matches(const char *service, const char *wan
     return strcmp(wdgwars_status, wanted_status) == 0;
 }
 
-static bool wardrive_cleanup_ensure_dir(const char *service, const char *status, char *out_dir, size_t out_sz) {
+static bool wardrive_cleanup_valid_subdir(const char *subdir) {
+    if (!subdir || subdir[0] == '\0' || strcmp(subdir, ".") == 0 || strcmp(subdir, "..") == 0) {
+        return false;
+    }
+    for (const char *p = subdir; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (!(isalnum(c) || c == '.' || c == '_' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool wardrive_cleanup_ensure_dir(const char *service, const char *status,
+                                        const char *subdir, char *out_dir, size_t out_sz) {
     if (!service || !status || !out_dir || out_sz == 0) {
         return false;
     }
@@ -8459,25 +8473,44 @@ static bool wardrive_cleanup_ensure_dir(const char *service, const char *status,
         return false;
     }
     mkdir(out_dir, 0755);
+
+    if (subdir && subdir[0] != '\0') {
+        char status_dir[384];
+        strlcpy(status_dir, out_dir, sizeof(status_dir));
+        ret = snprintf(out_dir, out_sz, "%s/%s", status_dir, subdir);
+        if (ret <= 0 || ret >= (int)out_sz) {
+            return false;
+        }
+        mkdir(out_dir, 0755);
+    }
     return true;
 }
 
 static int cmd_wardrive_cleanup(int argc, char **argv) {
-    if (argc < 3 || argc > 4 ||
+    if (argc < 3 || argc > 5 ||
         !wardrive_cleanup_valid_service(argv[1]) ||
         !wardrive_cleanup_valid_status(argv[2])) {
-        MY_LOG_INFO(TAG, "Usage: wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]");
+        MY_LOG_INFO(TAG, "Usage: wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]");
         return 1;
     }
 
-    if (argc == 4 && strcasecmp(argv[3], "move") != 0) {
-        MY_LOG_INFO(TAG, "Usage: wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]");
+    if (argc >= 4 && strcasecmp(argv[3], "move") != 0) {
+        MY_LOG_INFO(TAG, "Usage: wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]");
         return 1;
     }
 
     const char *service = wardrive_cleanup_normalize_service(argv[1]);
     const char *status = wardrive_cleanup_normalize_status(argv[2]);
     bool do_move = (argc >= 4 && strcasecmp(argv[3], "move") == 0);
+    const char *dest_subdir = (argc >= 5) ? argv[4] : NULL;
+
+    if (dest_subdir && !wardrive_cleanup_valid_subdir(dest_subdir)) {
+        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=move target=\n", service, status);
+        printf("[WARD_CLEANUP] filename=destination action=failed reason=invalid_destination destination=%s\n", dest_subdir ? dest_subdir : "");
+        printf("[WARD_CLEANUP] SUMMARY scanned=0 matched=0 moved=0 failed=1 dry_run=0\n");
+        printf("[WARD_CLEANUP] END\n");
+        return 1;
+    }
 
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
@@ -8487,7 +8520,7 @@ static int cmd_wardrive_cleanup(int argc, char **argv) {
     upload_state_ensure_file();
 
     char target_dir[384];
-    if (!wardrive_cleanup_ensure_dir(service, status, target_dir, sizeof(target_dir))) {
+    if (!wardrive_cleanup_ensure_dir(service, status, dest_subdir, target_dir, sizeof(target_dir))) {
         MY_LOG_INFO(TAG, "wardrive_cleanup: failed to prepare target directory");
         return 1;
     }
@@ -8552,10 +8585,45 @@ static int cmd_wardrive_cleanup(int argc, char **argv) {
             continue;
         }
 
+        unlink(target_path);
         if (rename(filepath, target_path) == 0) {
             moved++;
             printf("[WARD_CLEANUP] filename=%s size=%ld hash=%08lX wigle=%s wdgwars=%s action=moved target=%s\n",
                    entry->d_name, size, (unsigned long)hash, wigle_status, wdgwars_status, target_path);
+
+            size_t name_len = strlen(entry->d_name);
+            if (name_len > 4 && strcasecmp(entry->d_name + name_len - 4, ".log") == 0) {
+                char track_name[256];
+                int track_name_len = snprintf(track_name, sizeof(track_name), "%.*s_track.kml",
+                                              (int)(name_len - 4), entry->d_name);
+                if (track_name_len <= 0 || track_name_len >= (int)sizeof(track_name)) {
+                    failed++;
+                    printf("[WARD_CLEANUP] filename=%s action=failed reason=track_name_too_long\n",
+                           entry->d_name);
+                } else {
+                    char track_path[384];
+                    char track_target_path[512];
+                    int track_path_len = snprintf(track_path, sizeof(track_path), "/sdcard/lab/wardrives/%s", track_name);
+                    int track_target_len = snprintf(track_target_path, sizeof(track_target_path), "%s/%s", target_dir, track_name);
+                    if (track_path_len <= 0 || track_path_len >= (int)sizeof(track_path) ||
+                        track_target_len <= 0 || track_target_len >= (int)sizeof(track_target_path)) {
+                        failed++;
+                        printf("[WARD_CLEANUP] filename=%s action=failed reason=track_path_too_long\n",
+                               track_name);
+                    } else if (access(track_path, F_OK) == 0) {
+                        unlink(track_target_path);
+                        if (rename(track_path, track_target_path) == 0) {
+                            moved++;
+                            printf("[WARD_CLEANUP] filename=%s action=moved target=%s\n",
+                                   track_name, track_target_path);
+                        } else {
+                            failed++;
+                            printf("[WARD_CLEANUP] filename=%s action=failed errno=%d target=%s\n",
+                                   track_name, errno, track_target_path);
+                        }
+                    }
+                }
+            }
         } else {
             failed++;
             printf("[WARD_CLEANUP] filename=%s size=%ld hash=%08lX wigle=%s wdgwars=%s action=failed errno=%d target=%s\n",
@@ -11901,7 +11969,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "wdgwars_upload", " [file1 file2 ...]" },
     { "upload_state", "" },
     { "wardrive_files", "" },
-    { "wardrive_cleanup", " <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]" },
+    { "wardrive_cleanup", " <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]" },
     { "wardrive_fix", " <file>" },
     { "add_ssid", " <SSID>" },
     { "remove_ssid", " <index>" },
@@ -19944,8 +20012,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t wardrive_cleanup_cmd = {
         .command = "wardrive_cleanup",
-        .help = "Dry-run or move wardrive files by upload status: wardrive_cleanup <service> <status> [move]",
-        .hint = "<wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]",
+        .help = "Dry-run or move wardrive files by upload status: wardrive_cleanup <service> <status> [move [destination]]",
+        .hint = "<wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]",
         .func = &cmd_wardrive_cleanup,
         .argtable = NULL
     };

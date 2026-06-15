@@ -830,8 +830,8 @@ Status may be `done`, `failed`, or `rate_limited`.
 Upload status may be `pending`, `done`, `failed`, or `rate_limited`. The `SUMMARY` line appears before `END`; `*_ok` means files marked `done`, and `devices` is an alias for valid data `rows`.
 
 ### `wardrive_cleanup`
-- **Syntax**: `wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move]`
-- **Description**: Dry-run or move wardrive files by local upload status. Matching files are moved to `/sdcard/lab/wardrives/uploaded/<service>/<status>/` only when `move` is passed. `ok` = `done`; `fail` = `failed`. For `all`, both WiGLE and WDGWars statuses must match.
+- **Syntax**: `wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]`
+- **Description**: Dry-run or move wardrive files by local upload status. Matching files are moved to `/sdcard/lab/wardrives/uploaded/<service>/<status>/` only when `move` is passed, or to `/sdcard/lab/wardrives/uploaded/<service>/<status>/<destination>/` when a safe destination token is supplied. `ok` = `done`; `fail` = `failed`. For `all`, both WiGLE and WDGWars statuses must match.
 - **Output**:
 ```
 [WARD_CLEANUP] BEGIN service=wdgwars status=done mode=dry-run target=/sdcard/lab/wardrives/uploaded/wdgwars/done
