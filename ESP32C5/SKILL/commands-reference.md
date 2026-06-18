@@ -508,6 +508,15 @@ F1:2E:71:9F:C8:68  RSSI: -90 dBm  Name: Forerunner 935
 - **Syntax**: `gps_set <module>` or `gps_set` (no args = read current)
 - **Modules**: `m5` (m5stack GPS), `atgm` (ATGM336H), `external`/`ext`/`usb`/`tab`/`tab5`, `cap`/`external_cap`
 - **Example**: `gps_set tab5`
+- **Output** (terminated by `[GPSCFG] END`):
+```
+[GPSCFG] module=External
+[GPSCFG] baud=9600
+[GPSCFG] external=yes
+[GPSCFG] position_command=set_gps_position
+[GPSCFG] END
+```
+- **Completion marker**: `strstr("[GPSCFG] END")`.
 
 ### `set_gps_position`
 - **Syntax**: `set_gps_position <lat> <lon> [alt] [acc]` or `set_gps_position` (no args = clear fix)
@@ -787,8 +796,8 @@ SSID removed. 2 SSIDs remaining.
 ## WiGLE Integration
 
 ### `wigle_key`
-- **Syntax**: `wigle_key set <api_name> <api_token>` or `wigle_key set <api_name:api_token>` or `wigle_key read`
-- **Description**: Set or read WiGLE API credentials.
+- **Syntax**: `wigle_key set <api_name> <api_token>` or `wigle_key set <api_name:api_token>` or `wigle_key read` or `wigle_key clear`
+- **Description**: Set, read, or clear WiGLE API credentials from NVS. `/sdcard/lab/wigle.txt` is read only during upload and is not persisted to NVS.
 
 ### `wigle_upload`
 - **Syntax**: `wigle_upload` or `wigle_upload [file1 file2 ...]` or `wigle_upload all`
@@ -797,8 +806,8 @@ SSID removed. 2 SSIDs remaining.
 - **Output markers**: Upload state is also exposed via `upload_state` / `wardrive_files`.
 
 ### `wdgwars_key`
-- **Syntax**: `wdgwars_key set <key>` or `wdgwars_key read`
-- **Description**: Set or read WDGWars API key.
+- **Syntax**: `wdgwars_key set <key>` or `wdgwars_key read` or `wdgwars_key clear`
+- **Description**: Set, read, or clear WDGWars API key from NVS. `/sdcard/lab/wdgwars.txt` is read only during upload and is not persisted to NVS.
 
 ### `wdgwars_upload`
 - **Syntax**: `wdgwars_upload` or `wdgwars_upload [file1 file2 ...]` or `wdgwars_upload all`

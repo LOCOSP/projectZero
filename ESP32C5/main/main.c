@@ -125,7 +125,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.5"
+#define JANOS_VERSION "1.6.6"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -303,6 +303,7 @@ static char wigle_api_token[WIGLE_KEY_MAX_LEN] = "";
 static char wdgwars_api_key[WDGWARS_KEY_MAX_LEN] = "";
 static int64_t wdgwars_circuit_open_until_us = 0;
 static int wdgwars_rate_limit_streak = 0;
+static esp_err_t sd_last_init_error = ESP_OK;
 
 // ARP ban state
 static volatile bool arp_ban_active = false;
@@ -1007,10 +1008,7 @@ static void wardrive_config_format_custom(char *out, size_t out_sz) {
     }
 }
 
-// get_wardrive_config: dump active config (machine-parseable, "[WDCFG] END" marker).
-static int cmd_get_wardrive_config(int argc, char **argv) {
-    (void)argc; (void)argv;
-
+static void wardrive_config_print(void) {
     char bands_str[24];
     wardrive_config_format_bands(bands_str, sizeof(bands_str));
 
@@ -1031,6 +1029,12 @@ static int cmd_get_wardrive_config(int argc, char **argv) {
            (g_wd_cfg.antisurv_sensitivity == WD_AS_LOW)  ? "low" :
            (g_wd_cfg.antisurv_sensitivity == WD_AS_HIGH) ? "high" : "med");
     printf("[WDCFG] END\n");
+}
+
+// get_wardrive_config: dump active config (machine-parseable, "[WDCFG] END" marker).
+static int cmd_get_wardrive_config(int argc, char **argv) {
+    (void)argc; (void)argv;
+    wardrive_config_print();
     return 0;
 }
 
@@ -1072,6 +1076,7 @@ static int cmd_set_wardrive_bands(int argc, char **argv) {
     char bands_str[24];
     wardrive_config_format_bands(bands_str, sizeof(bands_str));
     printf("Wardrive bands set: %s\n", bands_str);
+    wardrive_config_print();
     return 0;
 }
 
@@ -1135,6 +1140,7 @@ static int cmd_set_wardrive_channels(int argc, char **argv) {
     } else {
         printf("Wardrive channels set: %s\n", chmode_str);
     }
+    wardrive_config_print();
     return 0;
 }
 
@@ -1160,6 +1166,7 @@ static int cmd_set_wardrive_rssi_delta(int argc, char **argv) {
     wardrive_config_persist();
     printf("Wardrive RSSI delta set: wifi=%d ble=%d (0=log once)\n",
            g_wd_cfg.wifi_rssi_delta, g_wd_cfg.ble_rssi_delta);
+    wardrive_config_print();
     return 0;
 }
 
@@ -1177,6 +1184,7 @@ static int cmd_set_wardrive_memcap(int argc, char **argv) {
     g_wd_cfg.mem_cap = (uint32_t)val;
     wardrive_config_persist();
     printf("Wardrive memory cap set: %u entries\n", (unsigned)g_wd_cfg.mem_cap);
+    wardrive_config_print();
     return 0;
 }
 
@@ -1194,6 +1202,7 @@ static int cmd_set_wardrive_cooldown(int argc, char **argv) {
     g_wd_cfg.startup_cooldown_s = (uint16_t)val;
     wardrive_config_persist();
     printf("Wardrive startup cooldown set: %u s\n", (unsigned)g_wd_cfg.startup_cooldown_s);
+    wardrive_config_print();
     return 0;
 }
 
@@ -2030,6 +2039,7 @@ static void gps_sync_from_selected_external_source(void);
 static void gps_load_state_from_nvs(void);
 static void gps_save_state_to_nvs(void);
 static esp_err_t init_sd_card(void);
+static bool sd_mkdir_recursive(const char *path);
 static esp_err_t create_sd_directories(void);
 static void sd_sync(void);
 static void safe_restart(void);
@@ -3188,6 +3198,26 @@ static bool wigle_save_key_to_nvs(const char *api_name, const char *api_token) {
     return err == ESP_OK;
 }
 
+static bool wigle_clear_key_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIGLE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    esp_err_t err_name = nvs_erase_key(handle, WIGLE_NVS_KEY_NAME);
+    esp_err_t err_token = nvs_erase_key(handle, WIGLE_NVS_KEY_TOKEN);
+    if (err_name == ESP_ERR_NVS_NOT_FOUND) err_name = ESP_OK;
+    if (err_token == ESP_ERR_NVS_NOT_FOUND) err_token = ESP_OK;
+
+    err = (err_name == ESP_OK && err_token == ESP_OK) ? nvs_commit(handle) : ESP_FAIL;
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
 static void wdgwars_load_key_from_nvs(void) {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(WDGWARS_NVS_NAMESPACE, NVS_READONLY, &handle);
@@ -3216,6 +3246,85 @@ static bool wdgwars_save_key_to_nvs(const char *key) {
     }
     nvs_close(handle);
     return err == ESP_OK;
+}
+
+static bool wdgwars_clear_key_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WDGWARS_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = nvs_erase_key(handle, WDGWARS_NVS_KEY);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_OK;
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static bool wigle_load_key_from_sd(void) {
+    FILE *wf = fopen("/sdcard/lab/wigle.txt", "r");
+    if (!wf) {
+        return false;
+    }
+
+    char line[256] = {0};
+    char api_name[WIGLE_KEY_MAX_LEN] = {0};
+    char api_token[WIGLE_KEY_MAX_LEN] = {0};
+    bool loaded = false;
+
+    if (fgets(line, sizeof(line), wf) &&
+        wigle_split_key_pair(line, api_name, sizeof(api_name), api_token, sizeof(api_token))) {
+        snprintf(wigle_api_name, sizeof(wigle_api_name), "%s", api_name);
+        snprintf(wigle_api_token, sizeof(wigle_api_token), "%s", api_token);
+        MY_LOG_INFO(TAG, "WiGLE key loaded from SD for this session.");
+        loaded = true;
+    } else {
+        MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wigle.txt format. Expected: api_name:api_token");
+    }
+
+    fclose(wf);
+    return loaded;
+}
+
+static bool wdgwars_load_key_from_sd(void) {
+    FILE *wf = fopen("/sdcard/lab/wdgwars.txt", "r");
+    if (!wf) {
+        return false;
+    }
+
+    char line[128] = {0};
+    bool loaded = false;
+
+    if (fgets(line, sizeof(line), wf)) {
+        size_t ln = strlen(line);
+        while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r' || isspace((unsigned char)line[ln - 1]))) {
+            line[--ln] = '\0';
+        }
+        char *start = line;
+        while (*start && isspace((unsigned char)*start)) {
+            start++;
+        }
+        if (start[0] != '\0' && strlen(start) < WDGWARS_KEY_MAX_LEN) {
+            strncpy(wdgwars_api_key, start, sizeof(wdgwars_api_key) - 1);
+            wdgwars_api_key[sizeof(wdgwars_api_key) - 1] = '\0';
+            MY_LOG_INFO(TAG, "WDGWars key loaded from SD for this session.");
+            loaded = true;
+        } else if (start[0] != '\0') {
+            MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wdgwars.txt format. Expected one API key (max %d chars).",
+                        WDGWARS_KEY_MAX_LEN - 1);
+        }
+    }
+
+    fclose(wf);
+    return loaded;
 }
 
 // ---------------------------------------------------
@@ -6592,6 +6701,7 @@ static int cmd_set_antisurv_sensitivity(int argc, char **argv) {
     antisurv_thresholds(g_wd_cfg.antisurv_sensitivity, &dur, &dist, &rnd);
     printf("Anti-surveillance sensitivity: %s (>=%ds present, >=%dm travel, randoms=%s)\n",
            argv[1], dur, dist, rnd ? "yes" : "no");
+    wardrive_config_print();
     return 0;
 }
 
@@ -8098,6 +8208,8 @@ static bool upload_state_ensure_file(void) {
         return true;
     }
 
+    sd_mkdir_recursive("/sdcard/lab/wardrives");
+
     FILE *f = fopen(UPLOAD_STATE_PATH, "w");
     if (!f) {
         MY_LOG_INFO(TAG, "Upload state: cannot create %s", UPLOAD_STATE_PATH);
@@ -9208,7 +9320,7 @@ cleanup:
 
 static int cmd_wigle_key(int argc, char **argv) {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read");
+        MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read | wigle_key clear");
         return 0;
     }
 
@@ -9216,9 +9328,21 @@ static int cmd_wigle_key(int argc, char **argv) {
         if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
             MY_LOG_INFO(TAG, "WiGLE key: not set");
             MY_LOG_INFO(TAG, "Set via: wigle_key set <api_name> <api_token>");
-            MY_LOG_INFO(TAG, "Or place api_name:api_token in /sdcard/lab/wigle.txt and reboot.");
+            MY_LOG_INFO(TAG, "Or place api_name:api_token in /sdcard/lab/wigle.txt before upload.");
         } else {
             MY_LOG_INFO(TAG, "WiGLE key: %.4s****:%.4s****", wigle_api_name, wigle_api_token);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "clear") == 0) {
+        if (wigle_clear_key_from_nvs()) {
+            wigle_api_name[0] = '\0';
+            wigle_api_token[0] = '\0';
+            MY_LOG_INFO(TAG, "WiGLE key cleared from NVS.");
+        } else {
+            MY_LOG_INFO(TAG, "Failed to clear WiGLE key from NVS.");
+            return 1;
         }
         return 0;
     }
@@ -9262,7 +9386,7 @@ static int cmd_wigle_key(int argc, char **argv) {
         return 0;
     }
 
-    MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read");
+    MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read | wigle_key clear");
     return 0;
 }
 
@@ -9276,15 +9400,17 @@ static int cmd_wigle_upload(int argc, char **argv) {
         return 1;
     }
 
-    if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
-        MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
-        MY_LOG_INFO(TAG, "Use 'wigle_key set <api_name> <api_token>' or /sdcard/lab/wigle.txt");
-        return 1;
-    }
-
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    create_sd_directories();
+    wigle_load_key_from_sd();
+
+    if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
+        MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
+        MY_LOG_INFO(TAG, "Use 'wigle_key set <api_name> <api_token>' or /sdcard/lab/wigle.txt");
         return 1;
     }
 
@@ -9910,7 +10036,7 @@ cleanup:
 
 static int cmd_wdgwars_key(int argc, char **argv) {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key> | wdgwars_key read");
+        MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key> | wdgwars_key read | wdgwars_key clear");
         return 0;
     }
 
@@ -9918,9 +10044,20 @@ static int cmd_wdgwars_key(int argc, char **argv) {
         if (wdgwars_api_key[0] == '\0') {
             MY_LOG_INFO(TAG, "WDGWars key: not set");
             MY_LOG_INFO(TAG, "Set via: wdgwars_key set <key>");
-            MY_LOG_INFO(TAG, "Or place the API key in /sdcard/lab/wdgwars.txt and reboot.");
+            MY_LOG_INFO(TAG, "Or place the API key in /sdcard/lab/wdgwars.txt before upload.");
         } else {
             MY_LOG_INFO(TAG, "WDGWars key: %.4s****", wdgwars_api_key);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "clear") == 0) {
+        if (wdgwars_clear_key_from_nvs()) {
+            wdgwars_api_key[0] = '\0';
+            MY_LOG_INFO(TAG, "WDGWars key cleared from NVS.");
+        } else {
+            MY_LOG_INFO(TAG, "Failed to clear WDGWars key from NVS.");
+            return 1;
         }
         return 0;
     }
@@ -9946,7 +10083,7 @@ static int cmd_wdgwars_key(int argc, char **argv) {
         return 0;
     }
 
-    MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key> | wdgwars_key read");
+    MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key> | wdgwars_key read | wdgwars_key clear");
     return 0;
 }
 
@@ -10115,6 +10252,14 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
         return 1;
     }
 
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    create_sd_directories();
+    wdgwars_load_key_from_sd();
+
     if (wdgwars_api_key[0] == '\0') {
         MY_LOG_INFO(TAG, "NO WDGWARS CREDENTIALS");
         MY_LOG_INFO(TAG, "Use 'wdgwars_key set <key>' or /sdcard/lab/wdgwars.txt");
@@ -10123,12 +10268,6 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
 
     if (!wdgwars_circuit_allows_request()) {
         return 0;
-    }
-
-    esp_err_t ret = init_sd_card();
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
-        return 1;
     }
 
     int uploaded = 0;
@@ -11963,9 +12102,9 @@ static const cli_hint_t k_cli_hints[] = {
     { "set_html", " <html>" },
     { "wpasec_key", " set <key> | read" },
     { "wpasec_upload", "" },
-    { "wigle_key", " set <api_name> <api_token> | read" },
+    { "wigle_key", " set <api_name> <api_token> | read | clear" },
     { "wigle_upload", " [file1 file2 ...]" },
-    { "wdgwars_key", " set <key> | read" },
+    { "wdgwars_key", " set <key> | read | clear" },
     { "wdgwars_upload", " [file1 file2 ...]" },
     { "upload_state", "" },
     { "wardrive_files", "" },
@@ -16427,7 +16566,11 @@ static void gps_raw_task(void *pvParameters) {
 
 static int cmd_gps_set(int argc, char **argv) {
     if (argc < 2 || argv[1] == NULL) {
-        MY_LOG_INFO(TAG, "Usage: gps_set <m5|atgm|external|cap>");
+        printf("[GPSCFG] module=%s\n", gps_get_module_name(current_gps_module));
+        printf("[GPSCFG] baud=%d\n", gps_get_baud_for_module(current_gps_module));
+        printf("[GPSCFG] external=%s\n", gps_module_uses_external_feed(current_gps_module) ? "yes" : "no");
+        printf("[GPSCFG] position_command=%s\n", gps_external_position_command_name(current_gps_module));
+        printf("[GPSCFG] END\n");
         MY_LOG_INFO(TAG, "Current GPS module: %s (baud %d)",
                     gps_get_module_name(current_gps_module),
                     gps_get_baud_for_module(current_gps_module));
@@ -16456,6 +16599,11 @@ static int cmd_gps_set(int argc, char **argv) {
         gps_sync_from_selected_external_source();
     }
     gps_save_state_to_nvs();
+    printf("[GPSCFG] module=%s\n", gps_get_module_name(current_gps_module));
+    printf("[GPSCFG] baud=%d\n", gps_get_baud_for_module(current_gps_module));
+    printf("[GPSCFG] external=%s\n", gps_module_uses_external_feed(current_gps_module) ? "yes" : "no");
+    printf("[GPSCFG] position_command=%s\n", gps_external_position_command_name(current_gps_module));
+    printf("[GPSCFG] END\n");
     MY_LOG_INFO(TAG, "GPS module set to %s (baud %d). Restart GPS tasks if running.",
                 gps_get_module_name(current_gps_module),
                 gps_get_baud_for_module(current_gps_module));
@@ -19958,7 +20106,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t wigle_key_cmd = {
         .command = "wigle_key",
-        .help = "Set/read WiGLE API credentials: wigle_key set <api_name> <api_token> | wigle_key read",
+        .help = "Set/read/clear WiGLE API credentials: wigle_key set <api_name> <api_token> | wigle_key read | wigle_key clear",
         .hint = NULL,
         .func = &cmd_wigle_key,
         .argtable = NULL
@@ -19976,7 +20124,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t wdgwars_key_cmd = {
         .command = "wdgwars_key",
-        .help = "Set/read WDGWars API key: wdgwars_key set <key> | wdgwars_key read",
+        .help = "Set/read/clear WDGWars API key: wdgwars_key set <key> | wdgwars_key read | wdgwars_key clear",
         .hint = NULL,
         .func = &cmd_wdgwars_key,
         .argtable = NULL
@@ -20866,73 +21014,18 @@ void app_main(void) {
                 fclose(wf);
             }
         }
-        // Check for WiGLE API credentials file on SD card (format: api_name:api_token)
-        {
-            FILE *wf = fopen("/sdcard/lab/wigle.txt", "r");
-            if (wf) {
-                static char line[256];
-                memset(line, 0, sizeof(line));
-                if (fgets(line, sizeof(line), wf)) {
-                    static char api_name[WIGLE_KEY_MAX_LEN];
-                    static char api_token[WIGLE_KEY_MAX_LEN];
-                    memset(api_name, 0, sizeof(api_name));
-                    memset(api_token, 0, sizeof(api_token));
-                    if (wigle_split_key_pair(line, api_name, sizeof(api_name), api_token, sizeof(api_token))) {
-                        if (wigle_save_key_to_nvs(api_name, api_token)) {
-                            snprintf(wigle_api_name, sizeof(wigle_api_name), "%s", api_name);
-                            snprintf(wigle_api_token, sizeof(wigle_api_token), "%s", api_token);
-                            MY_LOG_INFO(TAG, "WiGLE key updated from SD card into NVS.");
-                        } else {
-                            MY_LOG_INFO(TAG, "Failed to save WiGLE key from SD card to NVS.");
-                        }
-                    } else {
-                        MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wigle.txt format. Expected: api_name:api_token");
-                    }
-                }
-                fclose(wf);
-            }
-        }
-        // Check for WDGWars API key file on SD card (format: one line, 64-char key)
-        {
-            FILE *wf = fopen("/sdcard/lab/wdgwars.txt", "r");
-            if (wf) {
-                static char line[128];
-                memset(line, 0, sizeof(line));
-                if (fgets(line, sizeof(line), wf)) {
-                    size_t ln = strlen(line);
-                    while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r' || isspace((unsigned char)line[ln - 1]))) {
-                        line[--ln] = '\0';
-                    }
-                    while (*line && isspace((unsigned char)*line)) {
-                        memmove(line, line + 1, strlen(line));
-                    }
-                    if (line[0] != '\0') {
-                        if (strlen(line) >= WDGWARS_KEY_MAX_LEN) {
-                            MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wdgwars.txt format. Expected one API key (max %d chars).", WDGWARS_KEY_MAX_LEN - 1);
-                        } else if (wdgwars_save_key_to_nvs(line)) {
-                            strncpy(wdgwars_api_key, line, sizeof(wdgwars_api_key) - 1);
-                            wdgwars_api_key[sizeof(wdgwars_api_key) - 1] = '\0';
-                            MY_LOG_INFO(TAG, "WDGWars key updated from SD card into NVS.");
-                        } else {
-                            MY_LOG_INFO(TAG, "Failed to save WDGWars key from SD card to NVS.");
-                        }
-                    }
-                }
-                fclose(wf);
-            }
-        }
         oled_display_update_full(NULL, "  SD: mounted", "  All systems OK", "");
     } else {
-        MY_LOG_INFO(TAG, "");
-        MY_LOG_INFO(TAG, "SD init error: %s", esp_err_to_name(sd_init_ret));
-        MY_LOG_INFO(TAG, "SD Card not detected. Custom portals won't be available, results won't be written to files.");
-        MY_LOG_INFO(TAG, "");
         oled_display_update_full(NULL, "  SD: MISSING!", "  No file save", "");
     }
     vTaskDelay(pdMS_TO_TICKS(400));
     
     // Load BSSID whitelist from SD card
-    load_whitelist_from_sd();
+    if (sd_init_ret == ESP_OK) {
+        load_whitelist_from_sd();
+    } else {
+        whitelistedBssidsCount = 0;
+    }
     vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
     oled_display_update_full("> JanOS v" JANOS_VERSION,
@@ -22794,6 +22887,9 @@ static esp_err_t init_sd_card(void) {
     if (sd_card_mounted) {
         return ESP_OK;
     }
+    if (sd_last_init_error != ESP_OK) {
+        return sd_last_init_error;
+    }
     
     // Options for mounting the filesystem (optimized for low memory)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
@@ -22832,26 +22928,28 @@ static esp_err_t init_sd_card(void) {
     // Some cards are unstable at higher SPI clock rates during init.
     const int mount_freqs_khz[] = {SDMMC_FREQ_DEFAULT, 10000, 4000};
     const size_t mount_freqs_count = sizeof(mount_freqs_khz) / sizeof(mount_freqs_khz[0]);
+    int attempted_freqs[3] = {0};
     for (size_t i = 0; i < mount_freqs_count; i++) {
         host.max_freq_khz = mount_freqs_khz[i];
+        attempted_freqs[i] = host.max_freq_khz;
         ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &sd_card_handle);
         if (ret == ESP_OK) {
             break;
         }
-        MY_LOG_INFO(TAG, "SD mount attempt %u failed at %d kHz: %s",
-                    (unsigned)(i + 1), host.max_freq_khz, esp_err_to_name(ret));
         vTaskDelay(pdMS_TO_TICKS(60));
     }
     
     if (ret != ESP_OK) {
+        sd_last_init_error = ret;
         if (ret == ESP_FAIL) {
-            MY_LOG_INFO(TAG, "Failed to mount SD filesystem at /sdcard (unsupported/corrupted FS).");
+            MY_LOG_INFO(TAG, "SD: not mounted (filesystem unsupported/corrupted). File-backed features disabled.");
         } else {
-            MY_LOG_INFO(TAG, "Failed to initialize SD card (%s). Check wiring, pull-ups, and card compatibility.",
-                        esp_err_to_name(ret));
+            MY_LOG_INFO(TAG, "SD: not detected (%s after %d/%d/%d kHz). File-backed features disabled.",
+                        esp_err_to_name(ret), attempted_freqs[0], attempted_freqs[1], attempted_freqs[2]);
         }
         return ret;
     }
+    sd_last_init_error = ESP_OK;
     
     // Print card info (single line)
     uint64_t size_mb = ((uint64_t)sd_card_handle->csd.capacity) * sd_card_handle->csd.sector_size / (1024 * 1024);
@@ -22874,6 +22972,50 @@ static esp_err_t init_sd_card(void) {
     return ESP_OK;
 }
 
+static bool sd_mkdir_recursive(const char *path) {
+    if (!path || path[0] == '\0') {
+        return false;
+    }
+
+    char tmp[384];
+    if (strlcpy(tmp, path, sizeof(tmp)) >= sizeof(tmp)) {
+        return false;
+    }
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            struct stat st;
+            if (stat(tmp, &st) == 0) {
+                if (!S_ISDIR(st.st_mode)) {
+                    errno = ENOTDIR;
+                    return false;
+                }
+            } else if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+                return false;
+            } else if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                errno = ENOTDIR;
+                return false;
+            }
+            *p = '/';
+        }
+    }
+
+    struct stat st;
+    if (stat(tmp, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return true;
+        }
+        errno = ENOTDIR;
+        return false;
+    }
+
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+        return false;
+    }
+    return stat(tmp, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 // Create necessary directories on SD card
 static esp_err_t create_sd_directories(void) {
     struct stat st;
@@ -22887,11 +23029,16 @@ static esp_err_t create_sd_directories(void) {
         "/sdcard/lab/pcaps",
     };
     for (int i = 0; i < (int)(sizeof(dirs) / sizeof(dirs[0])); i++) {
-        if (stat(dirs[i], &st) != 0) {
-            if (mkdir(dirs[i], 0755) != 0) {
-                MY_LOG_INFO(TAG, "mkdir %s failed: %s", dirs[i], strerror(errno));
-                return ESP_FAIL;
-            }
+        if (!sd_mkdir_recursive(dirs[i])) {
+            MY_LOG_INFO(TAG, "mkdir %s failed: %s", dirs[i], strerror(errno));
+            return ESP_FAIL;
+        }
+        if (stat(dirs[i], &st) == 0 && !S_ISDIR(st.st_mode)) {
+            MY_LOG_INFO(TAG, "%s exists but is not a directory", dirs[i]);
+            return ESP_FAIL;
+        }
+        if (i == 0 || strcmp(dirs[i], "/sdcard/lab/wardrives") == 0 ||
+            strcmp(dirs[i], "/sdcard/lab/wardrives/uploaded") == 0) {
             sd_sync();
         }
     }
