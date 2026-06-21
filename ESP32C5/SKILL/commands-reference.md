@@ -326,11 +326,12 @@ Connect to 'MojaSiec' WiFi network to access the portal
 ## WiFi Connection (STA Mode)
 
 ### `wifi_connect`
-- **Syntax**: `wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]`
-- **Description**: Connects to an AP as STA. Password is optional -- omit it for open (no-password) networks. Optional static IP config.
+- **Syntax**: `wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]`
+- **Description**: Connects to an AP as STA. If password is omitted, firmware tries open auth. Use `--saved` to explicitly load a saved password from `/sdcard/lab/eviltwin.txt` or `/sdcard/lab/portals.txt`. Optional static IP config.
 - **Examples**:
   - WPA2 network: `wifi_connect AX4 ruletka2022`
   - Open network: `wifi_connect BRW`
+  - Saved password: `wifi_connect AX4 --saved`
   - With OTA: `wifi_connect AX4 ruletka2022 ota`
   - Static IP: `wifi_connect AX4 ruletka2022 192.168.1.50 255.255.255.0 192.168.1.1`
 - **Output**:
@@ -346,7 +347,7 @@ DHCP IP: 192.168.0.5, Netmask: 255.255.255.0, GW: 192.168.0.1
 ```
 - **Success marker**: `strstr("SUCCESS")`
 - **Failure markers**: `strstr("FAILED")` or `strstr("TIMEOUT")`
-- **Notes**: When password is omitted, firmware sets `authmode = WIFI_AUTH_OPEN`. When password is provided, `authmode = WIFI_AUTH_WPA2_PSK`. The `ota` flag triggers OTA check after successful connection.
+- **Notes**: When password is omitted, firmware sets `authmode = WIFI_AUTH_OPEN`. Saved credentials are used only when `--saved` is passed. The `ota` flag triggers OTA check after successful connection.
 
 ### `wifi_disconnect`
 - **Syntax**: `wifi_disconnect`
@@ -507,6 +508,15 @@ F1:2E:71:9F:C8:68  RSSI: -90 dBm  Name: Forerunner 935
 - **Syntax**: `gps_set <module>` or `gps_set` (no args = read current)
 - **Modules**: `m5` (m5stack GPS), `atgm` (ATGM336H), `external`/`ext`/`usb`/`tab`/`tab5`, `cap`/`external_cap`
 - **Example**: `gps_set tab5`
+- **Output** (terminated by `[GPSCFG] END`):
+```
+[GPSCFG] module=External
+[GPSCFG] baud=9600
+[GPSCFG] external=yes
+[GPSCFG] position_command=set_gps_position
+[GPSCFG] END
+```
+- **Completion marker**: `strstr("[GPSCFG] END")`.
 
 ### `set_gps_position`
 - **Syntax**: `set_gps_position <lat> <lon> [alt] [acc]` or `set_gps_position` (no args = clear fix)
@@ -541,12 +551,109 @@ F1:2E:71:9F:C8:68  RSSI: -90 dBm  Name: Forerunner 935
 
 ### `start_wardrive_promisc`
 - **Syntax**: `start_wardrive_promisc`
-- **Description**: Promiscuous wardrive with D-UCB channel selection algorithm.
-- **Output**: Same as `start_wardrive` plus periodic status:
+- **Description**: Promiscuous wardrive with D-UCB channel selection. Logs Wi-Fi APs **and** BLE devices to a WigleWifi-1.6 CSV at `/sdcard/lab/wardrives/wN.log`. Behaviour is controlled by the wardrive config block (see `get_wardrive_config` and the `set_wardrive_*` commands). Reads the config at start.
+- **Startup line** (after GPS fix): echoes the active config, e.g.
 ```
-Wardrive promisc: 29 unique networks, D-UCB best ch: 1 (5 visits), GPS: valid
+Wardrive config: bands=wifi24,wifi5,ble channels=popular wifi_delta=5 ble_delta=15 cooldown=0s memcap=40000
+Promiscuous wardrive started. Bands: wifi24,wifi5,ble, WiFi channels: 12
 ```
+- **Periodic status**:
+```
+Wardrive promisc: 58 unique networks, 48 BT devices, 12 relogs, D-UCB best ch: 1 (34 visits), GPS: valid, sats: 5, dist: 1240.0m
+```
+  - `relogs` = re-observation rows written (RSSI/position re-logging; rises with distance while driving).
+- **Notes**: Console prints first sightings live; re-logged rows go to the file only (BLE re-logs also print). With `bands=ble` only, runs a BLE-only wardrive (no channel hopping).
 - **Stop**: Send `stop`.
+
+### `start_wardrive_promisc_trace`
+- **Syntax**: `start_wardrive_promisc_trace`
+- **Description**: Same as `start_wardrive_promisc` plus a per-session KML track at `/sdcard/lab/wardrives/wN_track.kml`.
+- **Stop**: Send `stop`.
+
+### `get_wardrive_config`
+- **Syntax**: `get_wardrive_config`
+- **Description**: Prints the active wardrive configuration (stored in NVS).
+- **Output** (terminated by `[WDCFG] END`):
+```
+[WDCFG] bands=wifi24,wifi5,ble
+[WDCFG] channels=popular
+[WDCFG] custom=
+[WDCFG] wifi_rssi_delta=5
+[WDCFG] ble_rssi_delta=15
+[WDCFG] startup_cooldown=0
+[WDCFG] mem_cap=40000
+[WDCFG] antisurv_sensitivity=med
+[WDCFG] END
+```
+- **Completion marker**: `strstr("[WDCFG] END")`.
+- **Parse**: split each `[WDCFG] key=value` line on `=`.
+
+### `set_wardrive_bands`
+- **Syntax**: `set_wardrive_bands <wifi24|wifi5|ble>[,...]`
+- **Description**: Choose which radios the wardrive uses (any comma-separated mix). `ble` only = BLE-only wardrive.
+- **Examples**: `set_wardrive_bands wifi24,wifi5,ble`, `set_wardrive_bands wifi24,ble`, `set_wardrive_bands ble`
+- **Output**: `Wardrive bands set: wifi24,wifi5,ble`
+- **Errors**: `Unknown band '<x>'. Valid: wifi24, wifi5, ble`
+
+### `set_wardrive_channels`
+- **Syntax**: `set_wardrive_channels <popular|all|custom> [c1:c2:...]`
+- **Description**: Channel selection. `popular` = 2.4 GHz 1/6/11 + 5 GHz non-DFS; `all` = every tier (default); `custom` = colon-separated list (validated, tier auto-classified).
+- **Examples**: `set_wardrive_channels popular`, `set_wardrive_channels all`, `set_wardrive_channels custom 1:6:11:36:149`
+- **Output**: `Wardrive channels set: custom 1:6:11:36:149`
+
+### `set_wardrive_rssi_delta`
+- **Syntax**: `set_wardrive_rssi_delta <wifi|ble> <0-50>`
+- **Description**: Re-log threshold in dBm. A network/device is re-written when its RSSI changes by ≥ this (or after moving beyond GPS accuracy). `0` = legacy "log once".
+- **Examples**: `set_wardrive_rssi_delta wifi 5`, `set_wardrive_rssi_delta ble 15`, `set_wardrive_rssi_delta wifi 0`
+- **Output**: `Wardrive RSSI delta set: wifi=5 ble=15 (0=log once)`
+
+### `set_wardrive_memcap`
+- **Syntax**: `set_wardrive_memcap <1000-200000>`
+- **Description**: Max Wi-Fi entries in RAM before the oldest already-written entries are evicted. Default 40000.
+- **Output**: `Wardrive memory cap set: 40000 entries`
+
+### `set_wardrive_cooldown`
+- **Syntax**: `set_wardrive_cooldown <0-600>`
+- **Description**: Drop all scans during the first N seconds of a run (after GPS fix) so the start area is not logged. `0` = off (default).
+- **Output**: `Wardrive startup cooldown set: 30 s`
+
+### `wardrive_blacklist`
+- **Syntax**: `wardrive_blacklist <add|remove|list|clear> [MAC]`
+- **Description**: MAC blacklist (max 64) excluded from wardrive results, exports, and anti-surveillance. Stored in NVS.
+- **Examples**: `wardrive_blacklist add AA:BB:CC:DD:EE:FF`, `wardrive_blacklist list`, `wardrive_blacklist clear`
+- **List output** (terminated by `Blacklist END`):
+```
+Blacklist: 1/64 entries
+  AA:BB:CC:DD:EE:FF
+Blacklist END
+```
+
+---
+
+## Anti-Surveillance
+
+### `start_antisurveillance`
+- **Syntax**: `start_antisurveillance`
+- **Description**: Detects a BLE device that moves along with you (a possible tail). Runs a continuous BLE scan + GPS; flags a device as a follower when it has been present long enough AND you have travelled far enough while it stayed in range AND it was seen in the last 30 s. Does not log networks to SD. Thresholds come from `set_antisurv_sensitivity`. Blacklisted MACs are ignored.
+- **Alert line** (per newly flagged device):
+```
+[FOLLOWER] MAC=AA:BB:CC:DD:EE:FF name="Smart Tag" type=SmartTag rssi=-60 seen=240s travel=2100m
+```
+- **Parse**: `MAC=`, `name="..."`, `type=` (AirTag|SmartTag|device), `rssi=`, `seen=Ns`, `travel=Nm`.
+- **Notes**: Needs a GPS fix and movement. A loop back to start can flag a stationary device near the origin — blacklist your own devices; most reliable on a one-way route.
+- **Stop**: Send `stop`.
+
+### `set_antisurv_sensitivity`
+- **Syntax**: `set_antisurv_sensitivity <low|med|high>`
+- **Description**: Follower-detection sensitivity. Stored in NVS; also shown by `get_wardrive_config`.
+
+| Level | Min duration | Min travel | Randomized MACs |
+|-------|-------------|-----------|-----------------|
+| low   | 300 s       | 1000 m    | excluded |
+| med   | 180 s       | 500 m     | excluded |
+| high  | 120 s       | 300 m     | included |
+
+- **Output**: `Anti-surveillance sensitivity: high (>=120s present, >=300m travel, randoms=yes)`
 
 ---
 
@@ -689,17 +796,153 @@ SSID removed. 2 SSIDs remaining.
 ## WiGLE Integration
 
 ### `wigle_key`
-- **Syntax**: `wigle_key set <api_name> <api_token>` or `wigle_key set <api_name:api_token>` or `wigle_key read`
-- **Description**: Set or read WiGLE API credentials.
+- **Syntax**: `wigle_key set <api_name> <api_token>` or `wigle_key set <api_name:api_token>` or `wigle_key read` or `wigle_key clear`
+- **Description**: Set, read, or clear WiGLE API credentials from NVS. `/sdcard/lab/wigle.txt` is read only during upload and is not persisted to NVS.
 
 ### `wigle_upload`
-- **Syntax**: `wigle_upload` or `wigle_upload [file1 file2 ...]`
-- **Description**: Uploads wardrive files to WiGLE. No args = upload all.
+- **Syntax**: `wigle_upload` or `wigle_upload [file1 file2 ...]` or `wigle_upload all`
+- **Description**: Uploads wardrive files to WiGLE. No args = upload files not marked `wigle=done` in `/sdcard/lab/wardrives/upload_state.csv`; `all` ignores the local manifest.
 - **Prerequisite**: WiFi connected, `wigle_key` set.
+- **Output markers**: Upload state is also exposed via `upload_state` / `wardrive_files`.
+
+### `wdgwars_key`
+- **Syntax**: `wdgwars_key set <key>` or `wdgwars_key read` or `wdgwars_key clear`
+- **Description**: Set, read, or clear WDGWars API key from NVS. `/sdcard/lab/wdgwars.txt` is read only during upload and is not persisted to NVS.
+
+### `wdgwars_upload`
+- **Syntax**: `wdgwars_upload` or `wdgwars_upload [file1 file2 ...]` or `wdgwars_upload all`
+- **Description**: Uploads wardrive files to WDGWars. No args = upload files not marked `wdgwars=done`; `all` ignores the local manifest. Uses the v2 queued CSV upload API and local WigleWifi-1.6 preflight/sanitization. HTTP 429 opens a local circuit breaker/backoff and stops the batch.
+- **Prerequisite**: WiFi connected, `wdgwars_key` set.
+- **Output**: `"Done: U uploaded, S skipped, F failed, R rate_limited"`. A rate-limited stop is a controlled pause and should not be treated as a fatal command error.
+
+### `upload_state`
+- **Syntax**: `upload_state` or `upload_state clear`
+- **Description**: Prints or clears `/sdcard/lab/wardrives/upload_state.csv`. Clearing does not delete wardrive files.
+- **Output**:
+```
+[UPLOAD_STATE] BEGIN
+[UPLOAD_STATE] service=wdgwars filename=w21.log size=123456 hash=8F3A91C2 status=done wifi=900 ble=334 bt=0 bad=0
+[UPLOAD_STATE] END
+```
+Status may be `done`, `failed`, or `rate_limited`.
+
+### `wardrive_files`
+- **Syntax**: `wardrive_files`
+- **Description**: Lists local wardrive files with streaming hash, local row stats, and upload status for WiGLE/WDGWars.
+- **Output**:
+```
+[WARD_FILE] BEGIN
+[WARD_FILE] filename=w21.log size=123456 hash=8F3A91C2 wifi=900 ble=334 bt=0 bad=0 wigle=done wdgwars=pending
+[WARD_FILE] SUMMARY files=1 bytes=123456 rows=1234 devices=1234 wifi=900 ble=334 bt=0 bad=0 wigle_ok=1 wigle_pending=0 wigle_failed=0 wigle_rate_limited=0 wdgwars_ok=0 wdgwars_pending=1 wdgwars_failed=0 wdgwars_rate_limited=0
+[WARD_FILE] END
+```
+Upload status may be `pending`, `done`, `failed`, or `rate_limited`. The `SUMMARY` line appears before `END`; `*_ok` means files marked `done`, and `devices` is an alias for valid data `rows`.
+
+### `wardrive_cleanup`
+- **Syntax**: `wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]`
+- **Description**: Dry-run or move wardrive files by local upload status. Matching files are moved to `/sdcard/lab/wardrives/uploaded/<service>/<status>/` only when `move` is passed, or to `/sdcard/lab/wardrives/uploaded/<service>/<status>/<destination>/` when a safe destination token is supplied. `ok` = `done`; `fail` = `failed`. For `all`, both WiGLE and WDGWars statuses must match.
+- **Output**:
+```
+[WARD_CLEANUP] BEGIN service=wdgwars status=done mode=dry-run target=/sdcard/lab/wardrives/uploaded/wdgwars/done
+[WARD_CLEANUP] filename=w21.log size=123456 hash=8F3A91C2 wigle=pending wdgwars=done action=would_move target=/sdcard/lab/wardrives/uploaded/wdgwars/done/w21.log
+[WARD_CLEANUP] SUMMARY scanned=23 matched=4 moved=0 failed=0 dry_run=1
+[WARD_CLEANUP] END
+```
+
+### `wardrive_fix`
+- **Syntax**: `wardrive_fix <file>`
+- **Description**: Creates a soft-fixed `.fixed.log` copy with canonical WigleWifi-1.6 headers and only valid 14-field `WIFI/BLE/BT` rows. Original file is unchanged.
+- **Output**:
+```
+[WARD_FIX] BEGIN
+[WARD_FIX] filename=w21.log output=w21.fixed.log size=120000 hash=41D2A003 kept=11880 dropped=80 wifi=9000 ble=2880 bt=0 bad=80 status=ok
+[WARD_FIX] END
+```
 
 ---
 
 ## Detection & Monitoring
+
+### `start_zig_recon`
+- **Syntax**: `start_zig_recon [all|11,15,20] [dwell_ms]`
+- **Description**: Starts passive IEEE 802.15.4 recon on native ESP32-C5 radio. Hops channels 11-26 by default and discovers PANs/nodes for Zigbee/Thread-style networks without joining or transmitting.
+- **Examples**:
+  - `start_zig_recon` -- all channels, 250 ms dwell
+  - `start_zig_recon all 500` -- all channels, 500 ms dwell
+  - `start_zig_recon 11,15,20 250` -- selected channels
+- **Output**:
+```
+802.15.4 recon started. channels=11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26 dwell_ms=250 mode=passive. Use 'stop' to end.
+```
+- **Error outputs**:
+  - `FAILED: radio busy (<mode>). Use 'stop' first.`
+  - `dwell_ms must be 50-5000`
+  - `FAILED: zig_recon_start: <esp_err>`
+- **Stop**: Send `stop`.
+- **Notes**: Exclusive radio mode. Refuses to start while Wi-Fi sniffing/wardrive/BLE scan/nRF24 or another active operation owns the radio.
+
+### `zig_recon_status`
+- **Syntax**: `zig_recon_status`
+- **Description**: Prints human-readable recon status and one machine-readable `[ZIG] status` line.
+- **Output**:
+```
+802.15.4 Recon: running
+Channel: 11  Packets: 55  Networks: 4  Dropped: 0
+Hopping: 11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26 dwell=250ms  Mode: passive
+[ZIG] status active=1 channel=11 packets=55 pans=4 nodes=6 dropped=0 dwell_ms=250 channels=0x07fff800
+[ZIG] END
+```
+- **Completion marker**: `"[ZIG] END"`.
+
+### `zig_recon_list`
+- **Syntax**: `zig_recon_list [all]`
+- **Description**: Lists discovered 802.15.4 PANs. Without `all`, hides broadcast PAN `0xFFFF` and prints at most 20 network PANs to avoid UART flooding.
+- **Output**:
+```
+PAN       Proto       Ch                 Nodes  Packets  RSSI  Last
+0x1A62    Zigbee      11,15                  6       48   -63  2s
+[ZIG] pan id=0x1A62 kind=network proto=zigbee confidence=probable channels=0x00008800 nodes=6 packets=48 best_rssi=-63 last_rssi=-67 last_seen_ms=123456 age_ms=2000
+[ZIG] END
+```
+- **Machine fields**: `id`, `kind`, `proto`, `confidence`, `channels`, `nodes`, `packets`, `best_rssi`, `last_rssi`, `last_seen_ms`, `age_ms`.
+- **Notes**: `kind=broadcast` is used for `PAN 0xFFFF`; it appears only with `zig_recon_list all`.
+- **Protocol tokens**: `ieee802154`, `zigbee`, `thread`, `matter_thread`. `matter_thread` is a best-effort passive hint and should be displayed as `Matter/Thread?` unless later evidence confirms it.
+- **Completion marker**: `"[ZIG] END"`.
+
+### `zig_recon_nodes`
+- **Syntax**: `zig_recon_nodes <pan_id|all>`
+- **Description**: Lists nodes seen in a PAN, or all nodes across all PANs for UI sync.
+- **Example**: `zig_recon_nodes 0x1A62`
+- **Output**:
+```
+PAN 0x1A62  Proto: Zigbee  Channels: 11,15  Packets: 48
+ADDR      ROLE         PKTS  RSSI  LAST
+0x0000    Coordinator    42   -63  2s
+[ZIG] node pan=0x1A62 addr_type=short short=0x0000 ext=na role=coordinator packets=42 last_rssi=-63 best_rssi=-58 avg_rssi=-61 lqi=172 sample_count=42 last_channel=11 vendor=na device_hint=na battery=na last_seen_ms=123456 age_ms=2000
+[ZIG] END
+```
+- **Machine fields**: `pan`, `addr_type`, `short`, `ext`, `role`, `packets`, `last_rssi`, `best_rssi`, `avg_rssi`, `lqi`, `sample_count`, `last_channel`, `vendor`, `device_hint`, `battery`, `last_seen_ms`, `age_ms`.
+- **Notes**: `last_seen_ms` is device uptime timestamp in milliseconds; `age_ms` is the age of the observation and is the preferred UI field for "last seen".
+- **Signal notes**: `best_rssi`, `avg_rssi`, `sample_count`, `last_channel`, and `lqi` are passive signal hints, not distance. `vendor`, `device_hint`, and `battery` are `na` unless a later parser can prove them from observed frames.
+- **Locate/track UI guidance**: A UI may pin a node and refresh this line from repeated `zig_recon_nodes all` polling. Use `last_rssi`, `avg_rssi`, `best_rssi`, `lqi`, `sample_count`, `last_channel`, and `age_ms` to show a passive "Locate" panel. Suggested trend labels:
+  - `warming up`: `sample_count < 2`
+  - `closer`: `last_rssi >= avg_rssi + 4`
+  - `farther`: `last_rssi <= avg_rssi - 4`
+  - `steady`: otherwise
+  These labels mean relative signal trend only. Do not display meters or claim physical distance from RSSI.
+- **Locate UX contract**: selecting a node starts passive locate for that node; selecting the same node again stops locate. Selecting another PAN/network or leaving/collapsing the expanded network view must clear the current locate target.
+- **Addressing**: `addr_type=short` means `short` is a real 16-bit node address. `addr_type=ext` means no short address was present; use `ext` as the node key and display address. `short=na` must not be rendered as `0xFFFF`.
+- **Completion marker**: `"[ZIG] END"`.
+
+### `zig_recon_clear`
+- **Syntax**: `zig_recon_clear`
+- **Description**: Clears current 802.15.4 recon counters and discovered PAN/node tables.
+- **Output**:
+```
+[ZIG] cleared
+[ZIG] END
+```
+- **Completion marker**: `"[ZIG] END"`.
 
 ### `deauth_detector`
 - **Syntax**: `deauth_detector` or `deauth_detector [index1 index2 ...]`

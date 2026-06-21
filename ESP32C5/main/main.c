@@ -95,6 +95,7 @@
 #include "sniffer.h"
 #include "oled_display.h"
 #include "nrf24_jammer.h"
+#include "zig_recon.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -124,7 +125,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.5"
+#define JANOS_VERSION "1.6.6"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -155,8 +156,14 @@
 #define WDGWARS_NVS_NAMESPACE "wdgwars"
 #define WDGWARS_NVS_KEY       "api_key"
 #define WDGWARS_URL           "https://wdgwars.pl/api/upload-csv"
+#define WDGWARS_V2_URL        "https://wdgwars.pl/api/v2/upload-csv"
+#define WDGWARS_V2_JOB_URL_BASE "https://wdgwars.pl/api/v2/upload-job/"
 #define WDGWARS_HISTORY_URL   "https://wdgwars.pl/api/upload-history?limit=5"
 #define WDGWARS_KEY_MAX_LEN   65
+#define WDGWARS_MAX_UPLOAD_BYTES (60L * 1024L * 1024L)
+#define WDGWARS_RESULT_RATE_LIMITED 3
+#define WDGWARS_BACKOFF_BASE_MS 15000
+#define WDGWARS_BACKOFF_MAX_MS 120000
 
 #define DISPLAY_NVS_NAMESPACE "display"
 #define DISPLAY_NVS_KEY_MODE  "mode"
@@ -294,6 +301,9 @@ static char wpasec_api_key[WPASEC_KEY_MAX_LEN] = "";
 static char wigle_api_name[WIGLE_KEY_MAX_LEN] = "";
 static char wigle_api_token[WIGLE_KEY_MAX_LEN] = "";
 static char wdgwars_api_key[WDGWARS_KEY_MAX_LEN] = "";
+static int64_t wdgwars_circuit_open_until_us = 0;
+static int wdgwars_rate_limit_streak = 0;
+static esp_err_t sd_last_init_error = ESP_OK;
 
 // ARP ban state
 static volatile bool arp_ban_active = false;
@@ -608,6 +618,7 @@ static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112
 #define WDP_PSRAM_RESERVE_BYTES   (64 * 1024)
 #define WDP_STATS_INTERVAL_US     (30 * 1000000LL)
 #define WDP_FILE_FLUSH_INTERVAL   50
+#define WDP_RELOG_DISTANCE_M      25.0   // re-log a known AP after moving this far (WiGLE trilateration)
 
 typedef enum {
     WDP_TIER_24_PRIMARY,
@@ -628,13 +639,19 @@ typedef struct {
     uint8_t  bssid[6];
     char     ssid[33];
     uint8_t  channel;
-    int8_t   rssi;
+    int8_t   rssi;                 // latest reading
     wifi_auth_mode_t authmode;
-    bool     written_to_file;
+    bool     needs_log;            // pending write to SD (new sighting or re-log)
+    int8_t   last_logged_rssi;     // RSSI at the last written row
+    bool     last_logged_valid;    // last_logged_lat/lon hold a real position
+    double   last_logged_lat;
+    double   last_logged_lon;
 } wdp_network_t;
 
 static bool wardrive_promisc_active = false;
 static TaskHandle_t wardrive_promisc_task_handle = NULL;
+static volatile bool antisurv_active = false;
+static TaskHandle_t antisurv_task_handle = NULL;
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
 static double wdp_ducb_discounted_total = 0.0;
@@ -643,6 +660,9 @@ static volatile int wdp_seen_count = 0;
 static volatile int wdp_seen_capacity = 0;
 static volatile bool wdp_needs_grow = false;
 static volatile int wdp_dwell_new_networks = 0;
+static volatile bool wdp_relog_pending = false;   // a known network needs re-logging (RSSI/position changed)
+static volatile int  wdp_relog_writes = 0;        // count of re-observation rows written this session
+static volatile int64_t wdp_log_gate_until_us = 0; // drop all logging until this time (startup cooldown)
 
 // ============================================================================
 // Radio Mode State (lazy initialization)
@@ -651,7 +671,8 @@ static volatile int wdp_dwell_new_networks = 0;
 typedef enum {
     RADIO_MODE_NONE,
     RADIO_MODE_WIFI,
-    RADIO_MODE_BLE
+    RADIO_MODE_BLE,
+    RADIO_MODE_IEEE802154
 } radio_mode_t;
 
 static radio_mode_t current_radio_mode = RADIO_MODE_NONE;
@@ -659,6 +680,7 @@ static bool wifi_initialized = false;
 static bool netif_initialized = false;
 static bool event_loop_initialized = false;
 static esp_netif_t *sta_netif_handle = NULL;
+static esp_netif_t *ap_netif_handle = NULL;
 static bool wifi_event_handler_registered = false;
 static bool ip_event_handler_registered = false;
 static bool ota_check_started = false;
@@ -730,6 +752,20 @@ typedef struct {
     uint16_t company_id;
     bool is_airtag;
     bool is_smarttag;
+    // Wardrive re-log bookkeeping (used only while wardrive_promisc_active)
+    bool   needs_log;
+    int8_t last_logged_rssi;
+    bool   last_logged_valid;
+    double last_logged_lat;
+    double last_logged_lon;
+    // Anti-surveillance tracking (used only while antisurv_active)
+    int64_t as_first_us;        // first time this device was seen
+    int64_t as_last_us;         // most recent sighting
+    bool    as_has_origin;      // as_origin_lat/lon hold the first known position
+    double  as_origin_lat;
+    double  as_origin_lon;
+    double  as_max_dist_m;      // furthest we travelled from origin while it stayed visible
+    bool    as_alerted;         // already raised as a follower
 } bt_device_info_t;
 
 static bt_device_info_t *bt_devices = NULL;                 // ~5.5 KB in PSRAM
@@ -808,6 +844,478 @@ static void channel_time_load_state_from_nvs(void) {
         g_scan_max_channel_time = max_val;
     }
     nvs_close(handle);
+}
+
+// ============================================================================
+// Wardrive configuration (bands / channels / data-quality) — persisted in NVS
+// Foundation only: loaded at boot and exposed via get_wardrive_config.
+// Consumers (wdp_ducb_init, dedup, cooldown...) are wired in later steps.
+// ============================================================================
+
+typedef enum {
+    WD_BAND_24  = 1 << 0,   // 2.4 GHz WiFi
+    WD_BAND_5   = 1 << 1,   // 5 GHz WiFi
+    WD_BAND_BLE = 1 << 2,   // Bluetooth LE
+} wd_band_flags_t;
+
+#define WD_BAND_ALL (WD_BAND_24 | WD_BAND_5 | WD_BAND_BLE)
+
+typedef enum {
+    WD_CH_POPULAR = 0,   // 2.4: 1,6,11 + 5G non-DFS
+    WD_CH_ALL     = 1,   // all four tiers (default = current behavior)
+    WD_CH_CUSTOM  = 2,   // explicit list in custom_ch[]
+} wd_channel_mode_t;
+
+#define WD_CUSTOM_CH_MAX 64
+
+typedef struct {
+    uint8_t  bands;                         // wd_band_flags_t bitmask
+    uint8_t  ch_mode;                       // wd_channel_mode_t
+    uint8_t  custom_ch[WD_CUSTOM_CH_MAX];   // valid when ch_mode == WD_CH_CUSTOM
+    uint8_t  custom_ch_count;
+    int8_t   wifi_rssi_delta;               // re-log threshold dBm (0 = log once, current behavior)
+    int8_t   ble_rssi_delta;                // re-log threshold dBm
+    uint16_t startup_cooldown_s;            // drop scans during first N seconds
+    uint32_t mem_cap;                       // hard cap on in-RAM entries
+    uint8_t  antisurv_sensitivity;          // 0=low, 1=med, 2=high (follower detection)
+} wardrive_config_t;
+
+typedef enum {
+    WD_AS_LOW  = 0,
+    WD_AS_MED  = 1,
+    WD_AS_HIGH = 2,
+} wd_antisurv_sensitivity_t;
+
+static wardrive_config_t g_wd_cfg;
+
+#define WD_CFG_NVS_NAMESPACE    "wdcfg"
+#define WD_CFG_NVS_KEY_BANDS    "bands"
+#define WD_CFG_NVS_KEY_CHMODE   "chmode"
+#define WD_CFG_NVS_KEY_CUSTOM   "customch"     // blob
+#define WD_CFG_NVS_KEY_WDELTA   "wdelta"
+#define WD_CFG_NVS_KEY_BDELTA   "bdelta"
+#define WD_CFG_NVS_KEY_COOLDOWN "cooldown"
+#define WD_CFG_NVS_KEY_MEMCAP   "memcap"
+#define WD_CFG_NVS_KEY_ASSENS   "assens"
+
+static void wardrive_config_defaults(void) {
+    memset(&g_wd_cfg, 0, sizeof(g_wd_cfg));
+    g_wd_cfg.bands              = WD_BAND_ALL;
+    g_wd_cfg.ch_mode            = WD_CH_ALL;
+    g_wd_cfg.custom_ch_count    = 0;
+    g_wd_cfg.wifi_rssi_delta    = 5;
+    g_wd_cfg.ble_rssi_delta     = 15;
+    g_wd_cfg.startup_cooldown_s = 0;
+    g_wd_cfg.mem_cap            = 40000;
+    g_wd_cfg.antisurv_sensitivity = WD_AS_MED;
+}
+
+static void wardrive_config_persist(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WD_CFG_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wardrive cfg NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    nvs_set_u8(handle, WD_CFG_NVS_KEY_BANDS, g_wd_cfg.bands);
+    nvs_set_u8(handle, WD_CFG_NVS_KEY_CHMODE, g_wd_cfg.ch_mode);
+    nvs_set_blob(handle, WD_CFG_NVS_KEY_CUSTOM, g_wd_cfg.custom_ch, g_wd_cfg.custom_ch_count);
+    nvs_set_i8(handle, WD_CFG_NVS_KEY_WDELTA, g_wd_cfg.wifi_rssi_delta);
+    nvs_set_i8(handle, WD_CFG_NVS_KEY_BDELTA, g_wd_cfg.ble_rssi_delta);
+    nvs_set_u16(handle, WD_CFG_NVS_KEY_COOLDOWN, g_wd_cfg.startup_cooldown_s);
+    nvs_set_u32(handle, WD_CFG_NVS_KEY_MEMCAP, g_wd_cfg.mem_cap);
+    nvs_set_u8(handle, WD_CFG_NVS_KEY_ASSENS, g_wd_cfg.antisurv_sensitivity);
+    err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wardrive cfg NVS save failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void wardrive_config_load_from_nvs(void) {
+    wardrive_config_defaults();
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WD_CFG_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;   // first boot: keep defaults
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wardrive cfg NVS read open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t u8;
+    if (nvs_get_u8(handle, WD_CFG_NVS_KEY_BANDS, &u8) == ESP_OK && (u8 & WD_BAND_ALL)) {
+        g_wd_cfg.bands = u8 & WD_BAND_ALL;
+    }
+    if (nvs_get_u8(handle, WD_CFG_NVS_KEY_CHMODE, &u8) == ESP_OK && u8 <= WD_CH_CUSTOM) {
+        g_wd_cfg.ch_mode = u8;
+    }
+
+    uint8_t tmp[WD_CUSTOM_CH_MAX];
+    size_t blob_len = sizeof(tmp);
+    if (nvs_get_blob(handle, WD_CFG_NVS_KEY_CUSTOM, tmp, &blob_len) == ESP_OK &&
+        blob_len <= WD_CUSTOM_CH_MAX) {
+        memcpy(g_wd_cfg.custom_ch, tmp, blob_len);
+        g_wd_cfg.custom_ch_count = (uint8_t)blob_len;
+    }
+
+    int8_t i8;
+    if (nvs_get_i8(handle, WD_CFG_NVS_KEY_WDELTA, &i8) == ESP_OK && i8 >= 0 && i8 <= 50) {
+        g_wd_cfg.wifi_rssi_delta = i8;
+    }
+    if (nvs_get_i8(handle, WD_CFG_NVS_KEY_BDELTA, &i8) == ESP_OK && i8 >= 0 && i8 <= 50) {
+        g_wd_cfg.ble_rssi_delta = i8;
+    }
+
+    uint16_t u16;
+    if (nvs_get_u16(handle, WD_CFG_NVS_KEY_COOLDOWN, &u16) == ESP_OK) {
+        g_wd_cfg.startup_cooldown_s = u16;
+    }
+
+    uint32_t u32;
+    if (nvs_get_u32(handle, WD_CFG_NVS_KEY_MEMCAP, &u32) == ESP_OK && u32 >= 1000) {
+        g_wd_cfg.mem_cap = u32;
+    }
+
+    if (nvs_get_u8(handle, WD_CFG_NVS_KEY_ASSENS, &u8) == ESP_OK && u8 <= WD_AS_HIGH) {
+        g_wd_cfg.antisurv_sensitivity = u8;
+    }
+
+    nvs_close(handle);
+}
+
+// Format the active band mask into "wifi24,wifi5,ble" (caller buffer >= 24 bytes).
+static void wardrive_config_format_bands(char *out, size_t out_sz) {
+    snprintf(out, out_sz, "%s%s%s",
+             (g_wd_cfg.bands & WD_BAND_24)  ? "wifi24," : "",
+             (g_wd_cfg.bands & WD_BAND_5)   ? "wifi5,"  : "",
+             (g_wd_cfg.bands & WD_BAND_BLE) ? "ble,"    : "");
+    size_t len = strlen(out);
+    if (len > 0 && out[len - 1] == ',') out[len - 1] = '\0';   // strip trailing comma
+}
+
+// Format the custom channel list into "1:6:11:36" (caller buffer should be large).
+static void wardrive_config_format_custom(char *out, size_t out_sz) {
+    out[0] = '\0';
+    for (int i = 0; i < g_wd_cfg.custom_ch_count; i++) {
+        char part[6];
+        snprintf(part, sizeof(part), "%s%d", (i == 0) ? "" : ":", g_wd_cfg.custom_ch[i]);
+        size_t len = strlen(out);
+        if (len + strlen(part) + 1 >= out_sz) break;
+        strcpy(out + len, part);
+    }
+}
+
+static void wardrive_config_print(void) {
+    char bands_str[24];
+    wardrive_config_format_bands(bands_str, sizeof(bands_str));
+
+    const char *chmode_str = (g_wd_cfg.ch_mode == WD_CH_POPULAR) ? "popular" :
+                             (g_wd_cfg.ch_mode == WD_CH_CUSTOM)  ? "custom"  : "all";
+
+    char custom_str[WD_CUSTOM_CH_MAX * 4];
+    wardrive_config_format_custom(custom_str, sizeof(custom_str));
+
+    printf("[WDCFG] bands=%s\n", bands_str);
+    printf("[WDCFG] channels=%s\n", chmode_str);
+    printf("[WDCFG] custom=%s\n", custom_str);
+    printf("[WDCFG] wifi_rssi_delta=%d\n", g_wd_cfg.wifi_rssi_delta);
+    printf("[WDCFG] ble_rssi_delta=%d\n", g_wd_cfg.ble_rssi_delta);
+    printf("[WDCFG] startup_cooldown=%u\n", (unsigned)g_wd_cfg.startup_cooldown_s);
+    printf("[WDCFG] mem_cap=%u\n", (unsigned)g_wd_cfg.mem_cap);
+    printf("[WDCFG] antisurv_sensitivity=%s\n",
+           (g_wd_cfg.antisurv_sensitivity == WD_AS_LOW)  ? "low" :
+           (g_wd_cfg.antisurv_sensitivity == WD_AS_HIGH) ? "high" : "med");
+    printf("[WDCFG] END\n");
+}
+
+// get_wardrive_config: dump active config (machine-parseable, "[WDCFG] END" marker).
+static int cmd_get_wardrive_config(int argc, char **argv) {
+    (void)argc; (void)argv;
+    wardrive_config_print();
+    return 0;
+}
+
+// Defined later with the wardrive-promisc helpers; needed by the set command below.
+static bool wdp_channel_is_known(int ch);
+
+// set_wardrive_bands wifi24,wifi5,ble — choose which radios the wardrive uses.
+static int cmd_set_wardrive_bands(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: set_wardrive_bands <wifi24|wifi5|ble>[,...]  (e.g. wifi24,ble)\n");
+        return 1;
+    }
+    char buf[64];
+    strncpy(buf, argv[1], sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    uint8_t mask = 0;
+    char *tok = strtok(buf, ",");
+    while (tok != NULL) {
+        if (strcmp(tok, "wifi24") == 0 || strcmp(tok, "24") == 0 || strcmp(tok, "2.4") == 0)
+            mask |= WD_BAND_24;
+        else if (strcmp(tok, "wifi5") == 0 || strcmp(tok, "5") == 0 || strcmp(tok, "5g") == 0)
+            mask |= WD_BAND_5;
+        else if (strcmp(tok, "ble") == 0 || strcmp(tok, "bt") == 0)
+            mask |= WD_BAND_BLE;
+        else {
+            printf("Unknown band '%s'. Valid: wifi24, wifi5, ble\n", tok);
+            return 1;
+        }
+        tok = strtok(NULL, ",");
+    }
+    if (mask == 0) {
+        printf("No valid bands given.\n");
+        return 1;
+    }
+    g_wd_cfg.bands = mask;
+    wardrive_config_persist();
+
+    char bands_str[24];
+    wardrive_config_format_bands(bands_str, sizeof(bands_str));
+    printf("Wardrive bands set: %s\n", bands_str);
+    wardrive_config_print();
+    return 0;
+}
+
+// set_wardrive_channels <popular|all|custom> [1:6:11:36] — channel selection.
+static int cmd_set_wardrive_channels(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: set_wardrive_channels <popular|all|custom> [1:6:11:36]\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "popular") == 0) {
+        g_wd_cfg.ch_mode = WD_CH_POPULAR;
+        g_wd_cfg.custom_ch_count = 0;
+    } else if (strcmp(argv[1], "all") == 0) {
+        g_wd_cfg.ch_mode = WD_CH_ALL;
+        g_wd_cfg.custom_ch_count = 0;
+    } else if (strcmp(argv[1], "custom") == 0) {
+        if (argc < 3) {
+            printf("custom needs a list, e.g. set_wardrive_channels custom 1:6:11:36\n");
+            return 1;
+        }
+        char buf[256];
+        strncpy(buf, argv[2], sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+
+        uint8_t list[WD_CUSTOM_CH_MAX];
+        int count = 0;
+        char *tok = strtok(buf, ":");
+        while (tok != NULL) {
+            int ch = atoi(tok);
+            if (!wdp_channel_is_known(ch)) {
+                printf("Channel %d is not a supported channel, ignoring.\n", ch);
+            } else if (count >= WD_CUSTOM_CH_MAX) {
+                printf("Too many channels (max %d), ignoring rest.\n", WD_CUSTOM_CH_MAX);
+                break;
+            } else {
+                bool dup = false;
+                for (int i = 0; i < count; i++) if (list[i] == ch) { dup = true; break; }
+                if (!dup) list[count++] = (uint8_t)ch;
+            }
+            tok = strtok(NULL, ":");
+        }
+        if (count == 0) {
+            printf("No valid channels parsed.\n");
+            return 1;
+        }
+        memcpy(g_wd_cfg.custom_ch, list, (size_t)count);
+        g_wd_cfg.custom_ch_count = (uint8_t)count;
+        g_wd_cfg.ch_mode = WD_CH_CUSTOM;
+    } else {
+        printf("Unknown mode '%s'. Valid: popular, all, custom\n", argv[1]);
+        return 1;
+    }
+    wardrive_config_persist();
+
+    const char *chmode_str = (g_wd_cfg.ch_mode == WD_CH_POPULAR) ? "popular" :
+                             (g_wd_cfg.ch_mode == WD_CH_CUSTOM)  ? "custom"  : "all";
+    if (g_wd_cfg.ch_mode == WD_CH_CUSTOM) {
+        char custom_str[WD_CUSTOM_CH_MAX * 4];
+        wardrive_config_format_custom(custom_str, sizeof(custom_str));
+        printf("Wardrive channels set: custom %s\n", custom_str);
+    } else {
+        printf("Wardrive channels set: %s\n", chmode_str);
+    }
+    wardrive_config_print();
+    return 0;
+}
+
+// set_wardrive_rssi_delta <wifi|ble> <0-50> — re-log threshold in dBm (0 = log once).
+static int cmd_set_wardrive_rssi_delta(int argc, char **argv) {
+    if (argc < 3) {
+        printf("Usage: set_wardrive_rssi_delta <wifi|ble> <0-50>  (0 = log once)\n");
+        return 1;
+    }
+    int val = atoi(argv[2]);
+    if (val < 0 || val > 50) {
+        printf("Delta must be 0-50 dBm.\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "wifi") == 0) {
+        g_wd_cfg.wifi_rssi_delta = (int8_t)val;
+    } else if (strcmp(argv[1], "ble") == 0) {
+        g_wd_cfg.ble_rssi_delta = (int8_t)val;
+    } else {
+        printf("Unknown target '%s'. Valid: wifi, ble\n", argv[1]);
+        return 1;
+    }
+    wardrive_config_persist();
+    printf("Wardrive RSSI delta set: wifi=%d ble=%d (0=log once)\n",
+           g_wd_cfg.wifi_rssi_delta, g_wd_cfg.ble_rssi_delta);
+    wardrive_config_print();
+    return 0;
+}
+
+// set_wardrive_memcap <1000-200000> — max WiFi entries in RAM before oldest are evicted.
+static int cmd_set_wardrive_memcap(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: set_wardrive_memcap <1000-200000>\n");
+        return 1;
+    }
+    long val = atol(argv[1]);
+    if (val < 1000 || val > 200000) {
+        printf("Memory cap must be 1000-200000 entries.\n");
+        return 1;
+    }
+    g_wd_cfg.mem_cap = (uint32_t)val;
+    wardrive_config_persist();
+    printf("Wardrive memory cap set: %u entries\n", (unsigned)g_wd_cfg.mem_cap);
+    wardrive_config_print();
+    return 0;
+}
+
+// set_wardrive_cooldown <0-600> — drop scans during the first N seconds (hide start area).
+static int cmd_set_wardrive_cooldown(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: set_wardrive_cooldown <0-600>  (seconds, 0 = off)\n");
+        return 1;
+    }
+    int val = atoi(argv[1]);
+    if (val < 0 || val > 600) {
+        printf("Cooldown must be 0-600 seconds.\n");
+        return 1;
+    }
+    g_wd_cfg.startup_cooldown_s = (uint16_t)val;
+    wardrive_config_persist();
+    printf("Wardrive startup cooldown set: %u s\n", (unsigned)g_wd_cfg.startup_cooldown_s);
+    wardrive_config_print();
+    return 0;
+}
+
+// ============================================================================
+// Wardrive device blacklist — MACs excluded from results and WiGLE exports (NVS-backed)
+// ============================================================================
+#define WD_BLACKLIST_MAX     64
+#define WD_BL_NVS_NAMESPACE  "wdbl"
+#define WD_BL_NVS_KEY        "macs"
+
+static uint8_t g_wd_blacklist[WD_BLACKLIST_MAX][6];
+static int     g_wd_blacklist_count = 0;
+
+static bool wardrive_blacklist_contains(const uint8_t *mac) {
+    for (int i = 0; i < g_wd_blacklist_count; i++) {
+        if (memcmp(g_wd_blacklist[i], mac, 6) == 0) return true;
+    }
+    return false;
+}
+
+static void wardrive_blacklist_load(void) {
+    g_wd_blacklist_count = 0;
+    nvs_handle_t handle;
+    if (nvs_open(WD_BL_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return;
+    size_t len = sizeof(g_wd_blacklist);
+    if (nvs_get_blob(handle, WD_BL_NVS_KEY, g_wd_blacklist, &len) == ESP_OK) {
+        g_wd_blacklist_count = (int)(len / 6);
+        if (g_wd_blacklist_count > WD_BLACKLIST_MAX) g_wd_blacklist_count = WD_BLACKLIST_MAX;
+    }
+    nvs_close(handle);
+}
+
+static void wardrive_blacklist_save(void) {
+    nvs_handle_t handle;
+    if (nvs_open(WD_BL_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGW(TAG, "Blacklist NVS open failed");
+        return;
+    }
+    nvs_set_blob(handle, WD_BL_NVS_KEY, g_wd_blacklist, (size_t)g_wd_blacklist_count * 6);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+// Parse "AA:BB:CC:DD:EE:FF" into 6 bytes. Returns true on success.
+static bool wardrive_parse_mac(const char *s, uint8_t *out) {
+    unsigned v[6];
+    if (sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x",
+               &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+    for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
+    return true;
+}
+
+// wardrive_blacklist <add|remove|list|clear> [MAC]
+static int cmd_wardrive_blacklist(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: wardrive_blacklist <add|remove|list|clear> [MAC]\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "list") == 0) {
+        printf("Blacklist: %d/%d entries\n", g_wd_blacklist_count, WD_BLACKLIST_MAX);
+        for (int i = 0; i < g_wd_blacklist_count; i++) {
+            printf("  %02X:%02X:%02X:%02X:%02X:%02X\n",
+                   g_wd_blacklist[i][0], g_wd_blacklist[i][1], g_wd_blacklist[i][2],
+                   g_wd_blacklist[i][3], g_wd_blacklist[i][4], g_wd_blacklist[i][5]);
+        }
+        printf("Blacklist END\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "clear") == 0) {
+        g_wd_blacklist_count = 0;
+        wardrive_blacklist_save();
+        printf("Blacklist cleared.\n");
+        return 0;
+    }
+    if (argc < 3) {
+        printf("'%s' needs a MAC, e.g. wardrive_blacklist add AA:BB:CC:DD:EE:FF\n", argv[1]);
+        return 1;
+    }
+    uint8_t mac[6];
+    if (!wardrive_parse_mac(argv[2], mac)) {
+        printf("Invalid MAC: %s\n", argv[2]);
+        return 1;
+    }
+    if (strcmp(argv[1], "add") == 0) {
+        if (wardrive_blacklist_contains(mac)) {
+            printf("Already blacklisted.\n");
+            return 0;
+        }
+        if (g_wd_blacklist_count >= WD_BLACKLIST_MAX) {
+            printf("Blacklist full (max %d).\n", WD_BLACKLIST_MAX);
+            return 1;
+        }
+        memcpy(g_wd_blacklist[g_wd_blacklist_count++], mac, 6);
+        wardrive_blacklist_save();
+        printf("Blacklisted %s (%d total)\n", argv[2], g_wd_blacklist_count);
+        return 0;
+    }
+    if (strcmp(argv[1], "remove") == 0) {
+        for (int i = 0; i < g_wd_blacklist_count; i++) {
+            if (memcmp(g_wd_blacklist[i], mac, 6) == 0) {
+                for (int j = i; j < g_wd_blacklist_count - 1; j++)
+                    memcpy(g_wd_blacklist[j], g_wd_blacklist[j + 1], 6);
+                g_wd_blacklist_count--;
+                wardrive_blacklist_save();
+                printf("Removed %s (%d total)\n", argv[2], g_wd_blacklist_count);
+                return 0;
+            }
+        }
+        printf("Not found in blacklist.\n");
+        return 1;
+    }
+    printf("Unknown subcommand '%s'. Valid: add, remove, list, clear\n", argv[1]);
+    return 1;
 }
 
 // Calculate dynamic scan timeout based on channel times
@@ -1395,6 +1903,11 @@ static int cmd_start_pcap(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_init_nrf24(int argc, char **argv);
 static int cmd_start_jammer24(int argc, char **argv);
+static int cmd_start_zig_recon(int argc, char **argv);
+static int cmd_zig_recon_status(int argc, char **argv);
+static int cmd_zig_recon_list(int argc, char **argv);
+static int cmd_zig_recon_nodes(int argc, char **argv);
+static int cmd_zig_recon_clear(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
 static int cmd_list_hosts_vendor(int argc, char **argv);
@@ -1412,6 +1925,10 @@ static int cmd_wigle_key(int argc, char **argv);
 static int cmd_wigle_upload(int argc, char **argv);
 static int cmd_wdgwars_key(int argc, char **argv);
 static int cmd_wdgwars_upload(int argc, char **argv);
+static int cmd_upload_state(int argc, char **argv);
+static int cmd_wardrive_files(int argc, char **argv);
+static int cmd_wardrive_cleanup(int argc, char **argv);
+static int cmd_wardrive_fix(int argc, char **argv);
 static int cmd_channel_time(int argc, char **argv);
 static int cmd_ota_check(int argc, char **argv);
 static int cmd_ota_list(int argc, char **argv);
@@ -1451,7 +1968,7 @@ static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *a
 static bool hs_save_handshake_to_sd(int ap_idx);
 static void gps_raw_task(void *pvParameters);
 // Wardrive promisc helpers
-static void wdp_ducb_init(void);
+static void wdp_ducb_init(const wardrive_config_t *cfg);
 static int wdp_ducb_select_channel(void);
 static void wdp_ducb_update(int channel_idx, double reward);
 static int wdp_get_dwell_ms(wdp_channel_tier_t tier);
@@ -1522,6 +2039,7 @@ static void gps_sync_from_selected_external_source(void);
 static void gps_load_state_from_nvs(void);
 static void gps_save_state_to_nvs(void);
 static esp_err_t init_sd_card(void);
+static bool sd_mkdir_recursive(const char *path);
 static esp_err_t create_sd_directories(void);
 static void sd_sync(void);
 static void safe_restart(void);
@@ -2680,6 +3198,26 @@ static bool wigle_save_key_to_nvs(const char *api_name, const char *api_token) {
     return err == ESP_OK;
 }
 
+static bool wigle_clear_key_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIGLE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    esp_err_t err_name = nvs_erase_key(handle, WIGLE_NVS_KEY_NAME);
+    esp_err_t err_token = nvs_erase_key(handle, WIGLE_NVS_KEY_TOKEN);
+    if (err_name == ESP_ERR_NVS_NOT_FOUND) err_name = ESP_OK;
+    if (err_token == ESP_ERR_NVS_NOT_FOUND) err_token = ESP_OK;
+
+    err = (err_name == ESP_OK && err_token == ESP_OK) ? nvs_commit(handle) : ESP_FAIL;
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
 static void wdgwars_load_key_from_nvs(void) {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(WDGWARS_NVS_NAMESPACE, NVS_READONLY, &handle);
@@ -2708,6 +3246,85 @@ static bool wdgwars_save_key_to_nvs(const char *key) {
     }
     nvs_close(handle);
     return err == ESP_OK;
+}
+
+static bool wdgwars_clear_key_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WDGWARS_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = nvs_erase_key(handle, WDGWARS_NVS_KEY);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_OK;
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static bool wigle_load_key_from_sd(void) {
+    FILE *wf = fopen("/sdcard/lab/wigle.txt", "r");
+    if (!wf) {
+        return false;
+    }
+
+    char line[256] = {0};
+    char api_name[WIGLE_KEY_MAX_LEN] = {0};
+    char api_token[WIGLE_KEY_MAX_LEN] = {0};
+    bool loaded = false;
+
+    if (fgets(line, sizeof(line), wf) &&
+        wigle_split_key_pair(line, api_name, sizeof(api_name), api_token, sizeof(api_token))) {
+        snprintf(wigle_api_name, sizeof(wigle_api_name), "%s", api_name);
+        snprintf(wigle_api_token, sizeof(wigle_api_token), "%s", api_token);
+        MY_LOG_INFO(TAG, "WiGLE key loaded from SD for this session.");
+        loaded = true;
+    } else {
+        MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wigle.txt format. Expected: api_name:api_token");
+    }
+
+    fclose(wf);
+    return loaded;
+}
+
+static bool wdgwars_load_key_from_sd(void) {
+    FILE *wf = fopen("/sdcard/lab/wdgwars.txt", "r");
+    if (!wf) {
+        return false;
+    }
+
+    char line[128] = {0};
+    bool loaded = false;
+
+    if (fgets(line, sizeof(line), wf)) {
+        size_t ln = strlen(line);
+        while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r' || isspace((unsigned char)line[ln - 1]))) {
+            line[--ln] = '\0';
+        }
+        char *start = line;
+        while (*start && isspace((unsigned char)*start)) {
+            start++;
+        }
+        if (start[0] != '\0' && strlen(start) < WDGWARS_KEY_MAX_LEN) {
+            strncpy(wdgwars_api_key, start, sizeof(wdgwars_api_key) - 1);
+            wdgwars_api_key[sizeof(wdgwars_api_key) - 1] = '\0';
+            MY_LOG_INFO(TAG, "WDGWars key loaded from SD for this session.");
+            loaded = true;
+        } else if (start[0] != '\0') {
+            MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wdgwars.txt format. Expected one API key (max %d chars).",
+                        WDGWARS_KEY_MAX_LEN - 1);
+        }
+    }
+
+    fclose(wf);
+    return loaded;
 }
 
 // ---------------------------------------------------
@@ -2907,6 +3524,12 @@ static bool ensure_wifi_mode(void)
             current_radio_mode = RADIO_MODE_NONE;
             // Now initialize WiFi (recursive call with RADIO_MODE_NONE)
             return ensure_wifi_mode();
+
+        case RADIO_MODE_IEEE802154:
+            MY_LOG_INFO(TAG, "Switching from 802.15.4 to WiFi mode...");
+            zig_recon_stop();
+            current_radio_mode = RADIO_MODE_NONE;
+            return ensure_wifi_mode();
     }
     return false;
 }
@@ -2950,12 +3573,48 @@ static bool ensure_ble_mode(void)
             // Now initialize BLE (recursive call with RADIO_MODE_NONE)
             return ensure_ble_mode();
         }
+
+        case RADIO_MODE_IEEE802154:
+            MY_LOG_INFO(TAG, "Switching from 802.15.4 to BLE mode...");
+            zig_recon_stop();
+            current_radio_mode = RADIO_MODE_NONE;
+            return ensure_ble_mode();
     }
     return false;
 }
 
-// Track if AP netif was created
-static esp_netif_t *ap_netif_handle = NULL;
+static bool ensure_ieee802154_mode(void)
+{
+    switch (current_radio_mode) {
+        case RADIO_MODE_IEEE802154:
+            return true;
+
+        case RADIO_MODE_NONE:
+            current_radio_mode = RADIO_MODE_IEEE802154;
+            return true;
+
+        case RADIO_MODE_WIFI: {
+            MY_LOG_INFO(TAG, "Switching from WiFi to 802.15.4 mode...");
+            esp_wifi_stop();
+            esp_wifi_deinit();
+            esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if (ap_netif) {
+                esp_netif_destroy(ap_netif);
+            }
+            ap_netif_handle = NULL;
+            wifi_initialized = false;
+            current_radio_mode = RADIO_MODE_IEEE802154;
+            return true;
+        }
+
+        case RADIO_MODE_BLE:
+            MY_LOG_INFO(TAG, "Switching from BLE to 802.15.4 mode...");
+            bt_nimble_deinit();
+            current_radio_mode = RADIO_MODE_IEEE802154;
+            return true;
+    }
+    return false;
+}
 
 /**
  * Enable AP mode (switch to APSTA if needed) for Evil Twin, Portal, etc.
@@ -3268,10 +3927,22 @@ static bool check_channel_changes(void) {
 
 static void escape_csv_field(const char* input, char* output, size_t output_size) {
     if (!input || !output || output_size < 2) return;
-    
+
     size_t input_len = strlen(input);
     size_t out_pos = 0;
-    
+    bool needs_quotes = false;
+
+    for (size_t i = 0; i < input_len; i++) {
+        if (input[i] == ',' || input[i] == '"' || input[i] == '\r' || input[i] == '\n') {
+            needs_quotes = true;
+            break;
+        }
+    }
+
+    if (needs_quotes && out_pos < output_size - 1) {
+        output[out_pos++] = '"';
+    }
+
     for (size_t i = 0; i < input_len && out_pos < output_size - 2; i++) {
         if (input[i] == '"') {
             if (out_pos < output_size - 3) {
@@ -3281,6 +3952,9 @@ static void escape_csv_field(const char* input, char* output, size_t output_size
         } else {
             output[out_pos++] = input[i];
         }
+    }
+    if (needs_quotes && out_pos < output_size - 1) {
+        output[out_pos++] = '"';
     }
     output[out_pos] = '\0';
 }
@@ -4939,41 +5613,78 @@ static void ducb_update(int channel_idx, double reward) {
 // Wardrive Promisc: D-UCB, Dedup, Promiscuous Callback, Task
 // ============================================================================
 
-static void wdp_ducb_init(void) {
+// Append one channel to the D-UCB table. Primary 2.4 tier gets a warm-start reward.
+static void wdp_ducb_add_channel(int channel, wdp_channel_tier_t tier) {
+    if (wdp_ducb_channel_count >= WDP_TOTAL_CHANNELS) return;
+    wdp_ducb_channels[wdp_ducb_channel_count].channel = channel;
+    wdp_ducb_channels[wdp_ducb_channel_count].tier = tier;
+    wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = (tier == WDP_TIER_24_PRIMARY) ? 0.5 : 0.0;
+    wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+    wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+    wdp_ducb_channel_count++;
+}
+
+// Map a channel number to its tier (used for custom lists).
+static wdp_channel_tier_t wdp_classify_channel(int ch) {
+    if (ch <= 14) {
+        for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++)
+            if (wdp_ch_24_primary[i] == ch) return WDP_TIER_24_PRIMARY;
+        return WDP_TIER_24_SECONDARY;
+    }
+    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++)
+        if (wdp_ch_5_dfs[i] == ch) return WDP_TIER_5_DFS;
+    return WDP_TIER_5_NON_DFS;
+}
+
+// Is the channel part of any known tier? (validation for custom lists)
+static bool wdp_channel_is_known(int ch) {
+    if (ch <= 14) {
+        for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++)   if (wdp_ch_24_primary[i] == ch)   return true;
+        for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++) if (wdp_ch_24_secondary[i] == ch) return true;
+        return false;
+    }
+    for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) if (wdp_ch_5_non_dfs[i] == ch) return true;
+    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++)     if (wdp_ch_5_dfs[i] == ch)     return true;
+    return false;
+}
+
+// Build the D-UCB channel table from the active config (bands + channel mode).
+// With bands=all + ch_mode=all this reproduces the original full table exactly.
+static void wdp_ducb_init(const wardrive_config_t *cfg) {
     wdp_ducb_channel_count = 0;
     wdp_ducb_discounted_total = 0.0;
 
-    for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_primary[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_PRIMARY;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.5;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+    const bool want_24 = (cfg->bands & WD_BAND_24) != 0;
+    const bool want_5  = (cfg->bands & WD_BAND_5) != 0;
+
+    if (cfg->ch_mode == WD_CH_CUSTOM) {
+        for (int i = 0; i < cfg->custom_ch_count; i++) {
+            int ch = cfg->custom_ch[i];
+            bool is_24 = (ch <= 14);
+            if (is_24 && !want_24) continue;
+            if (!is_24 && !want_5)  continue;
+            wdp_ducb_add_channel(ch, wdp_classify_channel(ch));
+        }
+        return;
     }
-    for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_secondary[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_SECONDARY;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+
+    // POPULAR = primary 2.4 + 5G non-DFS only.  ALL = every tier.
+    const bool include_secondary = (cfg->ch_mode == WD_CH_ALL);
+    const bool include_dfs       = (cfg->ch_mode == WD_CH_ALL);
+
+    if (want_24) {
+        for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++)
+            wdp_ducb_add_channel(wdp_ch_24_primary[i], WDP_TIER_24_PRIMARY);
+        if (include_secondary)
+            for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++)
+                wdp_ducb_add_channel(wdp_ch_24_secondary[i], WDP_TIER_24_SECONDARY);
     }
-    for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
-    }
-    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+    if (want_5) {
+        for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++)
+            wdp_ducb_add_channel(wdp_ch_5_non_dfs[i], WDP_TIER_5_NON_DFS);
+        if (include_dfs)
+            for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++)
+                wdp_ducb_add_channel(wdp_ch_5_dfs[i], WDP_TIER_5_DFS);
     }
 }
 
@@ -5032,6 +5743,7 @@ static int wdp_find_bssid(const uint8_t *bssid) {
 static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!wardrive_promisc_active) return;
     if (type != WIFI_PKT_MGMT) return;
+    if (esp_timer_get_time() < wdp_log_gate_until_us) return;  // startup cooldown
 
     const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
     const uint8_t *frame = pkt->payload;
@@ -5043,6 +5755,7 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (frame_type != 0x80) return; // Only beacons
 
     const uint8_t *ap_bssid = &frame[10]; // addr2 = transmitter = AP
+    if (wardrive_blacklist_contains(ap_bssid)) return;  // excluded device
 
     const uint8_t *body = frame + 24 + 12;
     int body_len = len - 24 - 12;
@@ -5076,8 +5789,30 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
     int existing = wdp_find_bssid(ap_bssid);
     if (existing >= 0) {
-        if (pkt->rx_ctrl.rssi > wdp_seen_networks[existing].rssi) {
-            wdp_seen_networks[existing].rssi = (int8_t)pkt->rx_ctrl.rssi;
+        int8_t cur_rssi = (int8_t)pkt->rx_ctrl.rssi;
+        wdp_seen_networks[existing].rssi = cur_rssi;   // keep the latest reading for re-log
+
+        // Re-log this AP if its signal or our position moved enough since the last row.
+        // wifi_rssi_delta == 0 keeps the legacy "log once" behavior.
+        if (g_wd_cfg.wifi_rssi_delta > 0 && !wdp_seen_networks[existing].needs_log) {
+            bool trig = false;
+            int rd = cur_rssi - wdp_seen_networks[existing].last_logged_rssi;
+            if (rd < 0) rd = -rd;
+            if (rd >= g_wd_cfg.wifi_rssi_delta) {
+                trig = true;
+            } else if (current_gps.valid && wdp_seen_networks[existing].last_logged_valid) {
+                double moved = gps_distance_meters(wdp_seen_networks[existing].last_logged_lat,
+                                                   wdp_seen_networks[existing].last_logged_lon,
+                                                   current_gps.latitude, current_gps.longitude);
+                // Require real movement beyond GPS noise: max(fixed threshold, reported accuracy).
+                double thresh = WDP_RELOG_DISTANCE_M;
+                if (current_gps.accuracy > thresh) thresh = current_gps.accuracy;
+                if (moved >= thresh) trig = true;
+            }
+            if (trig) {
+                wdp_seen_networks[existing].needs_log = true;
+                wdp_relog_pending = true;
+            }
         }
         return;
     }
@@ -5094,7 +5829,8 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].channel = beacon_channel;
     wdp_seen_networks[idx].rssi = (int8_t)pkt->rx_ctrl.rssi;
     wdp_seen_networks[idx].authmode = authmode;
-    wdp_seen_networks[idx].written_to_file = false;
+    wdp_seen_networks[idx].needs_log = true;        // pending first write
+    wdp_seen_networks[idx].last_logged_valid = false;
     wdp_seen_count++;
 
     wdp_dwell_new_networks++;
@@ -5125,8 +5861,34 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
+// Evict up to `target` of the oldest already-written (not pending) entries, compacting
+// the array toward the front. Returns how many were freed.
+// Safe to call ONLY with promiscuous disabled (mutates the array the callback reads).
+static int wdp_evict_written_networks(int target) {
+    int to_evict = target;
+    int evicted = 0;
+    int write_idx = 0;
+    for (int read_idx = 0; read_idx < wdp_seen_count; read_idx++) {
+        if (to_evict > 0 && !wdp_seen_networks[read_idx].needs_log) {
+            to_evict--;
+            evicted++;
+            continue;  // drop this (oldest written) entry
+        }
+        if (write_idx != read_idx) {
+            wdp_seen_networks[write_idx] = wdp_seen_networks[read_idx];
+        }
+        write_idx++;
+    }
+    wdp_seen_count = write_idx;
+    return evicted;
+}
+
 static bool wdp_grow_network_buffer(void) {
+    if (wdp_seen_capacity >= (int)g_wd_cfg.mem_cap) {
+        return false;  // at the configured memory cap — caller evicts instead of growing
+    }
     int new_capacity = wdp_seen_capacity * 2;
+    if (new_capacity > (int)g_wd_cfg.mem_cap) new_capacity = (int)g_wd_cfg.mem_cap;
     size_t new_size = (size_t)new_capacity * sizeof(wdp_network_t);
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 
@@ -5208,25 +5970,49 @@ static void wardrive_promisc_task(void *pvParameters) {
     wdp_seen_count = 0;
     wdp_dwell_new_networks = 0;
     wdp_needs_grow = false;
+    wdp_relog_pending = false;
+    wdp_relog_writes = 0;
     memset(wdp_seen_networks, 0, (size_t)wdp_seen_capacity * sizeof(wdp_network_t));
-    wdp_ducb_init();
+    wdp_ducb_init(&g_wd_cfg);
 
-    wifi_promiscuous_filter_t filter = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
-    };
-    esp_wifi_set_promiscuous_filter(&filter);
-    esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
-    esp_wifi_set_promiscuous(true);
+    // No WiFi channels selected => BLE-only mode (no promiscuous, no channel hop).
+    const bool wifi_scan_enabled = (wdp_ducb_channel_count > 0);
 
-    MY_LOG_INFO(TAG, "Promiscuous wardrive started. Channels: %d (2.4 primary: %d, secondary: %d, 5GHz: %d, DFS: %d)",
-                wdp_ducb_channel_count,
-                (int)WDP_CH_24_PRIMARY_COUNT, (int)WDP_CH_24_SECONDARY_COUNT,
-                (int)WDP_CH_5_NON_DFS_COUNT, (int)WDP_CH_5_DFS_COUNT);
+    if (wifi_scan_enabled) {
+        // Match the band mode to the selected bands so set_channel can reach 5 GHz.
+        // 2.4+5 must be AUTO; single-band uses the dedicated mode (less RF overhead).
+        const bool want_24 = (g_wd_cfg.bands & WD_BAND_24) != 0;
+        const bool want_5  = (g_wd_cfg.bands & WD_BAND_5) != 0;
+        wifi_band_mode_t band_mode = WIFI_BAND_MODE_AUTO;
+        if (want_24 && want_5)  band_mode = WIFI_BAND_MODE_AUTO;
+        else if (want_5)        band_mode = WIFI_BAND_MODE_5G_ONLY;
+        else                    band_mode = WIFI_BAND_MODE_2G_ONLY;
+        esp_err_t bm_err = esp_wifi_set_band_mode(band_mode);
+        if (bm_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "esp_wifi_set_band_mode(%d) failed: %s (continuing)",
+                        (int)band_mode, esp_err_to_name(bm_err));
+        }
+
+        wifi_promiscuous_filter_t filter = {
+            .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
+        };
+        esp_wifi_set_promiscuous_filter(&filter);
+        esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
+        esp_wifi_set_promiscuous(true);
+    }
+
+    {
+        char wd_bands[24];
+        wardrive_config_format_bands(wd_bands, sizeof(wd_bands));
+        MY_LOG_INFO(TAG, "Promiscuous wardrive started. Bands: %s, WiFi channels: %d%s",
+                    wd_bands, wdp_ducb_channel_count,
+                    wifi_scan_enabled ? "" : " (BLE-only mode)");
+    }
     MY_LOG_INFO(TAG, "Use 'stop' command to stop.");
 
     // Start BLE scanning in background (coexistence handled by ESP-IDF)
     bt_reset_counters();
-    bool wdp_bt_enabled = nimble_initialized;
+    bool wdp_bt_enabled = nimble_initialized && (g_wd_cfg.bands & WD_BAND_BLE);
     bool wdp_bt_running = false;
     if (wdp_bt_enabled) {
         wdp_bt_running = (bt_start_scan_coex() == 0);
@@ -5244,6 +6030,14 @@ static void wardrive_promisc_task(void *pvParameters) {
     int gps_fix_lost_count = 0;
     #define WDP_GPS_FIX_LOST_THRESHOLD 3
 
+    // Startup cooldown: drop everything seen in the first N seconds so the start area
+    // (e.g. home) is not logged. Counts from here (after the initial GPS fix).
+    wdp_log_gate_until_us = esp_timer_get_time() + (int64_t)g_wd_cfg.startup_cooldown_s * 1000000LL;
+    if (g_wd_cfg.startup_cooldown_s > 0) {
+        MY_LOG_INFO(TAG, "Startup cooldown: dropping scans for the first %u s",
+                    (unsigned)g_wd_cfg.startup_cooldown_s);
+    }
+
     while (wardrive_promisc_active && !operation_stop_requested) {
         if (external_feed) {
             gps_sync_from_selected_external_source();
@@ -5251,7 +6045,7 @@ static void wardrive_promisc_task(void *pvParameters) {
         if (external_feed && !current_gps.valid) {
             MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
             oled_display_update_full("> Wardrive Pro", "  GPS fix lost!", "  Pausing...", "");
-            esp_wifi_set_promiscuous(false);
+            if (wifi_scan_enabled) esp_wifi_set_promiscuous(false);
             if (wdp_bt_running) {
                 bt_stop_scan();
                 wdp_bt_running = false;
@@ -5264,7 +6058,7 @@ static void wardrive_promisc_task(void *pvParameters) {
             MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
                         current_gps.latitude, current_gps.longitude);
             oled_display_update_full("> Wardrive Pro", "  GPS recovered!", "  Resuming...", "");
-            esp_wifi_set_promiscuous(true);
+            if (wifi_scan_enabled) esp_wifi_set_promiscuous(true);
             if (wdp_bt_enabled) {
                 wdp_bt_running = (bt_start_scan_coex() == 0);
                 if (!wdp_bt_running) {
@@ -5273,19 +6067,28 @@ static void wardrive_promisc_task(void *pvParameters) {
             }
         }
 
-        int ch_idx = wdp_ducb_select_channel();
-        int channel = wdp_ducb_channels[ch_idx].channel;
-        int dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
+        int ch_idx = 0;
+        int channel = 0;
+        int dwell_ms = WDP_DWELL_DEFAULT_MS;
+        if (wifi_scan_enabled) {
+            ch_idx = wdp_ducb_select_channel();
+            channel = wdp_ducb_channels[ch_idx].channel;
+            dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
+            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        } else {
+            dwell_ms = 1000;  // BLE-only: no channel hop, steady dwell
+        }
 
-        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-        
         {
             static int64_t wdp_oled_last_us = 0;
             int64_t wdp_now_us = esp_timer_get_time();
             if (wdp_now_us - wdp_oled_last_us > 2000000) {
                 wdp_oled_last_us = wdp_now_us;
                 char wdp_l2[64], wdp_l3[64], wdp_l4[64];
-                snprintf(wdp_l2, sizeof(wdp_l2), "  Ch %d  D-UCB", channel);
+                if (wifi_scan_enabled)
+                    snprintf(wdp_l2, sizeof(wdp_l2), "  Ch %d  D-UCB", channel);
+                else
+                    snprintf(wdp_l2, sizeof(wdp_l2), "  BLE-only scan");
                 snprintf(wdp_l3, sizeof(wdp_l3), "  %d networks", wdp_seen_count);
                 snprintf(wdp_l4, sizeof(wdp_l4), "  GPS:%s SAT:%d",
                          current_gps.valid ? "OK" : "LOST", current_gps.satellites);
@@ -5305,8 +6108,16 @@ static void wardrive_promisc_task(void *pvParameters) {
             if (wdp_grow_network_buffer()) {
                 MY_LOG_INFO(TAG, "Network buffer expanded, capacity now %d", wdp_seen_capacity);
             } else {
-                MY_LOG_INFO(TAG, "Network buffer growth failed, continuing with %d/%d",
-                            wdp_seen_count, wdp_seen_capacity);
+                // At the memory cap (or PSRAM exhausted): reclaim slots by evicting the
+                // oldest entries already written to SD. Their data is safe in the CSV.
+                int evicted = wdp_evict_written_networks((int)(g_wd_cfg.mem_cap / 4));
+                if (evicted > 0) {
+                    MY_LOG_INFO(TAG, "Memory cap %u reached: evicted %d oldest logged entries (now %d/%d)",
+                                (unsigned)g_wd_cfg.mem_cap, evicted, wdp_seen_count, wdp_seen_capacity);
+                } else {
+                    MY_LOG_INFO(TAG, "Memory cap %u reached, nothing flushed to evict yet (%d/%d)",
+                                (unsigned)g_wd_cfg.mem_cap, wdp_seen_count, wdp_seen_capacity);
+                }
                 wdp_needs_grow = false;
             }
             esp_wifi_set_promiscuous(true);
@@ -5359,7 +6170,7 @@ static void wardrive_promisc_task(void *pvParameters) {
 
         if (gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
             MY_LOG_INFO(TAG, "GPS fix lost for %d cycles! Pausing wardrive...", gps_fix_lost_count);
-            esp_wifi_set_promiscuous(false);
+            if (wifi_scan_enabled) esp_wifi_set_promiscuous(false);
             if (wdp_bt_running) {
                 bt_stop_scan();
                 wdp_bt_running = false;
@@ -5387,7 +6198,7 @@ static void wardrive_promisc_task(void *pvParameters) {
 
             MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
                         current_gps.latitude, current_gps.longitude);
-            esp_wifi_set_promiscuous(true);
+            if (wifi_scan_enabled) esp_wifi_set_promiscuous(true);
             if (wdp_bt_enabled) {
                 wdp_bt_running = (bt_start_scan_coex() == 0);
                 if (!wdp_bt_running) {
@@ -5397,17 +6208,24 @@ static void wardrive_promisc_task(void *pvParameters) {
             gps_fix_lost_count = 0;
         }
 
-        double reward = (double)wdp_dwell_new_networks;
-        wdp_ducb_update(ch_idx, reward);
+        if (wifi_scan_enabled) {
+            double reward = (double)wdp_dwell_new_networks;
+            wdp_ducb_update(ch_idx, reward);
+        }
 
         // Flush new entries to SD file periodically
         int current_count = wdp_seen_count;
         int bt_pending = wdp_bt_enabled ? (bt_device_count - wdp_bt_flush_count) : 0;
         bool bt_flush_due = wdp_bt_enabled && bt_pending > 0 &&
                             ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US);
+        bool relog_flush_due = wdp_relog_pending &&
+                            ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US);
         if ((current_count - last_flush_count) >= WDP_FILE_FLUSH_INTERVAL ||
             ((current_count > last_flush_count) && ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US)) ||
-            bt_flush_due) {
+            bt_flush_due || relog_flush_due) {
+
+            // Clear before the write loop; any re-log marked during the loop re-arms it.
+            wdp_relog_pending = false;
 
             char filename[64];
             snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", file_number);
@@ -5429,7 +6247,7 @@ static void wardrive_promisc_task(void *pvParameters) {
                     get_timestamp_string(timestamp, sizeof(timestamp));
 
                     for (int i = 0; i < current_count; i++) {
-                        if (wdp_seen_networks[i].written_to_file) continue;
+                        if (!wdp_seen_networks[i].needs_log) continue;
 
                         char mac_str[18];
                         snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -5454,13 +6272,22 @@ static void wardrive_promisc_task(void *pvParameters) {
                                     mac_str, escaped_ssid, auth_str, timestamp,
                                     wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi);
                         }
-                        wdp_seen_networks[i].written_to_file = true;
+                        // Record the baseline for the next re-log decision.
+                        if (wdp_seen_networks[i].last_logged_valid) wdp_relog_writes++;  // re-observation row
+                        wdp_seen_networks[i].needs_log = false;
+                        wdp_seen_networks[i].last_logged_rssi = wdp_seen_networks[i].rssi;
+                        if (current_gps.valid) {
+                            wdp_seen_networks[i].last_logged_lat = current_gps.latitude;
+                            wdp_seen_networks[i].last_logged_lon = current_gps.longitude;
+                            wdp_seen_networks[i].last_logged_valid = true;
+                        }
                     }
 
                     // Flush BT devices collected since last flush
                     if (wdp_bt_enabled) {
                         int bt_total = bt_device_count;
-                        for (int i = wdp_bt_flush_count; i < bt_total; i++) {
+                        for (int i = 0; i < bt_total; i++) {
+                            if (!bt_devices[i].needs_log) continue;
                             char bt_mac[18];
                             char escaped_bt_name[64];
                             char bt_mfgr_id[8];
@@ -5492,6 +6319,15 @@ static void wardrive_promisc_task(void *pvParameters) {
                                        bt_mac, escaped_bt_name, bt_cap, timestamp,
                                        (int)bt_devices[i].rssi, bt_mfgr_id);
                             }
+                            // Baseline for the next re-log decision.
+                            if (bt_devices[i].last_logged_valid) wdp_relog_writes++;
+                            bt_devices[i].needs_log = false;
+                            bt_devices[i].last_logged_rssi = bt_devices[i].rssi;
+                            if (current_gps.valid) {
+                                bt_devices[i].last_logged_lat = current_gps.latitude;
+                                bt_devices[i].last_logged_lon = current_gps.longitude;
+                                bt_devices[i].last_logged_valid = true;
+                            }
                         }
                         wdp_bt_flush_count = bt_total;
                     }
@@ -5520,15 +6356,19 @@ static void wardrive_promisc_task(void *pvParameters) {
                     top_ch = wdp_ducb_channels[i].channel;
                 }
             }
-            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, %d BT devices, D-UCB best ch: %d (%d visits), GPS: %s, sats: %d, dist: %.1fm",
-                        wdp_seen_count, bt_device_count, top_ch, top_pulls,
+            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, %d BT devices, %d relogs, D-UCB best ch: %d (%d visits), GPS: %s, sats: %d, dist: %.1fm",
+                        wdp_seen_count, bt_device_count, wdp_relog_writes, top_ch, top_pulls,
                         current_gps.valid ? "valid" : "no fix",
                         current_gps.satellites, wdp_total_distance_m);
             last_stats_time = now;
         }
     }
 
-    esp_wifi_set_promiscuous(false);
+    if (wifi_scan_enabled) {
+        esp_wifi_set_promiscuous(false);
+        // Restore default band mode so later 2.4-only features aren't left on a single band.
+        esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+    }
 
     // Stop BLE scan if it was started
     if (wdp_bt_running) {
@@ -5557,6 +6397,19 @@ cleanup:
 static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_enabled) {
     (void)argc; (void)argv;
     wardrive_promisc_trace_enabled = trace_enabled;
+
+    {
+        // Config loaded at boot; log active settings. Bands/channels are now applied
+        // in the task (wdp_ducb_init + band mode); deltas/cooldown wired in later steps.
+        char wd_bands[24];
+        wardrive_config_format_bands(wd_bands, sizeof(wd_bands));
+        const char *wd_chmode = (g_wd_cfg.ch_mode == WD_CH_POPULAR) ? "popular" :
+                                (g_wd_cfg.ch_mode == WD_CH_CUSTOM)  ? "custom"  : "all";
+        MY_LOG_INFO(TAG, "Wardrive config: bands=%s channels=%s wifi_delta=%d ble_delta=%d cooldown=%us memcap=%u",
+                    wd_bands, wd_chmode, g_wd_cfg.wifi_rssi_delta, g_wd_cfg.ble_rssi_delta,
+                    (unsigned)g_wd_cfg.startup_cooldown_s, (unsigned)g_wd_cfg.mem_cap);
+    }
+
     oled_display_update_full("> Wardrive Pro", "  Promiscuous", "  GPS + SD log", "  Active...");
     log_memory_info("start_wardrive_promisc");
 
@@ -5646,6 +6499,210 @@ static int cmd_start_wardrive_promisc(int argc, char **argv) {
 
 static int cmd_start_wardrive_promisc_trace(int argc, char **argv) {
     return cmd_start_wardrive_promisc_impl(argc, argv, true);
+}
+
+// ============================================================================
+// Anti-Surveillance: detect a BLE device that moves along with you (a "tail").
+// Uses the BLE scan + GPS streams already in place. A follower = a device that
+// stays in range over a long enough time AND a long enough travelled distance.
+// ============================================================================
+
+#define ANTISURV_LOST_TIMEOUT_US   (30 * 1000000LL)   // must have been seen this recently to count
+
+// Map sensitivity to detection thresholds.
+static void antisurv_thresholds(uint8_t sens, int *min_dur_s, int *min_dist_m, bool *include_random) {
+    switch (sens) {
+        case WD_AS_LOW:  *min_dur_s = 300; *min_dist_m = 1000; *include_random = false; break;
+        case WD_AS_HIGH: *min_dur_s = 120; *min_dist_m = 300;  *include_random = true;  break;
+        case WD_AS_MED:
+        default:         *min_dur_s = 180; *min_dist_m = 500;  *include_random = false; break;
+    }
+}
+
+// A locally-administered (randomized) BLE address has bit 1 of the first octet set.
+// Such devices rotate their MAC (~every 15 min) so they can't be tracked long-term.
+static inline bool antisurv_is_random_mac(const uint8_t *addr) {
+    return (addr[0] & 0x02) != 0;
+}
+
+// Scan tracked devices, raise an alert for any that newly qualify as a follower.
+static int antisurv_evaluate_and_alert(void) {
+    int min_dur_s, min_dist_m;
+    bool include_random;
+    antisurv_thresholds(g_wd_cfg.antisurv_sensitivity, &min_dur_s, &min_dist_m, &include_random);
+
+    int64_t now = esp_timer_get_time();
+    int n = bt_device_count;
+    int alerts = 0;
+
+    for (int i = 0; i < n; i++) {
+        bt_device_info_t *d = &bt_devices[i];
+        if (d->as_alerted) continue;
+        if (!d->as_has_origin) continue;
+        if (!include_random && antisurv_is_random_mac(d->addr)) continue;
+        if ((now - d->as_last_us) > ANTISURV_LOST_TIMEOUT_US) continue;   // not currently in range
+        int dur_s = (int)((d->as_last_us - d->as_first_us) / 1000000LL);
+        if (dur_s < min_dur_s) continue;
+        if (d->as_max_dist_m < (double)min_dist_m) continue;
+
+        char addr_str[18];
+        bt_format_addr(d->addr, addr_str);
+        const char *type = d->is_airtag ? "AirTag" : d->is_smarttag ? "SmartTag" : "device";
+        MY_LOG_INFO(TAG, "[FOLLOWER] MAC=%s name=\"%s\" type=%s rssi=%d seen=%ds travel=%.0fm",
+                    addr_str, d->name[0] ? d->name : "", type, d->rssi, dur_s, d->as_max_dist_m);
+        d->as_alerted = true;
+        alerts++;
+    }
+    return alerts;
+}
+
+static int antisurv_total_alerted(void) {
+    int c = 0;
+    for (int i = 0; i < bt_device_count; i++) if (bt_devices[i].as_alerted) c++;
+    return c;
+}
+
+static void antisurv_task(void *pvParameters) {
+    (void)pvParameters;
+    MY_LOG_INFO(TAG, "Anti-surveillance task started.");
+
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+
+    bt_reset_counters();
+    if (bt_start_scan() != 0) {
+        MY_LOG_INFO(TAG, "Anti-surveillance: BLE scan failed to start.");
+        antisurv_active = false;
+        antisurv_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    led_set_color(180, 0, 200);   // purple = watching
+
+    int min_dur_s, min_dist_m; bool include_random;
+    antisurv_thresholds(g_wd_cfg.antisurv_sensitivity, &min_dur_s, &min_dist_m, &include_random);
+    const char *sens_str = (g_wd_cfg.antisurv_sensitivity == WD_AS_LOW)  ? "low" :
+                           (g_wd_cfg.antisurv_sensitivity == WD_AS_HIGH) ? "high" : "med";
+    MY_LOG_INFO(TAG, "Anti-surveillance: sensitivity=%s (>=%ds, >=%dm, randoms=%s). Use 'stop'.",
+                sens_str, min_dur_s, min_dist_m, include_random ? "yes" : "no");
+    oled_display_update_full("> Anti-Surveil", "  Watching...", "  Need GPS+move", "  Use 'stop'");
+
+    int64_t last_eval_us = esp_timer_get_time();
+    int64_t last_oled_us = 0;
+
+    while (antisurv_active && !operation_stop_requested) {
+        // Read GPS (mirror of the wardrive loop).
+        if (external_feed) {
+            gps_sync_from_selected_external_source();
+            vTaskDelay(pdMS_TO_TICKS(200));
+        } else {
+            int gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer,
+                                          GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+            if (gps_len > 0) {
+                wardrive_gps_buffer[gps_len] = '\0';
+                char *line = strtok(wardrive_gps_buffer, "\r\n");
+                while (line != NULL) { parse_gps_nmea(line); line = strtok(NULL, "\r\n"); }
+            }
+        }
+
+        int64_t now = esp_timer_get_time();
+        if (now - last_eval_us >= 3000000LL) {       // evaluate every ~3 s
+            last_eval_us = now;
+            if (antisurv_evaluate_and_alert() > 0) {
+                oled_display_update_full("> Anti-Surveil", "  ! FOLLOWER !",
+                                         "  Check serial", "  Use 'stop'");
+                led_set_color(255, 0, 0);            // red flash on detection
+            }
+        }
+
+        if (now - last_oled_us >= 2000000LL) {
+            last_oled_us = now;
+            char l2[64], l3[64], l4[64];
+            snprintf(l2, sizeof(l2), "  %d devices", bt_device_count);
+            snprintf(l3, sizeof(l3), "  %d followers", antisurv_total_alerted());
+            snprintf(l4, sizeof(l4), "  GPS:%s SAT:%d", current_gps.valid ? "OK" : "--",
+                     current_gps.satellites);
+            oled_display_update_full("> Anti-Surveil", l2, l3, l4);
+        }
+    }
+
+    bt_stop_scan();
+    led_set_idle();
+    MY_LOG_INFO(TAG, "Anti-surveillance stopped. Devices seen: %d, followers flagged: %d",
+                bt_device_count, antisurv_total_alerted());
+    antisurv_active = false;
+    antisurv_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static int cmd_start_antisurveillance(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    if (antisurv_active || antisurv_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Anti-surveillance already running. Use 'stop' first.");
+        return 1;
+    }
+    if (wardrive_promisc_active || wardrive_promisc_task_handle != NULL ||
+        wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start anti-surveillance while wardrive is running. Use 'stop' first.");
+        return 1;
+    }
+    if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start anti-surveillance while a BT scan is running. Use 'stop' first.");
+        return 1;
+    }
+
+    operation_stop_requested = false;
+
+    esp_err_t bt_ret = bt_nimble_init();
+    if (bt_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Anti-surveillance: BLE init failed (%s).", esp_err_to_name(bt_ret));
+        return 1;
+    }
+
+    const bool external_feed = gps_module_uses_external_feed(current_gps_module);
+    if (!external_feed) {
+        int baud = gps_get_baud_for_module(current_gps_module);
+        if (init_gps_uart(baud) != ESP_OK) {
+            MY_LOG_INFO(TAG, "Anti-surveillance: failed to init GPS UART.");
+            return 1;
+        }
+        MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
+                    GPS_TX_PIN, GPS_RX_PIN, baud);
+    } else {
+        MY_LOG_INFO(TAG, "Using external GPS feed for anti-surveillance.");
+    }
+
+    antisurv_active = true;
+    BaseType_t result = xTaskCreate(antisurv_task, "antisurv_task", 8192, NULL, 5, &antisurv_task_handle);
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create anti-surveillance task!");
+        antisurv_active = false;
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "Anti-surveillance started. Use 'stop' to stop.");
+    return 0;
+}
+
+static int cmd_set_antisurv_sensitivity(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: set_antisurv_sensitivity <low|med|high>\n");
+        return 1;
+    }
+    if (strcmp(argv[1], "low") == 0)       g_wd_cfg.antisurv_sensitivity = WD_AS_LOW;
+    else if (strcmp(argv[1], "med") == 0)  g_wd_cfg.antisurv_sensitivity = WD_AS_MED;
+    else if (strcmp(argv[1], "high") == 0) g_wd_cfg.antisurv_sensitivity = WD_AS_HIGH;
+    else {
+        printf("Unknown level '%s'. Valid: low, med, high\n", argv[1]);
+        return 1;
+    }
+    wardrive_config_persist();
+    int dur, dist; bool rnd;
+    antisurv_thresholds(g_wd_cfg.antisurv_sensitivity, &dur, &dist, &rnd);
+    printf("Anti-surveillance sensitivity: %s (>=%ds present, >=%dm travel, randoms=%s)\n",
+           argv[1], dur, dist, rnd ? "yes" : "no");
+    wardrive_config_print();
+    return 0;
 }
 
 // ============================================================================
@@ -6741,6 +7798,9 @@ static bool wigle_is_upload_candidate(const char *filename) {
     if (!filename) {
         return false;
     }
+    if (filename[0] == '.' || strcmp(filename, "upload_state.csv") == 0) {
+        return false;
+    }
     size_t len = strlen(filename);
     if (len > 4 && strcasecmp(filename + len - 4, ".log") == 0) {
         return true;
@@ -6758,11 +7818,17 @@ static bool wdgwars_is_upload_candidate(const char *filename) {
     if (!filename) {
         return false;
     }
+    if (filename[0] == '.' || strcmp(filename, "upload_state.csv") == 0) {
+        return false;
+    }
     size_t len = strlen(filename);
     if (len > 4 && strcasecmp(filename + len - 4, ".log") == 0) {
         return true;
     }
     if (len > 4 && strcasecmp(filename + len - 4, ".csv") == 0) {
+        return true;
+    }
+    if (len > 3 && strcasecmp(filename + len - 3, ".gz") == 0) {
         return true;
     }
     return false;
@@ -6845,6 +7911,890 @@ static bool wdgwars_resolve_upload_target(const char *arg, char *out_path, size_
         return false;
     }
     return true;
+}
+
+typedef struct {
+    int data_rows;
+    int wifi_rows;
+    int ble_rows;
+    int bt_rows;
+    int bad_rows;
+    bool has_wigle_header;
+    bool has_schema_header;
+} wdgwars_wigle_stats_t;
+
+#define WDGWARS_SANITIZED_UPLOAD_PATH "/sdcard/lab/wardrives/.wdgwars_upload.tmp"
+#define UPLOAD_STATE_PATH "/sdcard/lab/wardrives/upload_state.csv"
+#define WDGWARS_WIGLE_HEADER "WigleWifi-1.6,appRelease=v1.1,model=MonsterC5,release=v1.0,device=MonsterC5,display=SPI TFT,board=ESP32C5,brand=LAB5"
+#define WDGWARS_WIGLE_SCHEMA "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type"
+
+static int count_csv_fields_simple(const char *line) {
+    if (!line || line[0] == '\0') {
+        return 0;
+    }
+
+    int fields = 1;
+    bool quoted = false;
+    for (const char *p = line; *p != '\0'; p++) {
+        if (*p == '"') {
+            if (quoted && p[1] == '"') {
+                p++;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (*p == ',' && !quoted) {
+            fields++;
+        }
+    }
+    return fields;
+}
+
+static bool csv_last_field_is_type(const char *line, const char *type) {
+    if (!line || !type) {
+        return false;
+    }
+
+    const char *last = strrchr(line, ',');
+    if (!last) {
+        return false;
+    }
+    last++;
+    while (*last == ' ' || *last == '\t') {
+        last++;
+    }
+    return strcasecmp(last, type) == 0;
+}
+
+static bool wdgwars_sanitize_wigle_file(const char *filepath, wdgwars_wigle_stats_t *stats, bool *use_sanitized) {
+    if (use_sanitized) {
+        *use_sanitized = false;
+    }
+    if (!filepath || !stats || !use_sanitized) {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    size_t path_len = strlen(filepath);
+    if (path_len > 3 && strcasecmp(filepath + path_len - 3, ".gz") == 0) {
+        MY_LOG_INFO(TAG, "  Preflight WigleWifi-1.6: skipped for compressed .gz file");
+        return true;
+    }
+
+    FILE *in = fopen(filepath, "r");
+    if (!in) {
+        MY_LOG_INFO(TAG, "  Preflight: cannot open file for schema check");
+        return false;
+    }
+
+    FILE *out = fopen(WDGWARS_SANITIZED_UPLOAD_PATH, "w");
+    if (!out) {
+        fclose(in);
+        MY_LOG_INFO(TAG, "  Preflight: cannot create sanitized upload file");
+        return false;
+    }
+
+    fprintf(out, "%s\n%s\n", WDGWARS_WIGLE_HEADER, WDGWARS_WIGLE_SCHEMA);
+
+    char line[512];
+    while (fgets(line, sizeof(line), in)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (strncmp(line, "WigleWifi-1.6", 13) == 0) {
+            stats->has_wigle_header = true;
+            continue;
+        }
+        if (strcmp(line, WDGWARS_WIGLE_SCHEMA) == 0) {
+            stats->has_schema_header = true;
+            continue;
+        }
+        if (strncmp(line, "MAC,SSID,", 9) == 0) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        int fields = count_csv_fields_simple(line);
+        if (fields != 14) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        const char *type = NULL;
+        if (csv_last_field_is_type(line, "WIFI")) {
+            stats->wifi_rows++;
+            type = "WIFI";
+        } else if (csv_last_field_is_type(line, "BLE")) {
+            stats->ble_rows++;
+            type = "BLE";
+        } else if (csv_last_field_is_type(line, "BT")) {
+            stats->bt_rows++;
+            type = "BT";
+        }
+
+        if (!type) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        stats->data_rows++;
+        fprintf(out, "%s\n", line);
+    }
+
+    fclose(in);
+    fclose(out);
+
+    bool changed = stats->bad_rows > 0 || !stats->has_wigle_header || !stats->has_schema_header;
+    *use_sanitized = changed;
+
+    MY_LOG_INFO(TAG, "  Preflight WigleWifi-1.6: header=%s schema=%s rows=%d wifi=%d ble=%d bt=%d bad=%d",
+                stats->has_wigle_header ? "yes" : "no",
+                stats->has_schema_header ? "yes" : "no",
+                stats->data_rows, stats->wifi_rows, stats->ble_rows,
+                stats->bt_rows, stats->bad_rows);
+
+    if (changed) {
+        MY_LOG_INFO(TAG, "  Sanitized copy prepared: removed %d bad row(s), added missing headers if needed",
+                    stats->bad_rows);
+    } else {
+        unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+    }
+    return true;
+}
+
+static void wardrive_build_fixed_path(const char *filename, char *out, size_t out_sz) {
+    char base[128];
+    snprintf(base, sizeof(base), "%s", filename ? filename : "wardrive.log");
+    char *dot = strrchr(base, '.');
+    if (dot && dot != base) {
+        *dot = '\0';
+    }
+    snprintf(out, out_sz, "/sdcard/lab/wardrives/%s.fixed.log", base);
+}
+
+static bool wardrive_fix_file_soft(const char *filepath, const char *filename,
+                                   char *out_path, size_t out_path_sz,
+                                   wdgwars_wigle_stats_t *stats) {
+    if (!filepath || !filename || !out_path || out_path_sz == 0 || !stats) {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    size_t path_len = strlen(filepath);
+    if (path_len > 3 && strcasecmp(filepath + path_len - 3, ".gz") == 0) {
+        MY_LOG_INFO(TAG, "wardrive_fix does not repair compressed .gz files");
+        return false;
+    }
+
+    FILE *in = fopen(filepath, "r");
+    if (!in) {
+        MY_LOG_INFO(TAG, "wardrive_fix: cannot open %s", filepath);
+        return false;
+    }
+
+    wardrive_build_fixed_path(filename, out_path, out_path_sz);
+    FILE *out = fopen(out_path, "w");
+    if (!out) {
+        fclose(in);
+        MY_LOG_INFO(TAG, "wardrive_fix: cannot create %s", out_path);
+        return false;
+    }
+
+    fprintf(out, "%s\n%s\n", WDGWARS_WIGLE_HEADER, WDGWARS_WIGLE_SCHEMA);
+
+    char line[512];
+    while (fgets(line, sizeof(line), in)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (strncmp(line, "WigleWifi-1.6", 13) == 0) {
+            stats->has_wigle_header = true;
+            continue;
+        }
+        if (strcmp(line, WDGWARS_WIGLE_SCHEMA) == 0) {
+            stats->has_schema_header = true;
+            continue;
+        }
+        if (strncmp(line, "MAC,SSID,", 9) == 0) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        if (count_csv_fields_simple(line) != 14) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        if (csv_last_field_is_type(line, "WIFI")) {
+            stats->wifi_rows++;
+        } else if (csv_last_field_is_type(line, "BLE")) {
+            stats->ble_rows++;
+        } else if (csv_last_field_is_type(line, "BT")) {
+            stats->bt_rows++;
+        } else {
+            stats->bad_rows++;
+            continue;
+        }
+
+        stats->data_rows++;
+        fprintf(out, "%s\n", line);
+    }
+
+    fclose(in);
+    fclose(out);
+    sd_sync();
+
+    // Future hard-repair concept:
+    // Keep a bounded accumulator (for example 2 KB), append up to a few physical
+    // lines when CSV quotes are unbalanced or field count is wrong, and emit the
+    // merged record only if it becomes a valid 14-field WigleWifi row. This is
+    // intentionally not automatic yet because guessing broken records can corrupt
+    // coordinates or device identity; the soft mode only drops unsafe rows.
+    return true;
+}
+
+static bool wardrive_collect_file_id(const char *filepath, long *out_size, uint32_t *out_hash) {
+    const size_t CHUNK_SIZE = 2048;
+    FILE *f = fopen(filepath, "rb");
+    if (!f) {
+        return false;
+    }
+
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (!buf) {
+        fclose(f);
+        return false;
+    }
+
+    uint32_t hash = 2166136261u; // FNV-1a 32-bit
+    long size = 0;
+    while (1) {
+        size_t n = fread(buf, 1, CHUNK_SIZE, f);
+        for (size_t i = 0; i < n; i++) {
+            hash ^= buf[i];
+            hash *= 16777619u;
+        }
+        size += (long)n;
+        if (n < CHUNK_SIZE) {
+            if (ferror(f)) {
+                free(buf);
+                fclose(f);
+                return false;
+            }
+            break;
+        }
+    }
+
+    free(buf);
+    fclose(f);
+    if (out_size) {
+        *out_size = size;
+    }
+    if (out_hash) {
+        *out_hash = hash;
+    }
+    return true;
+}
+
+static bool upload_state_ensure_file(void) {
+    struct stat st;
+    if (stat(UPLOAD_STATE_PATH, &st) == 0) {
+        return true;
+    }
+
+    sd_mkdir_recursive("/sdcard/lab/wardrives");
+
+    FILE *f = fopen(UPLOAD_STATE_PATH, "w");
+    if (!f) {
+        MY_LOG_INFO(TAG, "Upload state: cannot create %s", UPLOAD_STATE_PATH);
+        return false;
+    }
+    fprintf(f, "service,filename,size,hash,status,uploaded_at,wifi,ble,bt,bad\n");
+    fclose(f);
+    sd_sync();
+    return true;
+}
+
+static bool upload_state_parse_line(char *line, char *service, size_t service_sz,
+                                    char *filename, size_t filename_sz, long *size,
+                                    uint32_t *hash, char *status, size_t status_sz,
+                                    int *wifi, int *ble, int *bt, int *bad) {
+    if (!line || strncmp(line, "service,", 8) == 0) {
+        return false;
+    }
+
+    char *fields[10] = {0};
+    int count = 0;
+    char *save = NULL;
+    char *tok = strtok_r(line, ",", &save);
+    while (tok && count < 10) {
+        fields[count++] = tok;
+        tok = strtok_r(NULL, ",", &save);
+    }
+    if (count < 10) {
+        return false;
+    }
+
+    snprintf(service, service_sz, "%s", fields[0]);
+    snprintf(filename, filename_sz, "%s", fields[1]);
+    if (size) {
+        *size = strtol(fields[2], NULL, 10);
+    }
+    if (hash) {
+        *hash = (uint32_t)strtoul(fields[3], NULL, 16);
+    }
+    snprintf(status, status_sz, "%s", fields[4]);
+    if (wifi) *wifi = atoi(fields[6]);
+    if (ble)  *ble  = atoi(fields[7]);
+    if (bt)   *bt   = atoi(fields[8]);
+    if (bad)  *bad  = atoi(fields[9]);
+    return true;
+}
+
+static bool upload_state_is_done(const char *service, const char *filename, long size, uint32_t hash) {
+    FILE *f = fopen(UPLOAD_STATE_PATH, "r");
+    if (!f) {
+        return false;
+    }
+
+    bool done = false;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char svc[16], fn[128], status[16];
+        long rec_size = 0;
+        uint32_t rec_hash = 0;
+        if (!upload_state_parse_line(line, svc, sizeof(svc), fn, sizeof(fn),
+                                     &rec_size, &rec_hash, status, sizeof(status),
+                                     NULL, NULL, NULL, NULL)) {
+            continue;
+        }
+        if (strcmp(svc, service) == 0 && strcmp(fn, filename) == 0 &&
+            rec_size == size && rec_hash == hash) {
+            if (strcmp(status, "done") == 0) {
+                done = true;
+            }
+        }
+    }
+    fclose(f);
+    return done;
+}
+
+static bool upload_state_append(const char *service, const char *filename, long size,
+                                uint32_t hash, const char *status,
+                                const wdgwars_wigle_stats_t *stats) {
+    if (!upload_state_ensure_file()) {
+        return false;
+    }
+
+    FILE *f = fopen(UPLOAD_STATE_PATH, "a");
+    if (!f) {
+        MY_LOG_INFO(TAG, "Upload state: cannot append to %s", UPLOAD_STATE_PATH);
+        return false;
+    }
+
+    char timestamp[32];
+    get_timestamp_string(timestamp, sizeof(timestamp));
+    fprintf(f, "%s,%s,%ld,%08lX,%s,%s,%d,%d,%d,%d\n",
+            service, filename, size, (unsigned long)hash, status, timestamp,
+            stats ? stats->wifi_rows : 0,
+            stats ? stats->ble_rows : 0,
+            stats ? stats->bt_rows : 0,
+            stats ? stats->bad_rows : 0);
+    fclose(f);
+    sd_sync();
+    return true;
+}
+
+static void upload_state_get_status(const char *service, const char *filename, long size,
+                                    uint32_t hash, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "pending");
+    FILE *f = fopen(UPLOAD_STATE_PATH, "r");
+    if (!f) {
+        return;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char svc[16], fn[128], status[16];
+        long rec_size = 0;
+        uint32_t rec_hash = 0;
+        if (!upload_state_parse_line(line, svc, sizeof(svc), fn, sizeof(fn),
+                                     &rec_size, &rec_hash, status, sizeof(status),
+                                     NULL, NULL, NULL, NULL)) {
+            continue;
+        }
+        if (strcmp(svc, service) == 0 && strcmp(fn, filename) == 0 &&
+            rec_size == size && rec_hash == hash) {
+            if (strcmp(out, "done") == 0) {
+                continue;
+            }
+            snprintf(out, out_sz, "%s", status);
+        }
+    }
+    fclose(f);
+}
+
+static int cmd_upload_state(int argc, char **argv) {
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    if (argc > 1 && strcasecmp(argv[1], "clear") == 0) {
+        unlink(UPLOAD_STATE_PATH);
+        if (upload_state_ensure_file()) {
+            MY_LOG_INFO(TAG, "Upload state cleared: %s", UPLOAD_STATE_PATH);
+            return 0;
+        }
+        return 1;
+    }
+
+    upload_state_ensure_file();
+
+    FILE *f = fopen(UPLOAD_STATE_PATH, "r");
+    printf("[UPLOAD_STATE] BEGIN\n");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            char svc[16], fn[128], status[16];
+            long size = 0;
+            uint32_t hash = 0;
+            int wifi = 0, ble = 0, bt = 0, bad = 0;
+            if (!upload_state_parse_line(line, svc, sizeof(svc), fn, sizeof(fn),
+                                         &size, &hash, status, sizeof(status),
+                                         &wifi, &ble, &bt, &bad)) {
+                continue;
+            }
+            printf("[UPLOAD_STATE] service=%s filename=%s size=%ld hash=%08lX status=%s wifi=%d ble=%d bt=%d bad=%d\n",
+                   svc, fn, size, (unsigned long)hash, status, wifi, ble, bt, bad);
+        }
+        fclose(f);
+    }
+    printf("[UPLOAD_STATE] END\n");
+    return 0;
+}
+
+static int cmd_wardrive_files(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    upload_state_ensure_file();
+
+    DIR *dir = opendir("/sdcard/lab/wardrives");
+    if (!dir) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        return 1;
+    }
+
+    printf("[WARD_FILE] BEGIN\n");
+    int total_files = 0;
+    long total_bytes = 0;
+    int total_rows = 0;
+    int total_wifi = 0;
+    int total_ble = 0;
+    int total_bt = 0;
+    int total_bad = 0;
+    int wigle_pending = 0;
+    int wigle_ok = 0;
+    int wigle_failed = 0;
+    int wigle_rate_limited = 0;
+    int wdgwars_pending = 0;
+    int wdgwars_ok = 0;
+    int wdgwars_failed = 0;
+    int wdgwars_rate_limited = 0;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        char filepath[280];
+        snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
+        long size = 0;
+        uint32_t hash = 0;
+        if (!wardrive_collect_file_id(filepath, &size, &hash)) {
+            continue;
+        }
+
+        wdgwars_wigle_stats_t stats = {0};
+        bool use_sanitized = false;
+        wdgwars_sanitize_wigle_file(filepath, &stats, &use_sanitized);
+        if (use_sanitized) {
+            unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+        }
+
+        char wigle_status[16], wdgwars_status[16];
+        upload_state_get_status("wigle", entry->d_name, size, hash, wigle_status, sizeof(wigle_status));
+        upload_state_get_status("wdgwars", entry->d_name, size, hash, wdgwars_status, sizeof(wdgwars_status));
+
+        total_files++;
+        total_bytes += size;
+        total_rows += stats.data_rows;
+        total_wifi += stats.wifi_rows;
+        total_ble += stats.ble_rows;
+        total_bt += stats.bt_rows;
+        total_bad += stats.bad_rows;
+
+        if (strcmp(wigle_status, "done") == 0) {
+            wigle_ok++;
+        } else if (strcmp(wigle_status, "failed") == 0) {
+            wigle_failed++;
+        } else if (strcmp(wigle_status, "rate_limited") == 0) {
+            wigle_rate_limited++;
+        } else {
+            wigle_pending++;
+        }
+
+        if (strcmp(wdgwars_status, "done") == 0) {
+            wdgwars_ok++;
+        } else if (strcmp(wdgwars_status, "failed") == 0) {
+            wdgwars_failed++;
+        } else if (strcmp(wdgwars_status, "rate_limited") == 0) {
+            wdgwars_rate_limited++;
+        } else {
+            wdgwars_pending++;
+        }
+
+        printf("[WARD_FILE] filename=%s size=%ld hash=%08lX wifi=%d ble=%d bt=%d bad=%d wigle=%s wdgwars=%s\n",
+               entry->d_name, size, (unsigned long)hash,
+               stats.wifi_rows, stats.ble_rows, stats.bt_rows, stats.bad_rows,
+               wigle_status, wdgwars_status);
+    }
+    closedir(dir);
+    printf("[WARD_FILE] SUMMARY files=%d bytes=%ld rows=%d devices=%d wifi=%d ble=%d bt=%d bad=%d wigle_ok=%d wigle_pending=%d wigle_failed=%d wigle_rate_limited=%d wdgwars_ok=%d wdgwars_pending=%d wdgwars_failed=%d wdgwars_rate_limited=%d\n",
+           total_files, total_bytes, total_rows, total_rows, total_wifi, total_ble, total_bt, total_bad,
+           wigle_ok, wigle_pending, wigle_failed, wigle_rate_limited,
+           wdgwars_ok, wdgwars_pending, wdgwars_failed, wdgwars_rate_limited);
+    printf("[WARD_FILE] END\n");
+    return 0;
+}
+
+static bool wardrive_cleanup_valid_service(const char *service) {
+    return service &&
+           (strcasecmp(service, "wigle") == 0 ||
+            strcasecmp(service, "wdgwars") == 0 ||
+            strcasecmp(service, "all") == 0);
+}
+
+static bool wardrive_cleanup_valid_status(const char *status) {
+    return status &&
+           (strcasecmp(status, "pending") == 0 ||
+            strcasecmp(status, "done") == 0 ||
+            strcasecmp(status, "ok") == 0 ||
+            strcasecmp(status, "failed") == 0 ||
+            strcasecmp(status, "fail") == 0 ||
+            strcasecmp(status, "rate_limited") == 0);
+}
+
+static const char *wardrive_cleanup_normalize_status(const char *status) {
+    if (status && strcasecmp(status, "ok") == 0) {
+        return "done";
+    }
+    if (status && strcasecmp(status, "fail") == 0) {
+        return "failed";
+    }
+    if (status && strcasecmp(status, "pending") == 0) {
+        return "pending";
+    }
+    if (status && strcasecmp(status, "done") == 0) {
+        return "done";
+    }
+    if (status && strcasecmp(status, "failed") == 0) {
+        return "failed";
+    }
+    if (status && strcasecmp(status, "rate_limited") == 0) {
+        return "rate_limited";
+    }
+    return status;
+}
+
+static const char *wardrive_cleanup_normalize_service(const char *service) {
+    if (service && strcasecmp(service, "wigle") == 0) {
+        return "wigle";
+    }
+    if (service && strcasecmp(service, "wdgwars") == 0) {
+        return "wdgwars";
+    }
+    if (service && strcasecmp(service, "all") == 0) {
+        return "all";
+    }
+    return service;
+}
+
+static bool wardrive_cleanup_status_matches(const char *service, const char *wanted_status,
+                                            const char *wigle_status, const char *wdgwars_status) {
+    if (strcasecmp(service, "all") == 0) {
+        return strcmp(wigle_status, wanted_status) == 0 &&
+               strcmp(wdgwars_status, wanted_status) == 0;
+    }
+    if (strcasecmp(service, "wigle") == 0) {
+        return strcmp(wigle_status, wanted_status) == 0;
+    }
+    return strcmp(wdgwars_status, wanted_status) == 0;
+}
+
+static bool wardrive_cleanup_valid_subdir(const char *subdir) {
+    if (!subdir || subdir[0] == '\0' || strcmp(subdir, ".") == 0 || strcmp(subdir, "..") == 0) {
+        return false;
+    }
+    for (const char *p = subdir; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (!(isalnum(c) || c == '.' || c == '_' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool wardrive_cleanup_ensure_dir(const char *service, const char *status,
+                                        const char *subdir, char *out_dir, size_t out_sz) {
+    if (!service || !status || !out_dir || out_sz == 0) {
+        return false;
+    }
+
+    mkdir("/sdcard/lab/wardrives/uploaded", 0755);
+
+    char service_dir[384];
+    int ret = snprintf(service_dir, sizeof(service_dir), "/sdcard/lab/wardrives/uploaded/%s", service);
+    if (ret <= 0 || ret >= (int)sizeof(service_dir)) {
+        return false;
+    }
+    mkdir(service_dir, 0755);
+
+    ret = snprintf(out_dir, out_sz, "%s/%s", service_dir, status);
+    if (ret <= 0 || ret >= (int)out_sz) {
+        return false;
+    }
+    mkdir(out_dir, 0755);
+
+    if (subdir && subdir[0] != '\0') {
+        char status_dir[384];
+        strlcpy(status_dir, out_dir, sizeof(status_dir));
+        ret = snprintf(out_dir, out_sz, "%s/%s", status_dir, subdir);
+        if (ret <= 0 || ret >= (int)out_sz) {
+            return false;
+        }
+        mkdir(out_dir, 0755);
+    }
+    return true;
+}
+
+static int cmd_wardrive_cleanup(int argc, char **argv) {
+    if (argc < 3 || argc > 5 ||
+        !wardrive_cleanup_valid_service(argv[1]) ||
+        !wardrive_cleanup_valid_status(argv[2])) {
+        MY_LOG_INFO(TAG, "Usage: wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]");
+        return 1;
+    }
+
+    if (argc >= 4 && strcasecmp(argv[3], "move") != 0) {
+        MY_LOG_INFO(TAG, "Usage: wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]");
+        return 1;
+    }
+
+    const char *service = wardrive_cleanup_normalize_service(argv[1]);
+    const char *status = wardrive_cleanup_normalize_status(argv[2]);
+    bool do_move = (argc >= 4 && strcasecmp(argv[3], "move") == 0);
+    const char *dest_subdir = (argc >= 5) ? argv[4] : NULL;
+
+    if (dest_subdir && !wardrive_cleanup_valid_subdir(dest_subdir)) {
+        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=move target=\n", service, status);
+        printf("[WARD_CLEANUP] filename=destination action=failed reason=invalid_destination destination=%s\n", dest_subdir ? dest_subdir : "");
+        printf("[WARD_CLEANUP] SUMMARY scanned=0 matched=0 moved=0 failed=1 dry_run=0\n");
+        printf("[WARD_CLEANUP] END\n");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    upload_state_ensure_file();
+
+    char target_dir[384];
+    if (!wardrive_cleanup_ensure_dir(service, status, dest_subdir, target_dir, sizeof(target_dir))) {
+        MY_LOG_INFO(TAG, "wardrive_cleanup: failed to prepare target directory");
+        return 1;
+    }
+
+    DIR *dir = opendir("/sdcard/lab/wardrives");
+    if (!dir) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        return 1;
+    }
+
+    printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target=%s\n",
+           service, status, do_move ? "move" : "dry-run", target_dir);
+
+    int scanned = 0;
+    int matched = 0;
+    int moved = 0;
+    int failed = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        char filepath[384];
+        int path_len = snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
+        if (path_len <= 0 || path_len >= (int)sizeof(filepath)) {
+            failed++;
+            printf("[WARD_CLEANUP] filename=%s action=failed reason=path_too_long\n", entry->d_name);
+            continue;
+        }
+        long size = 0;
+        uint32_t hash = 0;
+        if (!wardrive_collect_file_id(filepath, &size, &hash)) {
+            continue;
+        }
+        scanned++;
+
+        char wigle_status[16], wdgwars_status[16];
+        upload_state_get_status("wigle", entry->d_name, size, hash, wigle_status, sizeof(wigle_status));
+        upload_state_get_status("wdgwars", entry->d_name, size, hash, wdgwars_status, sizeof(wdgwars_status));
+
+        if (!wardrive_cleanup_status_matches(service, status, wigle_status, wdgwars_status)) {
+            continue;
+        }
+        matched++;
+
+        char target_path[512];
+        path_len = snprintf(target_path, sizeof(target_path), "%s/%s", target_dir, entry->d_name);
+        if (path_len <= 0 || path_len >= (int)sizeof(target_path)) {
+            failed++;
+            printf("[WARD_CLEANUP] filename=%s size=%ld hash=%08lX wigle=%s wdgwars=%s action=failed reason=target_path_too_long\n",
+                   entry->d_name, size, (unsigned long)hash, wigle_status, wdgwars_status);
+            continue;
+        }
+
+        if (!do_move) {
+            printf("[WARD_CLEANUP] filename=%s size=%ld hash=%08lX wigle=%s wdgwars=%s action=would_move target=%s\n",
+                   entry->d_name, size, (unsigned long)hash, wigle_status, wdgwars_status, target_path);
+            continue;
+        }
+
+        unlink(target_path);
+        if (rename(filepath, target_path) == 0) {
+            moved++;
+            printf("[WARD_CLEANUP] filename=%s size=%ld hash=%08lX wigle=%s wdgwars=%s action=moved target=%s\n",
+                   entry->d_name, size, (unsigned long)hash, wigle_status, wdgwars_status, target_path);
+
+            size_t name_len = strlen(entry->d_name);
+            if (name_len > 4 && strcasecmp(entry->d_name + name_len - 4, ".log") == 0) {
+                char track_name[256];
+                int track_name_len = snprintf(track_name, sizeof(track_name), "%.*s_track.kml",
+                                              (int)(name_len - 4), entry->d_name);
+                if (track_name_len <= 0 || track_name_len >= (int)sizeof(track_name)) {
+                    failed++;
+                    printf("[WARD_CLEANUP] filename=%s action=failed reason=track_name_too_long\n",
+                           entry->d_name);
+                } else {
+                    char track_path[384];
+                    char track_target_path[512];
+                    int track_path_len = snprintf(track_path, sizeof(track_path), "/sdcard/lab/wardrives/%s", track_name);
+                    int track_target_len = snprintf(track_target_path, sizeof(track_target_path), "%s/%s", target_dir, track_name);
+                    if (track_path_len <= 0 || track_path_len >= (int)sizeof(track_path) ||
+                        track_target_len <= 0 || track_target_len >= (int)sizeof(track_target_path)) {
+                        failed++;
+                        printf("[WARD_CLEANUP] filename=%s action=failed reason=track_path_too_long\n",
+                               track_name);
+                    } else if (access(track_path, F_OK) == 0) {
+                        unlink(track_target_path);
+                        if (rename(track_path, track_target_path) == 0) {
+                            moved++;
+                            printf("[WARD_CLEANUP] filename=%s action=moved target=%s\n",
+                                   track_name, track_target_path);
+                        } else {
+                            failed++;
+                            printf("[WARD_CLEANUP] filename=%s action=failed errno=%d target=%s\n",
+                                   track_name, errno, track_target_path);
+                        }
+                    }
+                }
+            }
+        } else {
+            failed++;
+            printf("[WARD_CLEANUP] filename=%s size=%ld hash=%08lX wigle=%s wdgwars=%s action=failed errno=%d target=%s\n",
+                   entry->d_name, size, (unsigned long)hash, wigle_status, wdgwars_status, errno, target_path);
+        }
+    }
+
+    closedir(dir);
+    if (do_move && moved > 0) {
+        sd_sync();
+    }
+
+    printf("[WARD_CLEANUP] SUMMARY scanned=%d matched=%d moved=%d failed=%d dry_run=%d\n",
+           scanned, matched, moved, failed, do_move ? 0 : 1);
+    printf("[WARD_CLEANUP] END\n");
+    return failed > 0 ? 1 : 0;
+}
+
+static int cmd_wardrive_fix(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: wardrive_fix <file>");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char filepath[280];
+    char upload_name[128];
+    if (!wdgwars_resolve_upload_target(argv[1], filepath, sizeof(filepath), upload_name, sizeof(upload_name)) &&
+        !wigle_resolve_upload_target(argv[1], filepath, sizeof(filepath), upload_name, sizeof(upload_name))) {
+        MY_LOG_INFO(TAG, "wardrive_fix: invalid/missing file: %s", argv[1]);
+        return 1;
+    }
+
+    char fixed_path[280];
+    wdgwars_wigle_stats_t stats;
+    printf("[WARD_FIX] BEGIN\n");
+    if (!wardrive_fix_file_soft(filepath, upload_name, fixed_path, sizeof(fixed_path), &stats)) {
+        printf("[WARD_FIX] filename=%s status=failed\n", upload_name);
+        printf("[WARD_FIX] END\n");
+        return 1;
+    }
+
+    const char *fixed_name = wigle_basename(fixed_path);
+    long fixed_size = 0;
+    uint32_t fixed_hash = 0;
+    wardrive_collect_file_id(fixed_path, &fixed_size, &fixed_hash);
+
+    printf("[WARD_FIX] filename=%s output=%s size=%ld hash=%08lX kept=%d dropped=%d wifi=%d ble=%d bt=%d bad=%d status=ok\n",
+           upload_name, fixed_name ? fixed_name : fixed_path,
+           fixed_size, (unsigned long)fixed_hash,
+           stats.data_rows, stats.bad_rows,
+           stats.wifi_rows, stats.ble_rows, stats.bt_rows, stats.bad_rows);
+    printf("[WARD_FIX] END\n");
+    return 0;
 }
 
 static int cmd_wpasec_key(int argc, char **argv) {
@@ -7370,7 +9320,7 @@ cleanup:
 
 static int cmd_wigle_key(int argc, char **argv) {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read");
+        MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read | wigle_key clear");
         return 0;
     }
 
@@ -7378,9 +9328,21 @@ static int cmd_wigle_key(int argc, char **argv) {
         if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
             MY_LOG_INFO(TAG, "WiGLE key: not set");
             MY_LOG_INFO(TAG, "Set via: wigle_key set <api_name> <api_token>");
-            MY_LOG_INFO(TAG, "Or place api_name:api_token in /sdcard/lab/wigle.txt and reboot.");
+            MY_LOG_INFO(TAG, "Or place api_name:api_token in /sdcard/lab/wigle.txt before upload.");
         } else {
             MY_LOG_INFO(TAG, "WiGLE key: %.4s****:%.4s****", wigle_api_name, wigle_api_token);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "clear") == 0) {
+        if (wigle_clear_key_from_nvs()) {
+            wigle_api_name[0] = '\0';
+            wigle_api_token[0] = '\0';
+            MY_LOG_INFO(TAG, "WiGLE key cleared from NVS.");
+        } else {
+            MY_LOG_INFO(TAG, "Failed to clear WiGLE key from NVS.");
+            return 1;
         }
         return 0;
     }
@@ -7424,7 +9386,7 @@ static int cmd_wigle_key(int argc, char **argv) {
         return 0;
     }
 
-    MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read");
+    MY_LOG_INFO(TAG, "Usage: wigle_key set <api_name> <api_token> | wigle_key set <api_name:api_token> | wigle_key read | wigle_key clear");
     return 0;
 }
 
@@ -7438,15 +9400,17 @@ static int cmd_wigle_upload(int argc, char **argv) {
         return 1;
     }
 
-    if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
-        MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
-        MY_LOG_INFO(TAG, "Use 'wigle_key set <api_name> <api_token>' or /sdcard/lab/wigle.txt");
-        return 1;
-    }
-
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    create_sd_directories();
+    wigle_load_key_from_sd();
+
+    if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
+        MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
+        MY_LOG_INFO(TAG, "Use 'wigle_key set <api_name> <api_token>' or /sdcard/lab/wigle.txt");
         return 1;
     }
 
@@ -7454,9 +9418,10 @@ static int cmd_wigle_upload(int argc, char **argv) {
     int skipped = 0;
     int failed = 0;
     bool auth_failed = false;
+    bool force_all = (argc > 1 && strcasecmp(argv[1], "all") == 0);
 
     // If files are passed as args, upload only those selected files.
-    if (argc > 1) {
+    if (argc > 1 && !force_all) {
         int total_files = argc - 1;
         MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to api.wigle.net...", total_files);
 
@@ -7477,11 +9442,39 @@ static int cmd_wigle_upload(int argc, char **argv) {
                 fsize = (long)st.st_size;
             }
 
-            int result = wigle_upload_file(filepath, upload_name);
+            uint32_t hash = 0;
+            if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", i, total_files, upload_name);
+                failed++;
+                continue;
+            }
+
+            wdgwars_wigle_stats_t wigle_stats;
+            bool use_sanitized = false;
+            if (!wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", i, total_files, upload_name, fsize);
+                failed++;
+                continue;
+            }
+
+            if (upload_state_is_done("wigle", upload_name, fsize, hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
+                skipped++;
+                if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+                continue;
+            }
+
+            const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
+            int result = wigle_upload_file(upload_path, upload_name);
+            if (use_sanitized) {
+                unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+            }
             if (result == 0) {
+                upload_state_append("wigle", upload_name, fsize, hash, "done", &wigle_stats);
                 MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
                 uploaded++;
             } else if (result == 1) {
+                upload_state_append("wigle", upload_name, fsize, hash, "done", &wigle_stats);
                 MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (duplicate)", i, total_files, upload_name, fsize);
                 skipped++;
             } else if (result == 2) {
@@ -7491,6 +9484,7 @@ static int cmd_wigle_upload(int argc, char **argv) {
                 auth_failed = true;
                 break;
             } else {
+                upload_state_append("wigle", upload_name, fsize, hash, "failed", &wigle_stats);
                 MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", i, total_files, upload_name, fsize);
                 failed++;
             }
@@ -7529,7 +9523,8 @@ static int cmd_wigle_upload(int argc, char **argv) {
         return 0;
     }
 
-    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to api.wigle.net...", total_files);
+    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to api.wigle.net%s...", total_files,
+                force_all ? " (force all)" : "");
 
     rewinddir(dir);
     int current = 0;
@@ -7552,11 +9547,39 @@ static int cmd_wigle_upload(int argc, char **argv) {
             fsize = (long)st.st_size;
         }
 
-        int result = wigle_upload_file(filepath, entry->d_name);
+        uint32_t hash = 0;
+        if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", current, total_files, entry->d_name);
+            failed++;
+            continue;
+        }
+
+        wdgwars_wigle_stats_t wigle_stats;
+        bool use_sanitized = false;
+        if (!wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", current, total_files, entry->d_name, fsize);
+            failed++;
+            continue;
+        }
+
+        if (!force_all && upload_state_is_done("wigle", entry->d_name, fsize, hash)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
+            skipped++;
+            if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+            continue;
+        }
+
+        const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
+        int result = wigle_upload_file(upload_path, entry->d_name);
+        if (use_sanitized) {
+            unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+        }
         if (result == 0) {
+            upload_state_append("wigle", entry->d_name, fsize, hash, "done", &wigle_stats);
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
             uploaded++;
         } else if (result == 1) {
+            upload_state_append("wigle", entry->d_name, fsize, hash, "done", &wigle_stats);
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (duplicate)", current, total_files, entry->d_name, fsize);
             skipped++;
         } else if (result == 2) {
@@ -7566,6 +9589,7 @@ static int cmd_wigle_upload(int argc, char **argv) {
             auth_failed = true;
             break;
         } else {
+            upload_state_append("wigle", entry->d_name, fsize, hash, "failed", &wigle_stats);
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
             failed++;
         }
@@ -7582,8 +9606,213 @@ static int cmd_wigle_upload(int argc, char **argv) {
     return (failed > 0) ? 1 : 0;
 }
 
+static int wdgwars_parse_retry_after_ms(const char *resp) {
+    if (!resp) {
+        return 0;
+    }
+
+    const char *p = strcasestr(resp, "Retry-After:");
+    if (!p) {
+        return 0;
+    }
+    p += strlen("Retry-After:");
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    int seconds = atoi(p);
+    if (seconds <= 0) {
+        return 0;
+    }
+    if (seconds > 3600) {
+        seconds = 3600;
+    }
+    return seconds * 1000;
+}
+
+static int wdgwars_next_backoff_ms(int retry_after_ms) {
+    if (retry_after_ms > 0) {
+        return retry_after_ms;
+    }
+
+    int shift = wdgwars_rate_limit_streak;
+    if (shift < 0) shift = 0;
+    if (shift > 3) shift = 3;
+    int backoff = WDGWARS_BACKOFF_BASE_MS << shift;
+    if (backoff > WDGWARS_BACKOFF_MAX_MS) {
+        backoff = WDGWARS_BACKOFF_MAX_MS;
+    }
+    backoff += (int)((esp_timer_get_time() / 1000) % 5000); // small deterministic jitter
+    return backoff;
+}
+
+static void wdgwars_note_rate_limited(int retry_after_ms) {
+    wdgwars_rate_limit_streak++;
+    int backoff_ms = wdgwars_next_backoff_ms(retry_after_ms);
+    wdgwars_circuit_open_until_us = esp_timer_get_time() + ((int64_t)backoff_ms * 1000LL);
+    MY_LOG_INFO(TAG, "WDGWars rate limited (HTTP 429). Circuit open for %d s.",
+                (backoff_ms + 999) / 1000);
+}
+
+static void wdgwars_note_success(void) {
+    wdgwars_rate_limit_streak = 0;
+    wdgwars_circuit_open_until_us = 0;
+}
+
+static bool wdgwars_circuit_allows_request(void) {
+    int64_t now = esp_timer_get_time();
+    if (wdgwars_circuit_open_until_us > now) {
+        int wait_s = (int)((wdgwars_circuit_open_until_us - now + 999999LL) / 1000000LL);
+        MY_LOG_INFO(TAG, "WDGWars circuit open, retry after %d s", wait_s);
+        return false;
+    }
+    return true;
+}
+
+static int wdgwars_poll_upload_job(int job_id) {
+    const size_t REQ_BUF_SZ = 384;
+    const size_t RESP_BUF_SZ = 1536;
+    int result = -1;
+    esp_tls_t *tls = NULL;
+    char *req_buf = NULL;
+    char *resp_buf = NULL;
+
+    req_buf = (char *)heap_caps_malloc(REQ_BUF_SZ, MALLOC_CAP_8BIT);
+    resp_buf = (char *)heap_caps_malloc(RESP_BUF_SZ, MALLOC_CAP_8BIT);
+    if (!req_buf || !resp_buf) {
+        MY_LOG_INFO(TAG, "  Poll buffer allocation failed");
+        goto cleanup;
+    }
+
+    for (int attempt = 0; attempt < 90; attempt++) {
+        char url[128];
+        snprintf(url, sizeof(url), "%s%d", WDGWARS_V2_JOB_URL_BASE, job_id);
+
+        int req_len = snprintf(req_buf, REQ_BUF_SZ,
+                               "GET /api/v2/upload-job/%d HTTP/1.1\r\n"
+                               "Host: wdgwars.pl\r\n"
+                               "X-API-Key: %s\r\n"
+                               "User-Agent: projectZero-wdgwars\r\n"
+                               "Connection: close\r\n"
+                               "\r\n",
+                               job_id, wdgwars_api_key);
+        if (req_len <= 0 || req_len >= (int)REQ_BUF_SZ) {
+            MY_LOG_INFO(TAG, "  Failed to build poll request");
+            goto cleanup;
+        }
+
+        esp_tls_cfg_t tls_cfg = { .crt_bundle_attach = NULL, .timeout_ms = 15000 };
+        tls = esp_tls_init();
+        if (!tls) {
+            MY_LOG_INFO(TAG, "  Poll TLS init failed");
+            goto cleanup;
+        }
+        if (esp_tls_conn_http_new_sync(url, &tls_cfg, tls) < 0) {
+            MY_LOG_INFO(TAG, "  Poll TLS connection failed");
+            goto cleanup;
+        }
+        if (wpasec_tls_write_all(tls, req_buf, req_len) < 0) {
+            MY_LOG_INFO(TAG, "  Failed to send poll request");
+            goto cleanup;
+        }
+
+        memset(resp_buf, 0, RESP_BUF_SZ);
+        int total_read = 0;
+        while (total_read < (int)RESP_BUF_SZ - 1) {
+            int ret = esp_tls_conn_read(tls, resp_buf + total_read, RESP_BUF_SZ - 1 - total_read);
+            if (ret <= 0) break;
+            total_read += ret;
+        }
+        resp_buf[total_read] = '\0';
+        esp_tls_conn_destroy(tls);
+        tls = NULL;
+
+        int http_status = 0;
+        if (total_read > 12 && strncmp(resp_buf, "HTTP/", 5) == 0) {
+            const char *sp = strchr(resp_buf, ' ');
+            if (sp) {
+                http_status = atoi(sp + 1);
+            }
+        }
+        if (http_status == 401 || http_status == 403) {
+            result = 2;
+            goto cleanup;
+        }
+        if (http_status == 429) {
+            wdgwars_note_rate_limited(wdgwars_parse_retry_after_ms(resp_buf));
+            result = WDGWARS_RESULT_RATE_LIMITED;
+            goto cleanup;
+        }
+        if (http_status != 200) {
+            MY_LOG_INFO(TAG, "  Poll HTTP error %d", http_status);
+            goto cleanup;
+        }
+
+        const char *json = strchr(resp_buf, '{');
+        if (!json) {
+            MY_LOG_INFO(TAG, "  Poll response missing JSON");
+            goto cleanup;
+        }
+
+        if (strstr(json, "\"status\":\"done\"") ||
+            strstr(json, "\"status\": \"done\"")) {
+            result = 0;
+            goto cleanup;
+        }
+        if (strstr(json, "\"status\":\"failed\"") ||
+            strstr(json, "\"status\": \"failed\"")) {
+            MY_LOG_INFO(TAG, "  WDGWars job failed");
+            goto cleanup;
+        }
+
+        cJSON *root = cJSON_Parse(json);
+        if (!root) {
+            MY_LOG_INFO(TAG, "  Poll JSON parse failed");
+            goto cleanup;
+        }
+
+        cJSON *status = cJSON_GetObjectItem(root, "status");
+        if (cJSON_IsString(status) && status->valuestring) {
+            if (strcmp(status->valuestring, "done") == 0) {
+                cJSON_Delete(root);
+                result = 0;
+                goto cleanup;
+            }
+            if (strcmp(status->valuestring, "failed") == 0) {
+                cJSON *err = cJSON_GetObjectItem(root, "error");
+                if (cJSON_IsString(err) && err->valuestring) {
+                    MY_LOG_INFO(TAG, "  WDGWars job failed: %s", err->valuestring);
+                } else {
+                    MY_LOG_INFO(TAG, "  WDGWars job failed");
+                }
+                cJSON_Delete(root);
+                goto cleanup;
+            }
+        }
+        cJSON_Delete(root);
+
+        if ((attempt % 5) == 0) {
+            MY_LOG_INFO(TAG, "  WDGWars job %d pending...", job_id);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    MY_LOG_INFO(TAG, "  WDGWars job %d poll timeout", job_id);
+
+cleanup:
+    if (tls) {
+        esp_tls_conn_destroy(tls);
+    }
+    if (req_buf) {
+        free(req_buf);
+    }
+    if (resp_buf) {
+        free(resp_buf);
+    }
+    return result;
+}
+
 /**
- * @brief Upload a single Wardrive file (.log/.csv) to wdgwars.pl
+ * @brief Upload a single Wardrive file (.log/.csv/.gz) to wdgwars.pl v2 queue
  *
  * @return 0 on success, 1 on duplicate/skipped, 2 on auth error, -1 on error
  */
@@ -7607,7 +9836,7 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (file_size <= 0 || file_size > 16L * 1024L * 1024L) {
+    if (file_size <= 0 || file_size > WDGWARS_MAX_UPLOAD_BYTES) {
         MY_LOG_INFO(TAG, "  Invalid file size: %ld bytes", file_size);
         goto cleanup;
     }
@@ -7619,6 +9848,8 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
     size_t name_len = strlen(filename);
     if (name_len >= 4 && strcasecmp(filename + name_len - 4, ".log") == 0) {
         content_type = "text/plain";
+    } else if (name_len >= 3 && strcasecmp(filename + name_len - 3, ".gz") == 0) {
+        content_type = "application/gzip";
     }
 
     char body_start[256];
@@ -7658,7 +9889,7 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
     }
 
     int hdr_len = snprintf(http_headers, HDR_BUF_SZ,
-                           "POST /api/upload-csv HTTP/1.1\r\n"
+                           "POST /api/v2/upload-csv HTTP/1.1\r\n"
                            "Host: wdgwars.pl\r\n"
                            "X-API-Key: %s\r\n"
                            "Content-Type: multipart/form-data; boundary=%s\r\n"
@@ -7683,7 +9914,7 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
         goto cleanup;
     }
 
-    int ret = esp_tls_conn_http_new_sync(WDGWARS_URL, &tls_cfg, tls);
+    int ret = esp_tls_conn_http_new_sync(WDGWARS_V2_URL, &tls_cfg, tls);
     if (ret < 0) {
         MY_LOG_INFO(TAG, "  TLS connection failed");
         goto cleanup;
@@ -7734,18 +9965,46 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
         }
     }
 
-    bool duplicate = (strstr(resp_buf, "already") != NULL ||
-                      strstr(resp_buf, "Already") != NULL ||
-                      strstr(resp_buf, "duplicate") != NULL ||
-                      strstr(resp_buf, "Duplicate") != NULL);
-
-    if (status == 200 || status == 201 || status == 202) {
-        result = duplicate ? 1 : 0;
+    if (status == 401 || status == 403) {
+        result = 2;
+        goto cleanup;
+    }
+    if (status == 429) {
+        wdgwars_note_rate_limited(wdgwars_parse_retry_after_ms(resp_buf));
+        result = WDGWARS_RESULT_RATE_LIMITED;
         goto cleanup;
     }
 
-    if (status == 401 || status == 403) {
-        result = 2;
+    if (status == 200 || status == 201 || status == 202) {
+        const char *json = strchr(resp_buf, '{');
+        if (!json) {
+            result = 0;
+            goto cleanup;
+        }
+
+        cJSON *root = cJSON_Parse(json);
+        if (!root) {
+            MY_LOG_INFO(TAG, "  WDGWars response JSON parse failed");
+            goto cleanup;
+        }
+
+        cJSON *job_id = cJSON_GetObjectItem(root, "job_id");
+        if (cJSON_IsNumber(job_id)) {
+            int id = job_id->valueint;
+            cJSON_Delete(root);
+            MY_LOG_INFO(TAG, "  WDGWars job %d queued", id);
+            result = wdgwars_poll_upload_job(id);
+            goto cleanup;
+        }
+
+        cJSON *ok = cJSON_GetObjectItem(root, "ok");
+        if (cJSON_IsBool(ok) && cJSON_IsTrue(ok)) {
+            result = 0;
+        } else {
+            MY_LOG_INFO(TAG, "  WDGWars response missing job_id");
+            result = -1;
+        }
+        cJSON_Delete(root);
         goto cleanup;
     }
     if (status == 409) {
@@ -7777,7 +10036,7 @@ cleanup:
 
 static int cmd_wdgwars_key(int argc, char **argv) {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key> | wdgwars_key read");
+        MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key> | wdgwars_key read | wdgwars_key clear");
         return 0;
     }
 
@@ -7785,9 +10044,20 @@ static int cmd_wdgwars_key(int argc, char **argv) {
         if (wdgwars_api_key[0] == '\0') {
             MY_LOG_INFO(TAG, "WDGWars key: not set");
             MY_LOG_INFO(TAG, "Set via: wdgwars_key set <key>");
-            MY_LOG_INFO(TAG, "Or place the API key in /sdcard/lab/wdgwars.txt and reboot.");
+            MY_LOG_INFO(TAG, "Or place the API key in /sdcard/lab/wdgwars.txt before upload.");
         } else {
             MY_LOG_INFO(TAG, "WDGWars key: %.4s****", wdgwars_api_key);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "clear") == 0) {
+        if (wdgwars_clear_key_from_nvs()) {
+            wdgwars_api_key[0] = '\0';
+            MY_LOG_INFO(TAG, "WDGWars key cleared from NVS.");
+        } else {
+            MY_LOG_INFO(TAG, "Failed to clear WDGWars key from NVS.");
+            return 1;
         }
         return 0;
     }
@@ -7813,16 +10083,53 @@ static int cmd_wdgwars_key(int argc, char **argv) {
         return 0;
     }
 
-    MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key> | wdgwars_key read");
+    MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key> | wdgwars_key read | wdgwars_key clear");
     return 0;
 }
 
+static void wdgwars_log_history_result(cJSON *entry) {
+    if (!entry) {
+        return;
+    }
+
+    cJSON *endpoint = cJSON_GetObjectItem(entry, "endpoint");
+    cJSON *file_size = cJSON_GetObjectItem(entry, "file_size");
+    cJSON *created_at = cJSON_GetObjectItem(entry, "created_at");
+    cJSON *result = cJSON_GetObjectItem(entry, "result");
+
+    const char *endpoint_str = (cJSON_IsString(endpoint) && endpoint->valuestring) ? endpoint->valuestring : "unknown";
+    const char *created_str = (cJSON_IsString(created_at) && created_at->valuestring) ? created_at->valuestring : "unknown";
+    int size_val = cJSON_IsNumber(file_size) ? file_size->valueint : -1;
+
+    MY_LOG_INFO(TAG, "  Upload history: endpoint=%s size=%d at=%s",
+                endpoint_str, size_val, created_str);
+
+    if (cJSON_IsObject(result)) {
+        cJSON *imported = cJSON_GetObjectItem(result, "imported");
+        cJSON *captured = cJSON_GetObjectItem(result, "captured");
+        cJSON *updated = cJSON_GetObjectItem(result, "updated");
+        cJSON *duplicates = cJSON_GetObjectItem(result, "duplicates");
+        cJSON *no_gps = cJSON_GetObjectItem(result, "no_gps");
+        cJSON *bad_rows = cJSON_GetObjectItem(result, "bad_rows");
+        cJSON *cooldown = cJSON_GetObjectItem(result, "cooldown");
+
+        MY_LOG_INFO(TAG, "  Result: imported=%d captured=%d updated=%d duplicates=%d no_gps=%d bad_rows=%d cooldown=%d",
+                    cJSON_IsNumber(imported) ? imported->valueint : 0,
+                    cJSON_IsNumber(captured) ? captured->valueint : 0,
+                    cJSON_IsNumber(updated) ? updated->valueint : 0,
+                    cJSON_IsNumber(duplicates) ? duplicates->valueint : 0,
+                    cJSON_IsNumber(no_gps) ? no_gps->valueint : 0,
+                    cJSON_IsNumber(bad_rows) ? bad_rows->valueint : 0,
+                    cJSON_IsNumber(cooldown) ? cooldown->valueint : 0);
+    }
+}
+
 /**
- * @brief Query upload history and check if filename appears in the last 5 uploads.
+ * @brief Query upload history and check if filename appears in the last uploads.
  * @return true if found (upload confirmed), false otherwise
  */
 static bool wdgwars_check_in_history(const char *filename) {
-    const size_t RESP_BUF_SZ = 2048;
+    const size_t RESP_BUF_SZ = 4096;
     bool found = false;
     esp_tls_t *tls = NULL;
     char *resp_buf = NULL;
@@ -7874,6 +10181,7 @@ static bool wdgwars_check_in_history(const char *filename) {
             if (cJSON_IsString(fn) && fn->valuestring &&
                 strcmp(fn->valuestring, filename) == 0) {
                 found = true;
+                wdgwars_log_history_result(entry);
             }
         }
     }
@@ -7887,7 +10195,22 @@ hist_cleanup:
 }
 
 static int wdgwars_upload_file_with_retry(const char *filepath, const char *filename) {
+    if (!wdgwars_circuit_allows_request()) {
+        return WDGWARS_RESULT_RATE_LIMITED;
+    }
+
     int result = wdgwars_upload_file(filepath, filename);
+    if (result == WDGWARS_RESULT_RATE_LIMITED) {
+        return result;
+    }
+    if (result == 0) {
+        wdgwars_note_success();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (wdgwars_check_in_history(filename)) {
+            MY_LOG_INFO(TAG, "  Upload confirmed via history");
+        }
+        return 0;
+    }
     if (result != -1) return result;
 
     // HTTP error (likely timeout reading response) — verify via history before retrying
@@ -7900,11 +10223,21 @@ static int wdgwars_upload_file_with_retry(const char *filepath, const char *file
 
     // Not in history yet — try once more
     MY_LOG_INFO(TAG, "  Not found in history, retrying upload...");
+    if (!wdgwars_circuit_allows_request()) {
+        return WDGWARS_RESULT_RATE_LIMITED;
+    }
     result = wdgwars_upload_file(filepath, filename);
+    if (result == WDGWARS_RESULT_RATE_LIMITED) {
+        return result;
+    }
     if (result == 1) {
         // Duplicate on retry = first attempt landed after all
+        wdgwars_note_success();
         MY_LOG_INFO(TAG, "  Upload confirmed (duplicate on retry)");
         return 0;
+    }
+    if (result == 0) {
+        wdgwars_note_success();
     }
     return result;
 }
@@ -7919,24 +10252,32 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
         return 1;
     }
 
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+    create_sd_directories();
+    wdgwars_load_key_from_sd();
+
     if (wdgwars_api_key[0] == '\0') {
         MY_LOG_INFO(TAG, "NO WDGWARS CREDENTIALS");
         MY_LOG_INFO(TAG, "Use 'wdgwars_key set <key>' or /sdcard/lab/wdgwars.txt");
         return 1;
     }
 
-    esp_err_t ret = init_sd_card();
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
-        return 1;
+    if (!wdgwars_circuit_allows_request()) {
+        return 0;
     }
 
     int uploaded = 0;
     int skipped = 0;
     int failed = 0;
+    int rate_limited = 0;
     bool auth_failed = false;
+    bool force_all = (argc > 1 && strcasecmp(argv[1], "all") == 0);
 
-    if (argc > 1) {
+    if (argc > 1 && !force_all) {
         int total_files = argc - 1;
         MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to wdgwars.pl...", total_files);
 
@@ -7957,28 +10298,65 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
                 fsize = (long)st.st_size;
             }
 
-            int result = wdgwars_upload_file_with_retry(filepath, upload_name);
-            if (result == 0) {
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
-                uploaded++;
-            } else if (result == 1) {
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped", i, total_files, upload_name, fsize);
-                skipped++;
-            } else if (result == 2) {
-                MY_LOG_INFO(TAG, "WDGWARS AUTH FAILED");
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", i, total_files, upload_name, fsize);
+            wdgwars_wigle_stats_t wigle_stats;
+            bool use_sanitized = false;
+            uint32_t hash = 0;
+            if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", i, total_files, upload_name);
                 failed++;
-                auth_failed = true;
-                break;
+                continue;
+            }
+
+            if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
+                if (upload_state_is_done("wdgwars", upload_name, fsize, hash)) {
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
+                    skipped++;
+                    if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+                    continue;
+                }
+
+                const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
+                if (use_sanitized && stat(upload_path, &st) == 0) {
+                    /* Keep fsize/hash from the original file for upload_state identity. */
+                }
+
+                int result = wdgwars_upload_file_with_retry(upload_path, upload_name);
+                if (use_sanitized) {
+                    unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+                }
+                if (result == 0) {
+                    upload_state_append("wdgwars", upload_name, fsize, hash, "done", &wigle_stats);
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
+                    uploaded++;
+                } else if (result == 1) {
+                    upload_state_append("wdgwars", upload_name, fsize, hash, "done", &wigle_stats);
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped", i, total_files, upload_name, fsize);
+                    skipped++;
+                } else if (result == 2) {
+                    MY_LOG_INFO(TAG, "WDGWARS AUTH FAILED");
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", i, total_files, upload_name, fsize);
+                    failed++;
+                    auth_failed = true;
+                    break;
+                } else if (result == WDGWARS_RESULT_RATE_LIMITED) {
+                    upload_state_append("wdgwars", upload_name, fsize, hash, "rate_limited", &wigle_stats);
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> RATE LIMITED", i, total_files, upload_name, fsize);
+                    rate_limited++;
+                    break;
+                } else {
+                    upload_state_append("wdgwars", upload_name, fsize, hash, "failed", &wigle_stats);
+                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", i, total_files, upload_name, fsize);
+                    failed++;
+                }
             } else {
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", i, total_files, upload_name, fsize);
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", i, total_files, upload_name, fsize);
                 failed++;
             }
 
             vTaskDelay(pdMS_TO_TICKS(250));
         }
 
-        MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+        MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed, %d rate_limited", uploaded, skipped, failed, rate_limited);
         if (auth_failed) {
             return 1;
         }
@@ -8003,13 +10381,14 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
     }
 
     if (total_files == 0) {
-        MY_LOG_INFO(TAG, "No Wardrive files (.log/.csv) found in /sdcard/lab/wardrives/");
+        MY_LOG_INFO(TAG, "No Wardrive files (.log/.csv/.gz) found in /sdcard/lab/wardrives/");
         MY_LOG_INFO(TAG, "Done: 0 uploaded, 0 skipped, 0 failed");
         closedir(dir);
         return 0;
     }
 
-    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to wdgwars.pl...", total_files);
+    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to wdgwars.pl%s...", total_files,
+                force_all ? " (force all)" : "");
 
     rewinddir(dir);
     int current = 0;
@@ -8032,21 +10411,58 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
             fsize = (long)st.st_size;
         }
 
-        int result = wdgwars_upload_file_with_retry(filepath, entry->d_name);
-        if (result == 0) {
-            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
-            uploaded++;
-        } else if (result == 1) {
-            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped", current, total_files, entry->d_name, fsize);
-            skipped++;
-        } else if (result == 2) {
-            MY_LOG_INFO(TAG, "WDGWARS AUTH FAILED");
-            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", current, total_files, entry->d_name, fsize);
+        wdgwars_wigle_stats_t wigle_stats;
+        bool use_sanitized = false;
+        uint32_t hash = 0;
+        if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", current, total_files, entry->d_name);
             failed++;
-            auth_failed = true;
-            break;
+            continue;
+        }
+
+        if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
+            if (!force_all && upload_state_is_done("wdgwars", entry->d_name, fsize, hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
+                skipped++;
+                if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+                continue;
+            }
+
+            const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
+            if (use_sanitized && stat(upload_path, &st) == 0) {
+                /* Keep fsize/hash from the original file for upload_state identity. */
+            }
+
+            int result = wdgwars_upload_file_with_retry(upload_path, entry->d_name);
+            if (use_sanitized) {
+                unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
+            }
+            if (result == 0) {
+                upload_state_append("wdgwars", entry->d_name, fsize, hash, "done", &wigle_stats);
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
+                uploaded++;
+            } else if (result == 1) {
+                upload_state_append("wdgwars", entry->d_name, fsize, hash, "done", &wigle_stats);
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped", current, total_files, entry->d_name, fsize);
+                skipped++;
+            } else if (result == 2) {
+                MY_LOG_INFO(TAG, "WDGWARS AUTH FAILED");
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", current, total_files, entry->d_name, fsize);
+                failed++;
+                auth_failed = true;
+                break;
+            } else if (result == WDGWARS_RESULT_RATE_LIMITED) {
+                upload_state_append("wdgwars", entry->d_name, fsize, hash, "rate_limited", &wigle_stats);
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> RATE LIMITED", current, total_files, entry->d_name, fsize);
+                rate_limited++;
+                break;
+            } else {
+                upload_state_append("wdgwars", entry->d_name, fsize, hash, "failed", &wigle_stats);
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
+                failed++;
+            }
         } else {
-            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", current, total_files, entry->d_name, fsize);
             failed++;
         }
 
@@ -8055,7 +10471,7 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
 
     closedir(dir);
 
-    MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+    MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed, %d rate_limited", uploaded, skipped, failed, rate_limited);
     if (auth_failed) {
         return 1;
     }
@@ -8692,6 +11108,13 @@ static int cmd_stop(int argc, char **argv) {
     // Stop nRF24 jammer if running
     nrf24_jammer_stop();
 
+    // Stop 802.15.4 recon if running
+    if (zig_recon_is_active() || current_radio_mode == RADIO_MODE_IEEE802154) {
+        zig_recon_stop();
+        current_radio_mode = RADIO_MODE_NONE;
+        MY_LOG_INFO(TAG, "802.15.4 recon stopped.");
+    }
+
     // Stop AP locator if running
     ap_locator_stop();
 
@@ -9039,7 +11462,23 @@ static int cmd_stop(int argc, char **argv) {
             MY_LOG_INFO(TAG, "Wardrive promisc task forcefully stopped.");
         }
     }
-    
+
+    // Stop anti-surveillance task if running
+    if (antisurv_active || antisurv_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping anti-surveillance task...");
+        antisurv_active = false;
+        bt_stop_scan();
+
+        for (int i = 0; i < 20 && antisurv_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (antisurv_task_handle != NULL) {
+            vTaskDelete(antisurv_task_handle);
+            antisurv_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Anti-surveillance task forcefully stopped.");
+        }
+    }
+
     // Stop DarkSword if active
     if (darksword_active) {
         MY_LOG_INFO(TAG, "Stopping DarkSword...");
@@ -9195,6 +11634,414 @@ static int cmd_stop(int argc, char **argv) {
     return 0;
 }
 
+static bool zig_recon_radio_busy(char *reason, size_t reason_len)
+{
+    const char *why = NULL;
+    if (g_scan_in_progress) why = "wifi_scan";
+    else if (sniffer_active || sniffer_channel_task_handle != NULL) why = "sniffer";
+    else if (packet_monitor_active || packet_monitor_task_handle != NULL) why = "packet_monitor";
+    else if (ap_locator_active || ap_locator_task_handle != NULL) why = "ap_locator";
+    else if (channel_view_active || channel_view_task_handle != NULL) why = "channel_view";
+    else if (pcap_capture_active || pcap_writer_task_handle != NULL) why = "pcap";
+    else if (deauth_attack_active || deauth_attack_task_handle != NULL) why = "deauth";
+    else if (blackout_attack_active || blackout_attack_task_handle != NULL) why = "blackout";
+    else if (sae_attack_active || sae_attack_task_handle != NULL) why = "sae_overflow";
+    else if (sniffer_dog_active || sniffer_dog_task_handle != NULL) why = "sniffer_dog";
+    else if (deauth_detector_active || deauth_detector_task_handle != NULL) why = "deauth_detector";
+    else if (handshake_attack_active || handshake_attack_task_handle != NULL) why = "handshake";
+    else if (beacon_spam_active || beacon_spam_task_handle != NULL) why = "beacon_spam";
+    else if (portal_active || darksword_active) why = "portal";
+    else if (wardrive_active || wardrive_task_handle != NULL) why = "wardrive";
+    else if (wardrive_promisc_active || wardrive_promisc_task_handle != NULL) why = "wardrive_promisc";
+    else if (antisurv_active || antisurv_task_handle != NULL) why = "antisurveillance";
+    else if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) why = "ble_scan";
+    else if (nrf24_jammer_is_running()) why = "nrf24";
+
+    if (why && reason && reason_len) {
+        snprintf(reason, reason_len, "%s", why);
+    }
+    return why != NULL;
+}
+
+static bool zig_recon_parse_u16(const char *text, uint16_t *out)
+{
+    if (!text || !out || *text == '\0') {
+        return false;
+    }
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 0);
+    if (end == text || *end != '\0' || value > 0xffffUL) {
+        return false;
+    }
+    *out = (uint16_t)value;
+    return true;
+}
+
+static bool zig_recon_parse_channels(const char *arg, uint32_t *out_mask)
+{
+    if (!arg || !out_mask) {
+        return false;
+    }
+    if (strcasecmp(arg, "all") == 0) {
+        *out_mask = ZIG_RECON_ALL_CHANNELS_MASK;
+        return true;
+    }
+
+    char buf[96];
+    strlcpy(buf, arg, sizeof(buf));
+    uint32_t mask = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(buf, ",:", &saveptr); tok; tok = strtok_r(NULL, ",:", &saveptr)) {
+        char *end = NULL;
+        long ch = strtol(tok, &end, 10);
+        if (end == tok || *end != '\0' || ch < ZIG_RECON_MIN_CHANNEL || ch > ZIG_RECON_MAX_CHANNEL) {
+            return false;
+        }
+        mask |= (1UL << ch);
+    }
+    if (mask == 0) {
+        return false;
+    }
+    *out_mask = mask;
+    return true;
+}
+
+static void zig_recon_format_channels(uint32_t mask, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    bool first = true;
+    for (uint8_t ch = ZIG_RECON_MIN_CHANNEL; ch <= ZIG_RECON_MAX_CHANNEL; ch++) {
+        if (!(mask & (1UL << ch))) {
+            continue;
+        }
+        char part[8];
+        snprintf(part, sizeof(part), "%s%u", first ? "" : ",", ch);
+        strlcat(out, part, out_len);
+        first = false;
+    }
+    if (out[0] == '\0') {
+        strlcpy(out, "none", out_len);
+    }
+}
+
+static const char *zig_recon_pan_kind(uint16_t pan_id)
+{
+    return pan_id == 0xffff ? "broadcast" : "network";
+}
+
+static void zig_recon_format_ext(uint64_t value, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    snprintf(out, out_len, "%08lx%08lx",
+             (unsigned long)(value >> 32),
+             (unsigned long)(value & 0xffffffffUL));
+}
+
+static zig_recon_snapshot_t *zig_recon_alloc_snapshot(void)
+{
+    return heap_caps_calloc(1, sizeof(zig_recon_snapshot_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+static int cmd_start_zig_recon(int argc, char **argv)
+{
+    if (argc > 3) {
+        printf("Usage: start_zig_recon [all|11,15,20] [dwell_ms]\n");
+        return 1;
+    }
+    if (zig_recon_is_active()) {
+        printf("802.15.4 recon already running. Use 'stop' first.\n");
+        return 1;
+    }
+
+    char busy[32] = {0};
+    if (zig_recon_radio_busy(busy, sizeof(busy))) {
+        printf("FAILED: radio busy (%s). Use 'stop' first.\n", busy);
+        return 1;
+    }
+
+    zig_recon_config_t cfg = {
+        .channel_mask = ZIG_RECON_ALL_CHANNELS_MASK,
+        .dwell_ms = 250,
+    };
+    if (argc >= 2 && !zig_recon_parse_channels(argv[1], &cfg.channel_mask)) {
+        printf("Usage: start_zig_recon [all|11,15,20] [dwell_ms]\n");
+        return 1;
+    }
+    if (argc >= 3) {
+        int dwell = atoi(argv[2]);
+        if (dwell < 50 || dwell > 5000) {
+            printf("dwell_ms must be 50-5000\n");
+            return 1;
+        }
+        cfg.dwell_ms = (uint16_t)dwell;
+    }
+
+    if (!ensure_ieee802154_mode()) {
+        printf("FAILED: unable to switch to 802.15.4 radio mode\n");
+        return 1;
+    }
+
+    esp_err_t err = zig_recon_start(&cfg);
+    if (err != ESP_OK) {
+        current_radio_mode = RADIO_MODE_NONE;
+        printf("FAILED: zig_recon_start: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    operation_stop_requested = false;
+    char channels[64];
+    zig_recon_format_channels(cfg.channel_mask, channels, sizeof(channels));
+    printf("802.15.4 recon started. channels=%s dwell_ms=%u mode=passive. Use 'stop' to end.\n",
+           channels, cfg.dwell_ms);
+    oled_display_update_full("> 802.15.4", "  Recon active", "  passive RX", "  > stop to end");
+    return 0;
+}
+
+static int cmd_zig_recon_status(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    zig_recon_snapshot_t *snap = zig_recon_alloc_snapshot();
+    if (!snap) {
+        printf("FAILED: no PSRAM for zig_recon_status snapshot\n");
+        printf("[ZIG] END\n");
+        return 1;
+    }
+    zig_recon_get_snapshot(snap);
+    char channels[64];
+    zig_recon_format_channels(snap->channel_mask, channels, sizeof(channels));
+
+    printf("802.15.4 Recon: %s\n", snap->active ? "running" : "idle");
+    printf("Channel: %u  Packets: %lu  Networks: %u  Dropped: %lu\n",
+           snap->current_channel,
+           (unsigned long)snap->packets_total,
+           snap->pan_count,
+           (unsigned long)snap->dropped_frames);
+    printf("Hopping: %s dwell=%ums  Mode: passive\n", channels, snap->dwell_ms);
+    printf("[ZIG] status active=%d channel=%u packets=%lu pans=%u nodes=%u dropped=%lu dwell_ms=%u channels=0x%08lx\n",
+           snap->active ? 1 : 0,
+           snap->current_channel,
+           (unsigned long)snap->packets_total,
+           snap->pan_count,
+           snap->node_count,
+           (unsigned long)snap->dropped_frames,
+           snap->dwell_ms,
+           (unsigned long)snap->channel_mask);
+    printf("[ZIG] END\n");
+    heap_caps_free(snap);
+    return 0;
+}
+
+static int cmd_zig_recon_list(int argc, char **argv)
+{
+    bool show_all = argc >= 2 && strcasecmp(argv[1], "all") == 0;
+    if (argc > 2 || (argc == 2 && !show_all)) {
+        printf("Usage: zig_recon_list [all]\n");
+        return 1;
+    }
+
+    zig_recon_snapshot_t *snap = zig_recon_alloc_snapshot();
+    if (!snap) {
+        printf("FAILED: no PSRAM for zig_recon_list snapshot\n");
+        printf("[ZIG] END\n");
+        return 1;
+    }
+    zig_recon_get_snapshot(snap);
+    printf("PAN       Proto       Ch                 Nodes  Packets  RSSI  Last\n");
+    uint16_t printed = 0;
+    uint16_t hidden = 0;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    for (uint16_t i = 0; i < snap->pan_count; i++) {
+        const zig_recon_pan_t *pan = &snap->pans[i];
+        if (!show_all && pan->pan_id == 0xffff) {
+            hidden++;
+            continue;
+        }
+        if (!show_all && printed >= 20) {
+            hidden++;
+            continue;
+        }
+        char channels[64];
+        zig_recon_format_channels(pan->channel_mask, channels, sizeof(channels));
+        uint32_t age_ms = pan->last_seen_ms ? (now - pan->last_seen_ms) : 0;
+        uint32_t age_s = age_ms / 1000U;
+        printf("0x%04X    %-10s  %-17s  %5u  %7lu  %4d  %lus\n",
+               pan->pan_id,
+               zig_recon_proto_name(pan->proto),
+               channels,
+               pan->nodes,
+               (unsigned long)pan->packets,
+               pan->last_rssi,
+               (unsigned long)age_s);
+        printf("[ZIG] pan id=0x%04X kind=%s proto=%s confidence=%s channels=0x%08lx nodes=%u packets=%lu best_rssi=%d last_rssi=%d last_seen_ms=%lu age_ms=%lu\n",
+               pan->pan_id,
+               zig_recon_pan_kind(pan->pan_id),
+               zig_recon_proto_token(pan->proto),
+               zig_recon_confidence_token(pan->confidence),
+               (unsigned long)pan->channel_mask,
+               pan->nodes,
+               (unsigned long)pan->packets,
+               pan->best_rssi,
+               pan->last_rssi,
+               (unsigned long)pan->last_seen_ms,
+               (unsigned long)age_ms);
+        printed++;
+    }
+    if (!show_all && hidden > 0) {
+        printf("... %u more hidden PANs/broadcast entries (use zig_recon_list all)\n", hidden);
+    }
+    printf("[ZIG] END\n");
+    heap_caps_free(snap);
+    return 0;
+}
+
+static int cmd_zig_recon_nodes(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("Usage: zig_recon_nodes <pan_id|all>\n");
+        return 1;
+    }
+    bool show_all = strcasecmp(argv[1], "all") == 0;
+    uint16_t pan_id = 0;
+    if (!show_all && !zig_recon_parse_u16(argv[1], &pan_id)) {
+        printf("Usage: zig_recon_nodes <pan_id|all>\n");
+        return 1;
+    }
+
+    zig_recon_snapshot_t *snap = zig_recon_alloc_snapshot();
+    if (!snap) {
+        printf("FAILED: no PSRAM for zig_recon_nodes snapshot\n");
+        printf("[ZIG] END\n");
+        return 1;
+    }
+    zig_recon_get_snapshot(snap);
+    const zig_recon_pan_t *pan = NULL;
+    if (!show_all) {
+        for (uint16_t i = 0; i < snap->pan_count; i++) {
+            if (snap->pans[i].pan_id == pan_id) {
+                pan = &snap->pans[i];
+                break;
+            }
+        }
+        if (!pan) {
+            printf("PAN 0x%04X not found\n", pan_id);
+            printf("[ZIG] END\n");
+            heap_caps_free(snap);
+            return 1;
+        }
+    }
+
+    if (show_all) {
+        printf("All discovered 802.15.4 nodes\n");
+    } else {
+        char channels[64];
+        zig_recon_format_channels(pan->channel_mask, channels, sizeof(channels));
+        printf("PAN 0x%04X  Proto: %s  Channels: %s  Packets: %lu\n",
+               pan_id, zig_recon_proto_name(pan->proto), channels, (unsigned long)pan->packets);
+    }
+    printf(show_all ? "PAN       ADDR    ROLE         PKTS  RSSI  LAST\n"
+                    : "ADDR      ROLE         PKTS  RSSI  LAST\n");
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    for (uint16_t i = 0; i < snap->node_count; i++) {
+        const zig_recon_node_t *node = &snap->nodes[i];
+        if (!show_all && node->pan_id != pan_id) {
+            continue;
+        }
+        uint32_t age_ms = node->last_seen_ms ? (now - node->last_seen_ms) : 0;
+        uint32_t age_s = age_ms / 1000U;
+        char ext[17];
+        zig_recon_format_ext(node->ext_addr, ext, sizeof(ext));
+        char short_text[8];
+        char ext_text[19];
+        if (node->has_short_addr) {
+            snprintf(short_text, sizeof(short_text), "0x%04X", node->short_addr);
+        } else {
+            strlcpy(short_text, "na", sizeof(short_text));
+        }
+        if (node->has_ext_addr) {
+            snprintf(ext_text, sizeof(ext_text), "0x%s", ext);
+        } else {
+            strlcpy(ext_text, "na", sizeof(ext_text));
+        }
+        char lqi_text[8];
+        if (node->has_lqi) {
+            snprintf(lqi_text, sizeof(lqi_text), "%u", node->last_lqi);
+        } else {
+            strlcpy(lqi_text, "na", sizeof(lqi_text));
+        }
+        char channel_text[8];
+        if (node->last_channel >= ZIG_RECON_MIN_CHANNEL && node->last_channel <= ZIG_RECON_MAX_CHANNEL) {
+            snprintf(channel_text, sizeof(channel_text), "%u", node->last_channel);
+        } else {
+            strlcpy(channel_text, "na", sizeof(channel_text));
+        }
+        if (show_all) {
+            if (node->has_short_addr) {
+                printf("0x%04X    0x%04X  %-11s  %4lu  %4d  %lus\n",
+                       node->pan_id,
+                       node->short_addr,
+                       zig_recon_role_name(node->role),
+                       (unsigned long)node->packets,
+                       node->last_rssi,
+                       (unsigned long)age_s);
+            } else {
+                printf("0x%04X    EXT     %-11s  %4lu  %4d  %lus\n",
+                       node->pan_id,
+                       zig_recon_role_name(node->role),
+                       (unsigned long)node->packets,
+                       node->last_rssi,
+                       (unsigned long)age_s);
+            }
+        } else {
+            if (node->has_short_addr) {
+                printf("0x%04X    %-11s  %4lu  %4d  %lus\n",
+                       node->short_addr,
+                       zig_recon_role_name(node->role),
+                       (unsigned long)node->packets,
+                       node->last_rssi,
+                       (unsigned long)age_s);
+            } else {
+                printf("EXT       %-11s  %4lu  %4d  %lus\n",
+                       zig_recon_role_name(node->role),
+                       (unsigned long)node->packets,
+                       node->last_rssi,
+                       (unsigned long)age_s);
+            }
+        }
+        printf("[ZIG] node pan=0x%04X addr_type=%s short=%s ext=%s role=%s packets=%lu last_rssi=%d best_rssi=%d avg_rssi=%d lqi=%s sample_count=%lu last_channel=%s vendor=na device_hint=na battery=na last_seen_ms=%lu age_ms=%lu\n",
+               node->pan_id,
+               node->has_short_addr ? "short" : (node->has_ext_addr ? "ext" : "unknown"),
+               short_text,
+               ext_text,
+               zig_recon_role_token(node->role),
+               (unsigned long)node->packets,
+               node->last_rssi,
+               node->best_rssi,
+               node->avg_rssi,
+               lqi_text,
+               (unsigned long)node->sample_count,
+               channel_text,
+               (unsigned long)node->last_seen_ms,
+               (unsigned long)age_ms);
+    }
+    printf("[ZIG] END\n");
+    heap_caps_free(snap);
+    return 0;
+}
+
+static int cmd_zig_recon_clear(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    zig_recon_clear();
+    printf("[ZIG] cleared\n");
+    printf("[ZIG] END\n");
+    return 0;
+}
+
 static bool parse_ipv4_arg(const char *arg, esp_ip4_addr_t *out) {
     if (!arg || !out) {
         return false;
@@ -9238,11 +12085,13 @@ static const cli_hint_t k_cli_hints[] = {
     { "start_portal", " <SSID>" },
     { "start_karma", " <index>" },
     { "start_nmap", " [quick|medium|heavy] [IP]" },
+    { "start_zig_recon", " [all|11,15,20] [dwell_ms]" },
+    { "zig_recon_nodes", " <pan_id|all>" },
     { "vendor", " set <on|off> | read" },
     { "boot_button", " read|list|set <short|long> <command[, command...]> | status <short|long> <on|off>" },
     { "led", " set <on|off> | level <1-100> | read" },
     { "channel_time", " set <min|max> <ms> | read <min|max>" },
-    { "wifi_connect", " <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
+    { "wifi_connect", " <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
     { "ota_channel", " [main|dev]" },
     { "ota_boot", " <ota_0|ota_1>" },
     { "arp_ban", " <MAC> [IP]" },
@@ -9253,10 +12102,14 @@ static const cli_hint_t k_cli_hints[] = {
     { "set_html", " <html>" },
     { "wpasec_key", " set <key> | read" },
     { "wpasec_upload", "" },
-    { "wigle_key", " set <api_name> <api_token> | read" },
+    { "wigle_key", " set <api_name> <api_token> | read | clear" },
     { "wigle_upload", " [file1 file2 ...]" },
-    { "wdgwars_key", " set <key> | read" },
+    { "wdgwars_key", " set <key> | read | clear" },
     { "wdgwars_upload", " [file1 file2 ...]" },
+    { "upload_state", "" },
+    { "wardrive_files", "" },
+    { "wardrive_cleanup", " <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]" },
+    { "wardrive_fix", " <file>" },
     { "add_ssid", " <SSID>" },
     { "remove_ssid", " <index>" },
 };
@@ -9274,8 +12127,8 @@ static const char *lookup_cli_hint(const char *command) {
 }
 
 static const char *wifi_connect_dynamic_hint(const char *buf, int *color, int *bold) {
-    static const char *hint_ssid = " <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
-    static const char *hint_pass = " [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_ssid = " <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_pass = " [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_optional = " [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_ip_optional = " [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_mask = " <Netmask> <GW> [DNS1] [DNS2]";
@@ -9447,17 +12300,150 @@ static int cmd_wifi_disconnect(int argc, char **argv) {
     return 0;
 }
 
+static bool csv_get_quoted_field(const char *line, int wanted_idx, char *out, size_t out_sz) {
+    if (!line || !out || out_sz == 0 || wanted_idx < 0) {
+        return false;
+    }
+
+    int idx = 0;
+    const char *p = line;
+    while (*p) {
+        while (*p && *p != '"') {
+            p++;
+        }
+        if (*p != '"') {
+            return false;
+        }
+        p++;
+
+        char tmp[128];
+        size_t pos = 0;
+        while (*p) {
+            if (*p == '"') {
+                if (p[1] == '"') {
+                    if (pos < sizeof(tmp) - 1) {
+                        tmp[pos++] = '"';
+                    }
+                    p += 2;
+                    continue;
+                }
+                p++;
+                break;
+            }
+            if (pos < sizeof(tmp) - 1) {
+                tmp[pos++] = *p;
+            }
+            p++;
+        }
+        tmp[pos] = '\0';
+
+        if (idx == wanted_idx) {
+            snprintf(out, out_sz, "%s", tmp);
+            return true;
+        }
+        idx++;
+    }
+    return false;
+}
+
+static bool wifi_lookup_eviltwin_password(const char *ssid, char *out, size_t out_sz) {
+    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "r");
+    if (!file) {
+        return false;
+    }
+
+    bool found = false;
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        char saved_ssid[64];
+        char saved_pass[96];
+        if (csv_get_quoted_field(line, 0, saved_ssid, sizeof(saved_ssid)) &&
+            csv_get_quoted_field(line, 1, saved_pass, sizeof(saved_pass)) &&
+            strcmp(saved_ssid, ssid) == 0 && saved_pass[0] != '\0') {
+            snprintf(out, out_sz, "%s", saved_pass);
+            found = true;
+        }
+    }
+    fclose(file);
+    return found;
+}
+
+static bool wifi_lookup_portal_password(const char *ssid, char *out, size_t out_sz) {
+    FILE *file = fopen("/sdcard/lab/portals.txt", "r");
+    if (!file) {
+        return false;
+    }
+
+    bool found = false;
+    char line[384];
+    while (fgets(line, sizeof(line), file)) {
+        char saved_ssid[64];
+        if (!csv_get_quoted_field(line, 0, saved_ssid, sizeof(saved_ssid)) ||
+            strcmp(saved_ssid, ssid) != 0) {
+            continue;
+        }
+
+        for (int i = 1; i < 12; i++) {
+            char field[128];
+            if (!csv_get_quoted_field(line, i, field, sizeof(field))) {
+                break;
+            }
+            char *eq = strchr(field, '=');
+            if (!eq) {
+                continue;
+            }
+            *eq = '\0';
+            const char *key = field;
+            const char *val = eq + 1;
+            if ((strcasecmp(key, "password") == 0 ||
+                 strcasecmp(key, "pass") == 0 ||
+                 strcasecmp(key, "wifi_password") == 0) &&
+                val[0] != '\0') {
+                snprintf(out, out_sz, "%s", val);
+                found = true;
+            }
+        }
+    }
+    fclose(file);
+    return found;
+}
+
+static bool wifi_lookup_known_password(const char *ssid, char *out, size_t out_sz) {
+    if (!ssid || !out || out_sz == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        return false;
+    }
+
+    if (wifi_lookup_eviltwin_password(ssid, out, out_sz)) {
+        MY_LOG_INFO(TAG, "wifi_connect: using saved password from eviltwin.txt for '%s'", ssid);
+        return true;
+    }
+    if (wifi_lookup_portal_password(ssid, out, out_sz)) {
+        MY_LOG_INFO(TAG, "wifi_connect: using saved password from portals.txt for '%s'", ssid);
+        return true;
+    }
+    return false;
+}
+
 static int cmd_wifi_connect(int argc, char **argv) {
     oled_display_update_full("> WiFi Connect",
         argc >= 2 ? argv[1] : "  No SSID",
         "  STA Mode", "  Connecting...");
     if (argc < 2 || argc > 9) {
-        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
     }
     
     const char *ssid = argv[1];
-    const char *password = (argc >= 3) ? argv[2] : "";
+    char saved_password[65] = "";
+    bool use_saved_password = (argc >= 3 && strcasecmp(argv[2], "--saved") == 0);
+    bool explicit_password = (argc >= 3 && !use_saved_password && strcasecmp(argv[2], "ota") != 0);
+    const char *password = explicit_password ? argv[2] : "";
     bool ota_after_connect = false;
     bool use_static_ip = false;
     esp_ip4_addr_t static_ip = { 0 };
@@ -9468,7 +12454,16 @@ static int cmd_wifi_connect(int argc, char **argv) {
     esp_ip4_addr_t static_dns1 = { 0 };
     esp_ip4_addr_t static_dns2 = { 0 };
 
-    int argi = (argc >= 3) ? 3 : 2;
+    if (use_saved_password) {
+        wifi_lookup_known_password(ssid, saved_password, sizeof(saved_password));
+        if (saved_password[0] != '\0') {
+            password = saved_password;
+        } else {
+            MY_LOG_INFO(TAG, "wifi_connect: no saved password found for '%s'", ssid);
+        }
+    }
+
+    int argi = (explicit_password || use_saved_password) ? 3 : 2;
     if (argc > argi && strcasecmp(argv[argi], "ota") == 0) {
         ota_after_connect = true;
         argi++;
@@ -9476,7 +12471,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
 
     int remaining = argc - argi;
     if (remaining != 0 && remaining != 3 && remaining != 4 && remaining != 5) {
-        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
     }
     if (remaining >= 3) {
@@ -9504,6 +12499,13 @@ static int cmd_wifi_connect(int argc, char **argv) {
     }
     
     MY_LOG_INFO(TAG, "Connecting to AP '%s'...", ssid);
+    if (password[0] != '\0') {
+        MY_LOG_INFO(TAG, "wifi_connect: password source=%s", explicit_password ? "argument" : "saved");
+    } else if (use_saved_password) {
+        MY_LOG_INFO(TAG, "wifi_connect: saved password requested but missing, trying open network");
+    } else {
+        MY_LOG_INFO(TAG, "wifi_connect: trying open network");
+    }
     
     // Reset WiFi (same as mode switching)
     esp_wifi_disconnect();
@@ -13564,7 +16566,11 @@ static void gps_raw_task(void *pvParameters) {
 
 static int cmd_gps_set(int argc, char **argv) {
     if (argc < 2 || argv[1] == NULL) {
-        MY_LOG_INFO(TAG, "Usage: gps_set <m5|atgm|external|cap>");
+        printf("[GPSCFG] module=%s\n", gps_get_module_name(current_gps_module));
+        printf("[GPSCFG] baud=%d\n", gps_get_baud_for_module(current_gps_module));
+        printf("[GPSCFG] external=%s\n", gps_module_uses_external_feed(current_gps_module) ? "yes" : "no");
+        printf("[GPSCFG] position_command=%s\n", gps_external_position_command_name(current_gps_module));
+        printf("[GPSCFG] END\n");
         MY_LOG_INFO(TAG, "Current GPS module: %s (baud %d)",
                     gps_get_module_name(current_gps_module),
                     gps_get_baud_for_module(current_gps_module));
@@ -13593,6 +16599,11 @@ static int cmd_gps_set(int argc, char **argv) {
         gps_sync_from_selected_external_source();
     }
     gps_save_state_to_nvs();
+    printf("[GPSCFG] module=%s\n", gps_get_module_name(current_gps_module));
+    printf("[GPSCFG] baud=%d\n", gps_get_baud_for_module(current_gps_module));
+    printf("[GPSCFG] external=%s\n", gps_module_uses_external_feed(current_gps_module) ? "yes" : "no");
+    printf("[GPSCFG] position_command=%s\n", gps_external_position_command_name(current_gps_module));
+    printf("[GPSCFG] END\n");
     MY_LOG_INFO(TAG, "GPS module set to %s (baud %d). Restart GPS tasks if running.",
                 gps_get_module_name(current_gps_module),
                 gps_get_baud_for_module(current_gps_module));
@@ -16158,24 +19169,77 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     
     // Check if this is a Scan Response packet (contains names more often)
     bool is_scan_response = (desc->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
-    
+
+    // Wardrive-only gates: startup cooldown + device blacklist (don't affect scan_bt).
+    if (wardrive_promisc_active) {
+        if (esp_timer_get_time() < wdp_log_gate_until_us) return 0;       // startup cooldown
+        if (wardrive_blacklist_contains(desc->addr.val)) return 0;        // excluded device
+    }
+    // Anti-surveillance: skip blacklisted MACs so your own devices aren't flagged as followers.
+    if (antisurv_active && wardrive_blacklist_contains(desc->addr.val)) return 0;
+
     // Check if device already seen
     bool already_seen = bt_is_device_found(desc->addr.val);
     
-    // If already seen, only process scan responses to update names
+    // If already seen: update name from scan responses, and (during wardrive) re-log.
     if (already_seen) {
+        bool want_name = is_scan_response && fields.name != NULL && fields.name_len > 0;
+        int dev_idx = (want_name || wardrive_promisc_active || antisurv_active)
+                      ? bt_find_device_index(desc->addr.val) : -1;
+
         // Try to update name from scan response if we don't have one
-        if (is_scan_response && fields.name != NULL && fields.name_len > 0) {
-            int dev_idx = bt_find_device_index(desc->addr.val);
-            if (dev_idx >= 0 && bt_devices[dev_idx].name[0] == '\0') {
-                int name_len = fields.name_len < 31 ? fields.name_len : 31;
-                memcpy(bt_devices[dev_idx].name, fields.name, name_len);
-                bt_devices[dev_idx].name[name_len] = '\0';
+        if (dev_idx >= 0 && want_name && bt_devices[dev_idx].name[0] == '\0') {
+            int name_len = fields.name_len < 31 ? fields.name_len : 31;
+            memcpy(bt_devices[dev_idx].name, fields.name, name_len);
+            bt_devices[dev_idx].name[name_len] = '\0';
+        }
+
+        // Wardrive re-log: re-emit a row when signal or position moved enough.
+        // ble_rssi_delta == 0 keeps the legacy "log once" behavior.
+        if (dev_idx >= 0 && wardrive_promisc_active) {
+            int8_t cur = desc->rssi;
+            bt_devices[dev_idx].rssi = cur;
+            if (g_wd_cfg.ble_rssi_delta > 0 && !bt_devices[dev_idx].needs_log) {
+                bool trig = false;
+                int rd = cur - bt_devices[dev_idx].last_logged_rssi;
+                if (rd < 0) rd = -rd;
+                if (rd >= g_wd_cfg.ble_rssi_delta) {
+                    trig = true;
+                } else if (current_gps.valid && bt_devices[dev_idx].last_logged_valid) {
+                    double moved = gps_distance_meters(bt_devices[dev_idx].last_logged_lat,
+                                                       bt_devices[dev_idx].last_logged_lon,
+                                                       current_gps.latitude, current_gps.longitude);
+                    double thresh = WDP_RELOG_DISTANCE_M;
+                    if (current_gps.accuracy > thresh) thresh = current_gps.accuracy;
+                    if (moved >= thresh) trig = true;
+                }
+                if (trig) {
+                    bt_devices[dev_idx].needs_log = true;
+                    wdp_relog_pending = true;
+                }
+            }
+        }
+
+        // Anti-surveillance: track presence over time + travel distance from origin.
+        if (dev_idx >= 0 && antisurv_active) {
+            bt_devices[dev_idx].rssi = desc->rssi;
+            bt_devices[dev_idx].as_last_us = esp_timer_get_time();
+            if (current_gps.valid) {
+                if (!bt_devices[dev_idx].as_has_origin) {
+                    bt_devices[dev_idx].as_origin_lat = current_gps.latitude;
+                    bt_devices[dev_idx].as_origin_lon = current_gps.longitude;
+                    bt_devices[dev_idx].as_has_origin = true;
+                } else {
+                    double d = gps_distance_meters(bt_devices[dev_idx].as_origin_lat,
+                                                   bt_devices[dev_idx].as_origin_lon,
+                                                   current_gps.latitude, current_gps.longitude);
+                    if (d > bt_devices[dev_idx].as_max_dist_m) bt_devices[dev_idx].as_max_dist_m = d;
+                }
             }
         }
         return 0;
     }
-    
+
     // Add to found devices list
     if (!bt_add_found_device(desc->addr.val)) {
         return 0;
@@ -16192,6 +19256,18 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     dev->company_id = 0;
     dev->is_airtag = false;
     dev->is_smarttag = false;
+    dev->needs_log = true;          // pending first write to SD
+    dev->last_logged_valid = false;
+    dev->as_first_us = esp_timer_get_time();
+    dev->as_last_us = dev->as_first_us;
+    dev->as_has_origin = false;
+    dev->as_max_dist_m = 0.0;
+    dev->as_alerted = false;
+    if (antisurv_active && current_gps.valid) {
+        dev->as_origin_lat = current_gps.latitude;
+        dev->as_origin_lon = current_gps.longitude;
+        dev->as_has_origin = true;
+    }
     
     // Extract device name if available (standard AD field)
     bool has_name = (fields.name != NULL && fields.name_len > 0);
@@ -17030,7 +20106,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t wigle_key_cmd = {
         .command = "wigle_key",
-        .help = "Set/read WiGLE API credentials: wigle_key set <api_name> <api_token> | wigle_key read",
+        .help = "Set/read/clear WiGLE API credentials: wigle_key set <api_name> <api_token> | wigle_key read | wigle_key clear",
         .hint = NULL,
         .func = &cmd_wigle_key,
         .argtable = NULL
@@ -17039,7 +20115,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t wigle_upload_cmd = {
         .command = "wigle_upload",
-        .help = "Upload Wardrive files to WiGLE: wigle_upload [file1 file2 ...] (no args = upload all)",
+        .help = "Upload Wardrive files to WiGLE: wigle_upload [file1 file2 ...|all] (no args = pending only)",
         .hint = NULL,
         .func = &cmd_wigle_upload,
         .argtable = NULL
@@ -17048,7 +20124,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t wdgwars_key_cmd = {
         .command = "wdgwars_key",
-        .help = "Set/read WDGWars API key: wdgwars_key set <key> | wdgwars_key read",
+        .help = "Set/read/clear WDGWars API key: wdgwars_key set <key> | wdgwars_key read | wdgwars_key clear",
         .hint = NULL,
         .func = &cmd_wdgwars_key,
         .argtable = NULL
@@ -17057,12 +20133,48 @@ static void register_commands(void)
 
     const esp_console_cmd_t wdgwars_upload_cmd = {
         .command = "wdgwars_upload",
-        .help = "Upload Wardrive files to WDGWars: wdgwars_upload [file1 file2 ...] (no args = upload all)",
+        .help = "Upload Wardrive files to WDGWars: wdgwars_upload [file1 file2 ...|all] (no args = pending only)",
         .hint = NULL,
         .func = &cmd_wdgwars_upload,
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wdgwars_upload_cmd));
+
+    const esp_console_cmd_t upload_state_cmd = {
+        .command = "upload_state",
+        .help = "Print/clear local wardrive upload manifest: upload_state [clear]",
+        .hint = NULL,
+        .func = &cmd_upload_state,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&upload_state_cmd));
+
+    const esp_console_cmd_t wardrive_files_cmd = {
+        .command = "wardrive_files",
+        .help = "List wardrive files with local stats and upload status",
+        .hint = NULL,
+        .func = &cmd_wardrive_files,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_files_cmd));
+
+    const esp_console_cmd_t wardrive_cleanup_cmd = {
+        .command = "wardrive_cleanup",
+        .help = "Dry-run or move wardrive files by upload status: wardrive_cleanup <service> <status> [move [destination]]",
+        .hint = "<wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]",
+        .func = &cmd_wardrive_cleanup,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cleanup_cmd));
+
+    const esp_console_cmd_t wardrive_fix_cmd = {
+        .command = "wardrive_fix",
+        .help = "Create a soft-fixed WigleWifi copy: wardrive_fix <file>",
+        .hint = NULL,
+        .func = &cmd_wardrive_fix,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_fix_cmd));
 
        const esp_console_cmd_t sae_overflow_cmd = {
         .command = "sae_overflow",
@@ -17144,6 +20256,87 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cmd));
+
+    const esp_console_cmd_t get_wardrive_config_cmd = {
+        .command = "get_wardrive_config",
+        .help = "Print active wardrive config (bands, channels, deltas, cooldown, mem cap)",
+        .hint = NULL,
+        .func = &cmd_get_wardrive_config,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&get_wardrive_config_cmd));
+
+    const esp_console_cmd_t set_wardrive_bands_cmd = {
+        .command = "set_wardrive_bands",
+        .help = "Select wardrive radios: set_wardrive_bands wifi24,wifi5,ble",
+        .hint = NULL,
+        .func = &cmd_set_wardrive_bands,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_bands_cmd));
+
+    const esp_console_cmd_t set_wardrive_channels_cmd = {
+        .command = "set_wardrive_channels",
+        .help = "Select channels: set_wardrive_channels <popular|all|custom> [1:6:11:36]",
+        .hint = NULL,
+        .func = &cmd_set_wardrive_channels,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_channels_cmd));
+
+    const esp_console_cmd_t set_wardrive_rssi_delta_cmd = {
+        .command = "set_wardrive_rssi_delta",
+        .help = "Re-log threshold: set_wardrive_rssi_delta <wifi|ble> <0-50> (0 = log once)",
+        .hint = NULL,
+        .func = &cmd_set_wardrive_rssi_delta,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_rssi_delta_cmd));
+
+    const esp_console_cmd_t set_wardrive_memcap_cmd = {
+        .command = "set_wardrive_memcap",
+        .help = "Max WiFi entries in RAM before eviction: set_wardrive_memcap <1000-200000>",
+        .hint = NULL,
+        .func = &cmd_set_wardrive_memcap,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_memcap_cmd));
+
+    const esp_console_cmd_t set_wardrive_cooldown_cmd = {
+        .command = "set_wardrive_cooldown",
+        .help = "Drop scans for the first N seconds (hide start): set_wardrive_cooldown <0-600>",
+        .hint = NULL,
+        .func = &cmd_set_wardrive_cooldown,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_wardrive_cooldown_cmd));
+
+    const esp_console_cmd_t wardrive_blacklist_cmd = {
+        .command = "wardrive_blacklist",
+        .help = "Exclude devices: wardrive_blacklist <add|remove|list|clear> [MAC]",
+        .hint = NULL,
+        .func = &cmd_wardrive_blacklist,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_blacklist_cmd));
+
+    const esp_console_cmd_t start_antisurv_cmd = {
+        .command = "start_antisurveillance",
+        .help = "Detect a BLE device following you (uses GPS + BLE). Use 'stop' to end.",
+        .hint = NULL,
+        .func = &cmd_start_antisurveillance,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&start_antisurv_cmd));
+
+    const esp_console_cmd_t set_antisurv_sens_cmd = {
+        .command = "set_antisurv_sensitivity",
+        .help = "Follower-detection sensitivity: set_antisurv_sensitivity <low|med|high>",
+        .hint = NULL,
+        .func = &cmd_set_antisurv_sensitivity,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_antisurv_sens_cmd));
 
     const esp_console_cmd_t wardrive_promisc_cmd = {
         .command = "start_wardrive_promisc",
@@ -17262,6 +20455,51 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&pcap_cmd));
 
+    const esp_console_cmd_t zig_recon_cmd = {
+        .command = "start_zig_recon",
+        .help = "Passive IEEE 802.15.4 recon: start_zig_recon [all|11,15,20] [dwell_ms]",
+        .hint = "[all|11,15,20] [dwell_ms]",
+        .func = &cmd_start_zig_recon,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_cmd));
+
+    const esp_console_cmd_t zig_recon_status_cmd = {
+        .command = "zig_recon_status",
+        .help = "Print IEEE 802.15.4 recon status and [ZIG] machine output",
+        .hint = NULL,
+        .func = &cmd_zig_recon_status,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_status_cmd));
+
+    const esp_console_cmd_t zig_recon_list_cmd = {
+        .command = "zig_recon_list",
+        .help = "List discovered IEEE 802.15.4 PANs: zig_recon_list [all]",
+        .hint = "[all]",
+        .func = &cmd_zig_recon_list,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_list_cmd));
+
+    const esp_console_cmd_t zig_recon_nodes_cmd = {
+        .command = "zig_recon_nodes",
+        .help = "List nodes for a discovered PAN or all PANs: zig_recon_nodes <pan_id|all>",
+        .hint = "<pan_id|all>",
+        .func = &cmd_zig_recon_nodes,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_nodes_cmd));
+
+    const esp_console_cmd_t zig_recon_clear_cmd = {
+        .command = "zig_recon_clear",
+        .help = "Clear IEEE 802.15.4 recon counters and discovered PANs",
+        .hint = NULL,
+        .func = &cmd_zig_recon_clear,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&zig_recon_clear_cmd));
+
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
         .help = "Stop all running operations",
@@ -17291,8 +20529,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t wifi_connect_cmd = {
         .command = "wifi_connect",
-        .help = "Connect to AP as STA: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
-        .hint = "<SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
+        .help = "Connect to AP as STA: wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
+        .hint = "<SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
         .func = &cmd_wifi_connect,
         .argtable = NULL
     };
@@ -17638,6 +20876,8 @@ void app_main(void) {
     //printf("NVS initialized OK\n");
 
     channel_time_load_state_from_nvs();
+    wardrive_config_load_from_nvs();
+    wardrive_blacklist_load();
     gps_load_state_from_nvs();
     led_load_state_from_nvs();
     oled_display_update_full(NULL, "  NVS: OK", "  Init LED...", "");
@@ -17745,6 +20985,7 @@ void app_main(void) {
     esp_err_t sd_init_ret = init_sd_card();
     if (sd_init_ret == ESP_OK) {
         create_sd_directories();
+        upload_state_ensure_file();
         report_ssid_file_status();
         ensure_ssids_file();
         if (vendor_is_enabled()) {
@@ -17773,73 +21014,18 @@ void app_main(void) {
                 fclose(wf);
             }
         }
-        // Check for WiGLE API credentials file on SD card (format: api_name:api_token)
-        {
-            FILE *wf = fopen("/sdcard/lab/wigle.txt", "r");
-            if (wf) {
-                static char line[256];
-                memset(line, 0, sizeof(line));
-                if (fgets(line, sizeof(line), wf)) {
-                    static char api_name[WIGLE_KEY_MAX_LEN];
-                    static char api_token[WIGLE_KEY_MAX_LEN];
-                    memset(api_name, 0, sizeof(api_name));
-                    memset(api_token, 0, sizeof(api_token));
-                    if (wigle_split_key_pair(line, api_name, sizeof(api_name), api_token, sizeof(api_token))) {
-                        if (wigle_save_key_to_nvs(api_name, api_token)) {
-                            snprintf(wigle_api_name, sizeof(wigle_api_name), "%s", api_name);
-                            snprintf(wigle_api_token, sizeof(wigle_api_token), "%s", api_token);
-                            MY_LOG_INFO(TAG, "WiGLE key updated from SD card into NVS.");
-                        } else {
-                            MY_LOG_INFO(TAG, "Failed to save WiGLE key from SD card to NVS.");
-                        }
-                    } else {
-                        MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wigle.txt format. Expected: api_name:api_token");
-                    }
-                }
-                fclose(wf);
-            }
-        }
-        // Check for WDGWars API key file on SD card (format: one line, 64-char key)
-        {
-            FILE *wf = fopen("/sdcard/lab/wdgwars.txt", "r");
-            if (wf) {
-                static char line[128];
-                memset(line, 0, sizeof(line));
-                if (fgets(line, sizeof(line), wf)) {
-                    size_t ln = strlen(line);
-                    while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r' || isspace((unsigned char)line[ln - 1]))) {
-                        line[--ln] = '\0';
-                    }
-                    while (*line && isspace((unsigned char)*line)) {
-                        memmove(line, line + 1, strlen(line));
-                    }
-                    if (line[0] != '\0') {
-                        if (strlen(line) >= WDGWARS_KEY_MAX_LEN) {
-                            MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wdgwars.txt format. Expected one API key (max %d chars).", WDGWARS_KEY_MAX_LEN - 1);
-                        } else if (wdgwars_save_key_to_nvs(line)) {
-                            strncpy(wdgwars_api_key, line, sizeof(wdgwars_api_key) - 1);
-                            wdgwars_api_key[sizeof(wdgwars_api_key) - 1] = '\0';
-                            MY_LOG_INFO(TAG, "WDGWars key updated from SD card into NVS.");
-                        } else {
-                            MY_LOG_INFO(TAG, "Failed to save WDGWars key from SD card to NVS.");
-                        }
-                    }
-                }
-                fclose(wf);
-            }
-        }
         oled_display_update_full(NULL, "  SD: mounted", "  All systems OK", "");
     } else {
-        MY_LOG_INFO(TAG, "");
-        MY_LOG_INFO(TAG, "SD init error: %s", esp_err_to_name(sd_init_ret));
-        MY_LOG_INFO(TAG, "SD Card not detected. Custom portals won't be available, results won't be written to files.");
-        MY_LOG_INFO(TAG, "");
         oled_display_update_full(NULL, "  SD: MISSING!", "  No file save", "");
     }
     vTaskDelay(pdMS_TO_TICKS(400));
     
     // Load BSSID whitelist from SD card
-    load_whitelist_from_sd();
+    if (sd_init_ret == ESP_OK) {
+        load_whitelist_from_sd();
+    } else {
+        whitelistedBssidsCount = 0;
+    }
     vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
     oled_display_update_full("> JanOS v" JANOS_VERSION,
@@ -19701,6 +22887,9 @@ static esp_err_t init_sd_card(void) {
     if (sd_card_mounted) {
         return ESP_OK;
     }
+    if (sd_last_init_error != ESP_OK) {
+        return sd_last_init_error;
+    }
     
     // Options for mounting the filesystem (optimized for low memory)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
@@ -19739,26 +22928,28 @@ static esp_err_t init_sd_card(void) {
     // Some cards are unstable at higher SPI clock rates during init.
     const int mount_freqs_khz[] = {SDMMC_FREQ_DEFAULT, 10000, 4000};
     const size_t mount_freqs_count = sizeof(mount_freqs_khz) / sizeof(mount_freqs_khz[0]);
+    int attempted_freqs[3] = {0};
     for (size_t i = 0; i < mount_freqs_count; i++) {
         host.max_freq_khz = mount_freqs_khz[i];
+        attempted_freqs[i] = host.max_freq_khz;
         ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &sd_card_handle);
         if (ret == ESP_OK) {
             break;
         }
-        MY_LOG_INFO(TAG, "SD mount attempt %u failed at %d kHz: %s",
-                    (unsigned)(i + 1), host.max_freq_khz, esp_err_to_name(ret));
         vTaskDelay(pdMS_TO_TICKS(60));
     }
     
     if (ret != ESP_OK) {
+        sd_last_init_error = ret;
         if (ret == ESP_FAIL) {
-            MY_LOG_INFO(TAG, "Failed to mount SD filesystem at /sdcard (unsupported/corrupted FS).");
+            MY_LOG_INFO(TAG, "SD: not mounted (filesystem unsupported/corrupted). File-backed features disabled.");
         } else {
-            MY_LOG_INFO(TAG, "Failed to initialize SD card (%s). Check wiring, pull-ups, and card compatibility.",
-                        esp_err_to_name(ret));
+            MY_LOG_INFO(TAG, "SD: not detected (%s after %d/%d/%d kHz). File-backed features disabled.",
+                        esp_err_to_name(ret), attempted_freqs[0], attempted_freqs[1], attempted_freqs[2]);
         }
         return ret;
     }
+    sd_last_init_error = ESP_OK;
     
     // Print card info (single line)
     uint64_t size_mb = ((uint64_t)sd_card_handle->csd.capacity) * sd_card_handle->csd.sector_size / (1024 * 1024);
@@ -19781,6 +22972,50 @@ static esp_err_t init_sd_card(void) {
     return ESP_OK;
 }
 
+static bool sd_mkdir_recursive(const char *path) {
+    if (!path || path[0] == '\0') {
+        return false;
+    }
+
+    char tmp[384];
+    if (strlcpy(tmp, path, sizeof(tmp)) >= sizeof(tmp)) {
+        return false;
+    }
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            struct stat st;
+            if (stat(tmp, &st) == 0) {
+                if (!S_ISDIR(st.st_mode)) {
+                    errno = ENOTDIR;
+                    return false;
+                }
+            } else if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+                return false;
+            } else if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                errno = ENOTDIR;
+                return false;
+            }
+            *p = '/';
+        }
+    }
+
+    struct stat st;
+    if (stat(tmp, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return true;
+        }
+        errno = ENOTDIR;
+        return false;
+    }
+
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+        return false;
+    }
+    return stat(tmp, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 // Create necessary directories on SD card
 static esp_err_t create_sd_directories(void) {
     struct stat st;
@@ -19790,14 +23025,20 @@ static esp_err_t create_sd_directories(void) {
         "/sdcard/lab/htmls",
         "/sdcard/lab/handshakes",
         "/sdcard/lab/wardrives",
+        "/sdcard/lab/wardrives/uploaded",
         "/sdcard/lab/pcaps",
     };
     for (int i = 0; i < (int)(sizeof(dirs) / sizeof(dirs[0])); i++) {
-        if (stat(dirs[i], &st) != 0) {
-            if (mkdir(dirs[i], 0755) != 0) {
-                MY_LOG_INFO(TAG, "mkdir %s failed: %s", dirs[i], strerror(errno));
-                return ESP_FAIL;
-            }
+        if (!sd_mkdir_recursive(dirs[i])) {
+            MY_LOG_INFO(TAG, "mkdir %s failed: %s", dirs[i], strerror(errno));
+            return ESP_FAIL;
+        }
+        if (stat(dirs[i], &st) == 0 && !S_ISDIR(st.st_mode)) {
+            MY_LOG_INFO(TAG, "%s exists but is not a directory", dirs[i]);
+            return ESP_FAIL;
+        }
+        if (i == 0 || strcmp(dirs[i], "/sdcard/lab/wardrives") == 0 ||
+            strcmp(dirs[i], "/sdcard/lab/wardrives/uploaded") == 0) {
             sd_sync();
         }
     }

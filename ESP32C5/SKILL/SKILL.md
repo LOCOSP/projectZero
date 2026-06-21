@@ -120,6 +120,10 @@ Every command response has a known end marker. Wait for it before proceeding:
 | `list_probes` | Timeout (no explicit end marker) |
 | `wpasec_upload` | `"Done:"` |
 | `start_pcap` | `"PCAP radio capture started"` or `"PCAP net capture started"` (initial); on stop: `"PCAP saved:"` |
+| `zig_recon_status` | `"[ZIG] END"` |
+| `zig_recon_list` | `"[ZIG] END"` |
+| `zig_recon_nodes` | `"[ZIG] END"` |
+| `zig_recon_clear` | `"[ZIG] END"` |
 | `start_beacon_spam` | `"Beacon spam started. Use 'stop' to end."` |
 | `start_beacon_spam_ssids` | `"Beacon spam started. Use 'stop' to end."` (same as `start_beacon_spam`) |
 | `list_ssids` | Timeout (no explicit end marker, list ends after last indexed line) |
@@ -128,6 +132,8 @@ Every command response has a known end marker. Wait for it before proceeding:
 | `version` | `"JanOS version: X.Y.Z"` (single line, immediate) |
 
 For commands without explicit end markers, use a timeout with empty-read detection (e.g., 3 consecutive empty reads of 500ms each).
+
+`zig_recon_nodes` emits `[ZIG] node` lines for Mesh Recon consumers. Parse legacy fields first (`pan`, `addr_type`, `short`, `ext`, `role`, `packets`, `last_rssi`, `last_seen_ms`, `age_ms`) and treat appended fields as optional: `best_rssi`, `avg_rssi`, `lqi`, `sample_count`, `last_channel`, `vendor`, `device_hint`, `battery`. RSSI/LQI fields are signal hints only, not distance. For a passive Locate/track UI, suggested labels are `warming up` for `sample_count < 2`, `closer` when `last_rssi >= avg_rssi + 4`, `farther` when `last_rssi <= avg_rssi - 4`, and `steady` otherwise. Locate behaves as a toggle: selecting a node starts locate, selecting the same node again stops it, and selecting another PAN/network or leaving/collapsing the expanded network view clears the target.
 
 ### Key Parsing Recipes
 
@@ -433,6 +439,7 @@ scan_networks → select_networks → list_sd → user picks HTML
 // For open networks, omit the password:
 wifi_connect <SSID>              // open network
 wifi_connect <SSID> <password>   // WPA/WPA2 network
+wifi_connect <SSID> --saved      // explicitly use saved password lookup
   → wait for "SUCCESS" / "FAILED" / "TIMEOUT"
 
 list_hosts
@@ -449,7 +456,7 @@ stop
 ### 3b. Connect-NMAP (Port Scan)
 
 ```
-wifi_connect <SSID> [password]
+wifi_connect <SSID> [password|--saved]
   → wait for "SUCCESS" / "FAILED" / "TIMEOUT"
 
 start_nmap [quick|medium|heavy] [IP]
@@ -485,6 +492,38 @@ start_wardrive   // or start_wardrive_promisc
   → stop
 ```
 
+Wardrive upload/status for GUI clients:
+```
+wardrive_files
+  → parse marker lines:
+    [WARD_FILE] filename=<file> size=<bytes> hash=<hex> wifi=<n> ble=<n> bt=<n> bad=<n> wigle=<pending|done|failed> wdgwars=<pending|done|failed|rate_limited>
+    [WARD_FILE] SUMMARY files=<n> bytes=<n> rows=<n> devices=<n> wifi=<n> ble=<n> bt=<n> bad=<n> wigle_ok=<n> wigle_pending=<n> wigle_failed=<n> wigle_rate_limited=<n> wdgwars_ok=<n> wdgwars_pending=<n> wdgwars_failed=<n> wdgwars_rate_limited=<n>
+
+upload_state
+  → parse marker lines:
+    [UPLOAD_STATE] service=<wigle|wdgwars> filename=<file> size=<bytes> hash=<hex> status=<done|failed|rate_limited> wifi=<n> ble=<n> bt=<n> bad=<n>
+
+wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]
+  → dry-run only; parse marker lines:
+    [WARD_CLEANUP] filename=<file> size=<bytes> hash=<hex> wigle=<status> wdgwars=<status> action=would_move target=<path>
+    [WARD_CLEANUP] SUMMARY scanned=<n> matched=<n> moved=<n> failed=<n> dry_run=1
+wardrive_cleanup <service> <status> move
+  → moves matching files to /sdcard/lab/wardrives/uploaded/<service>/<status>/
+wardrive_cleanup <service> <status> move <destination>
+  → moves matching files and companion *_track.kml files to /sdcard/lab/wardrives/uploaded/<service>/<status>/<destination>/
+  → use only after user confirmation; "all done" requires both services to be done
+
+wardrive_fix <file>
+  → creates <file>.fixed.log without changing the original
+  → parse marker lines:
+    [WARD_FIX] filename=<file> output=<fixed-file> size=<bytes> hash=<hex> kept=<n> dropped=<n> wifi=<n> ble=<n> bt=<n> bad=<n> status=<ok|failed>
+
+wigle_upload        // pending only according to upload_state.csv
+wdgwars_upload      // pending only according to upload_state.csv
+wigle_upload all    // force retry all local files
+wdgwars_upload all  // force retry all local files
+```
+
 ### 6. Beacon Spam from SSID File
 
 ```
@@ -512,7 +551,7 @@ start_pcap radio
   → stop → "PCAP saved: ... (N frames, M drops)"
 
 // Net mode (requires WiFi connection):
-wifi_connect <SSID> [password]
+wifi_connect <SSID> [password|--saved]
   → wait for "SUCCESS"
 start_pcap net
   → wait for "PCAP net capture started -> ..."
