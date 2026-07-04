@@ -125,7 +125,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.7"
+#define JANOS_VERSION "1.6.8"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -7339,8 +7339,8 @@ static void handshake_attack_task_selected(void) {
             if (check_handshake_file_exists((const char*)ap->ssid)) {
                 handshake_captured[i] = true;
                 captured_count++;
-            }
                 continue;
+            }
             
             attacked_count++;
             MY_LOG_INFO(TAG, ">>> [%d/%d] Attacking '%s' (Ch %d, RSSI: %d dBm) <<<",
