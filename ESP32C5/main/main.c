@@ -125,7 +125,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.6"
+#define JANOS_VERSION "1.6.7"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -1541,6 +1541,7 @@ static wifi_ap_record_t g_scan_results[MAX_AP_CNT];
 static uint16_t g_scan_count = 0;
 static volatile bool g_scan_in_progress = false;
 static volatile bool g_scan_done = false;
+static volatile bool g_scan_teardown_in_progress = false; // set when cancelling a scan to switch radio mode (suppresses misleading failure log)
 static volatile uint32_t g_last_scan_status = 1; // 0 => success, non-zero => failure/unknown
 static int64_t g_scan_start_time_us = 0;
 
@@ -2307,7 +2308,7 @@ static void wifi_event_handler(void *event_handler_arg,
         }
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *e = (const wifi_event_sta_scan_done_t *)event_data;
-            bool suppress_scan_logs = periodic_rescan_in_progress || wardrive_active || channel_view_scan_mode;
+            bool suppress_scan_logs = periodic_rescan_in_progress || wardrive_active || channel_view_scan_mode || g_scan_teardown_in_progress;
 
             if (!suppress_scan_logs) {
                 MY_LOG_INFO(TAG, "WiFi scan completed. Found %u networks, status: %" PRIu32, e->number, e->status);
@@ -2341,6 +2342,7 @@ static void wifi_event_handler(void *event_handler_arg,
             
             g_scan_done = true;
             g_scan_in_progress = false;
+            g_scan_teardown_in_progress = false;
 
             // Update OLED with scan results (only if not suppressed / in sniffer)
             if (!suppress_scan_logs && !sniffer_active) {
@@ -3535,6 +3537,41 @@ static bool ensure_wifi_mode(void)
 }
 
 /**
+ * Wait for an in-progress WiFi scan to finish cleanly before tearing down the
+ * WiFi driver for a radio-mode switch. If the scan does not complete within the
+ * timeout, cancel it cleanly (esp_wifi_scan_stop) without emitting the
+ * misleading "Scan failed with status: 1" log.
+ */
+static void wait_or_cancel_wifi_scan(void)
+{
+    if (!g_scan_in_progress) {
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "Waiting for in-progress WiFi scan to finish before switching radio...");
+
+    int timeout = 0;
+    int timeout_limit = get_scan_timeout_iterations();
+    while (g_scan_in_progress && timeout < timeout_limit) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        timeout++;
+    }
+
+    if (g_scan_in_progress) {
+        // Scan did not finish in time: cancel it cleanly, suppressing the failure log.
+        g_scan_teardown_in_progress = true;
+        esp_wifi_scan_stop();
+        int extra = 0;
+        while (g_scan_in_progress && extra < 20) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            extra++;
+        }
+        g_scan_in_progress = false;
+        g_scan_teardown_in_progress = false;
+    }
+}
+
+/**
  * Ensure BLE mode is active. If WiFi is active, deinits WiFi first.
  * Returns true if BLE is ready to use, false if switching (will reboot).
  */
@@ -3560,6 +3597,7 @@ static bool ensure_ble_mode(void)
         case RADIO_MODE_WIFI: {
             // Deinitialize WiFi and switch to BLE
             MY_LOG_INFO(TAG, "Switching from WiFi to BLE mode...");
+            wait_or_cancel_wifi_scan();
             esp_wifi_stop();
             esp_wifi_deinit();
             // Only destroy AP netif, keep STA netif for reuse on WiFi re-init
@@ -3595,6 +3633,7 @@ static bool ensure_ieee802154_mode(void)
 
         case RADIO_MODE_WIFI: {
             MY_LOG_INFO(TAG, "Switching from WiFi to 802.15.4 mode...");
+            wait_or_cancel_wifi_scan();
             esp_wifi_stop();
             esp_wifi_deinit();
             esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
@@ -3725,6 +3764,7 @@ static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time) {
     g_scan_in_progress = true;
     g_scan_done = false;
     g_scan_count = 0;
+    g_scan_start_time_us = esp_timer_get_time(); // reset start timestamp for every scan path (sniffer, channel view, etc.)
     
     MY_LOG_INFO(TAG, "Starting background WiFi scan...");
     esp_err_t ret = esp_wifi_scan_start(&scan_cfg, false); // nieblokujace
@@ -4853,7 +4893,7 @@ static int cmd_scan_networks(int argc, char **argv) {
         return 1;
     }
     
-    g_scan_start_time_us = esp_timer_get_time();
+    // Start timestamp is set centrally in start_background_scan() so every scan path resets it.
     MY_LOG_INFO(TAG, "Background scan started (min: %u ms, max: %u ms per channel)", 
                 (unsigned int)g_scan_min_channel_time, (unsigned int)g_scan_max_channel_time);
     return 0;
