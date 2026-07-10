@@ -33,7 +33,7 @@ Important notes:
 - `ota_channel [main|dev]`: Get/set OTA channel (saved in NVS).
   - `main`: GitHub release/latest.
   - `dev`: Pulls the app image from the `development` branch using a raw GitHub URL.
-- `ota_info`: Show OTA partitions, states, and embedded app metadata (version/date).
+- `ota_info`: Show OTA partitions, states, and embedded app version.
 - `ota_boot <ota_0|ota_1>`: Force boot to a specific OTA slot (useful for recovery/testing).
 
 ### OTA Source
