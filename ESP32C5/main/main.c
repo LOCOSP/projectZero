@@ -297,6 +297,8 @@ static volatile bool operation_stop_requested = false;
 
 // wifi_connect command state: 0 = pending, 1 = success, -1 = failed
 static volatile int wifi_connect_result = 0;
+// Last disconnect/fail reason captured while a wifi_connect is waiting (esp_wifi reason code)
+static volatile int wifi_connect_fail_reason = 0;
 
 // WPA-SEC API key (loaded from NVS on boot)
 static char wpasec_api_key[WPASEC_KEY_MAX_LEN] = "";
@@ -2414,6 +2416,7 @@ static void wifi_event_handler(void *event_handler_arg,
             // Signal wifi_connect command that connection failed (only if waiting)
             if (wifi_connect_result == 0) {
                 wifi_connect_result = -1;
+                wifi_connect_fail_reason = (int)e->reason;
             }
             
             if (applicationState == EVIL_TWIN_PASS_CHECK) {
@@ -4060,6 +4063,8 @@ const char* authmode_to_string(wifi_auth_mode_t mode) {
             return "WPA2/WPA3 Mixed";
         case WIFI_AUTH_WAPI_PSK:
             return "WAPI";
+        case WIFI_AUTH_OWE:
+            return "OWE";
         default:
             return "Unknown";
     }
@@ -12691,13 +12696,20 @@ static int cmd_wifi_connect(int argc, char **argv) {
         strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password) - 1);
         sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     } else {
+        // Open path. Also cover OWE (Enhanced Open) APs, e.g. modern Android
+        // hotspots, which advertise no password but require the OWE handshake +
+        // PMF. Threshold stays OPEN so plain-open APs still pass; owe_enabled is
+        // opt-in capability so plain-open association is unaffected.
         sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+        sta_config.sta.owe_enabled = true;
+        sta_config.sta.pmf_cfg.capable = true;
     }
-    
+
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-    
+
     // Reset result flag before connecting
     wifi_connect_result = 0;
+    wifi_connect_fail_reason = 0;
     esp_wifi_connect();
     
     MY_LOG_INFO(TAG, "Waiting for connection result...");
@@ -12742,7 +12754,8 @@ static int cmd_wifi_connect(int argc, char **argv) {
         }
         return 0;
     } else if (wifi_connect_result == -1) {
-        MY_LOG_INFO(TAG, "FAILED: Connection to '%s' failed. Check SSID/password and signal.", ssid);
+        MY_LOG_INFO(TAG, "FAILED: Connection to '%s' failed (reason=%d). Check SSID/password and signal.",
+                    ssid, wifi_connect_fail_reason);
         return 0;
     } else {
         MY_LOG_INFO(TAG, "TIMEOUT: Connection to '%s' timed out", ssid);
