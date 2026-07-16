@@ -3,6 +3,9 @@ cmake_minimum_required(VERSION 3.16)
 # Add linker flag globally (needed for duplicate symbols in ROM)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")
 
+set(JANOS_VERSION "1.6.9")
+set(PROJECT_VER "${JANOS_VERSION}")
+
 # Ensure IDF FatFs has exFAT enabled for all developers building this repo.
 option(PROJECTZERO_PATCH_IDF_EXFAT "Patch IDF ffconf.h to enable exFAT support" ON)
 if(PROJECTZERO_PATCH_IDF_EXFAT)

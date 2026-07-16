@@ -125,14 +125,16 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.8"
+#define JANOS_VERSION "1.6.9"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
 #define OTA_ASSET_NAME "projectZero.bin"
 #define OTA_HTTP_MAX_BODY (256 * 1024)
-#define OTA_TASK_STACK_SIZE 8192
+#define OTA_TASK_STACK_SIZE 12288
 #define OTA_TASK_PRIORITY 5
+#define OTA_HTTP_RX_BUFFER_SIZE (8 * 1024)
+#define OTA_HTTP_TX_BUFFER_SIZE (2 * 1024)
 #define OTA_CHANNEL_MAX_LEN 8
 #define OTA_NVS_NAMESPACE "ota"
 #define OTA_NVS_KEY_CHANNEL "channel"
@@ -295,6 +297,8 @@ static volatile bool operation_stop_requested = false;
 
 // wifi_connect command state: 0 = pending, 1 = success, -1 = failed
 static volatile int wifi_connect_result = 0;
+// Last disconnect/fail reason captured while a wifi_connect is waiting (esp_wifi reason code)
+static volatile int wifi_connect_fail_reason = 0;
 
 // WPA-SEC API key (loaded from NVS on boot)
 static char wpasec_api_key[WPASEC_KEY_MAX_LEN] = "";
@@ -2412,6 +2416,7 @@ static void wifi_event_handler(void *event_handler_arg,
             // Signal wifi_connect command that connection failed (only if waiting)
             if (wifi_connect_result == 0) {
                 wifi_connect_result = -1;
+                wifi_connect_fail_reason = (int)e->reason;
             }
             
             if (applicationState == EVIL_TWIN_PASS_CHECK) {
@@ -2765,16 +2770,25 @@ static bool ota_is_expected_project(const esp_app_desc_t *desc) {
     return true;
 }
 
+static void ota_log_resources(const char *phase) {
+    MY_LOG_INFO(TAG, "OTA: %s heap internal=%lu psram=%lu stack_free=%u",
+                phase ? phase : "resources",
+                (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                (unsigned)uxTaskGetStackHighWaterMark(NULL));
+}
+
 static esp_err_t ota_perform_https_update(const char *download_url) {
     if (!download_url || !*download_url) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    ota_log_resources("before begin");
     esp_http_client_config_t http_cfg = {
         .url = download_url,
         .timeout_ms = 15000,
-        .buffer_size = 16 * 1024,
-        .buffer_size_tx = 4 * 1024,
+        .buffer_size = OTA_HTTP_RX_BUFFER_SIZE,
+        .buffer_size_tx = OTA_HTTP_TX_BUFFER_SIZE,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_https_ota_config_t ota_cfg = {
@@ -2803,7 +2817,34 @@ static esp_err_t ota_perform_https_update(const char *download_url) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    ota_log_resources("before perform");
+    int last_pct = -1;
+    int last_kb = -1;
+    int last_read = -1;
+    TickType_t last_progress_tick = xTaskGetTickCount();
+    int image_size = esp_https_ota_get_image_size(ota_handle);
     while ((err = esp_https_ota_perform(ota_handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+        int read = esp_https_ota_get_image_len_read(ota_handle);
+        int pct = (image_size > 0) ? ((read * 100) / image_size) : -1;
+        int kb = read / 1024;
+        if (read > last_read) {
+            last_read = read;
+            last_progress_tick = xTaskGetTickCount();
+        } else if ((xTaskGetTickCount() - last_progress_tick) > pdMS_TO_TICKS(60000)) {
+            MY_LOG_INFO(TAG, "OTA: download stalled at %d/%d bytes", read, image_size);
+            esp_https_ota_abort(ota_handle);
+            return ESP_ERR_TIMEOUT;
+        }
+        if ((pct >= 0 && pct >= last_pct + 10) || kb >= last_kb + 256) {
+            if (pct >= 0) {
+                MY_LOG_INFO(TAG, "OTA: progress %d%% (%d/%d bytes)", pct, read, image_size);
+            } else {
+                MY_LOG_INFO(TAG, "OTA: progress %d bytes", read);
+            }
+            last_pct = pct;
+            last_kb = kb;
+            ota_log_resources("during perform");
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (err != ESP_OK) {
@@ -2811,6 +2852,9 @@ static esp_err_t ota_perform_https_update(const char *download_url) {
         esp_https_ota_abort(ota_handle);
         return err;
     }
+    MY_LOG_INFO(TAG, "OTA: download complete (%d bytes)",
+                esp_https_ota_get_image_len_read(ota_handle));
+    ota_log_resources("before finish");
 
     if (!esp_https_ota_is_complete_data_received(ota_handle)) {
         MY_LOG_INFO(TAG, "OTA: incomplete image");
@@ -4019,6 +4063,8 @@ const char* authmode_to_string(wifi_auth_mode_t mode) {
             return "WPA2/WPA3 Mixed";
         case WIFI_AUTH_WAPI_PSK:
             return "WAPI";
+        case WIFI_AUTH_OWE:
+            return "OWE";
         default:
             return "Unknown";
     }
@@ -12470,6 +12516,30 @@ static bool wifi_lookup_known_password(const char *ssid, char *out, size_t out_s
     return false;
 }
 
+static bool wifi_already_connected_to_ssid(const char *ssid, esp_netif_ip_info_t *ip_info)
+{
+    if (!ssid || current_radio_mode != RADIO_MODE_WIFI || !wifi_initialized) {
+        return false;
+    }
+
+    wifi_ap_record_t ap_info = {0};
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        return false;
+    }
+    if (strcmp((const char *)ap_info.ssid, ssid) != 0) {
+        return false;
+    }
+
+    esp_netif_ip_info_t current_ip = {0};
+    if (!wait_for_sta_ip_info(&current_ip, 1000)) {
+        return false;
+    }
+    if (ip_info) {
+        *ip_info = current_ip;
+    }
+    return true;
+}
+
 static int cmd_wifi_connect(int argc, char **argv) {
     oled_display_update_full("> WiFi Connect",
         argc >= 2 ? argv[1] : "  No SSID",
@@ -12546,6 +12616,18 @@ static int cmd_wifi_connect(int argc, char **argv) {
     } else {
         MY_LOG_INFO(TAG, "wifi_connect: trying open network");
     }
+
+    esp_netif_ip_info_t existing_ip = {0};
+    if (!use_static_ip && wifi_already_connected_to_ssid(ssid, &existing_ip)) {
+        MY_LOG_INFO(TAG, "Wi-Fi: already connected to SSID='%s'", ssid);
+        MY_LOG_INFO(TAG, "SUCCESS: Connected to '%s'", ssid);
+        MY_LOG_INFO(TAG, "DHCP IP: " IPSTR ", Netmask: " IPSTR ", GW: " IPSTR,
+                    IP2STR(&existing_ip.ip), IP2STR(&existing_ip.netmask), IP2STR(&existing_ip.gw));
+        if (ota_after_connect && !ota_start_check(NULL, false)) {
+            return 0;
+        }
+        return 0;
+    }
     
     // Reset WiFi (same as mode switching)
     esp_wifi_disconnect();
@@ -12614,13 +12696,20 @@ static int cmd_wifi_connect(int argc, char **argv) {
         strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password) - 1);
         sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     } else {
+        // Open path. Also cover OWE (Enhanced Open) APs, e.g. modern Android
+        // hotspots, which advertise no password but require the OWE handshake +
+        // PMF. Threshold stays OPEN so plain-open APs still pass; owe_enabled is
+        // opt-in capability so plain-open association is unaffected.
         sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+        sta_config.sta.owe_enabled = true;
+        sta_config.sta.pmf_cfg.capable = true;
     }
-    
+
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-    
+
     // Reset result flag before connecting
     wifi_connect_result = 0;
+    wifi_connect_fail_reason = 0;
     esp_wifi_connect();
     
     MY_LOG_INFO(TAG, "Waiting for connection result...");
@@ -12665,7 +12754,8 @@ static int cmd_wifi_connect(int argc, char **argv) {
         }
         return 0;
     } else if (wifi_connect_result == -1) {
-        MY_LOG_INFO(TAG, "FAILED: Connection to '%s' failed. Check SSID/password and signal.", ssid);
+        MY_LOG_INFO(TAG, "FAILED: Connection to '%s' failed (reason=%d). Check SSID/password and signal.",
+                    ssid, wifi_connect_fail_reason);
         return 0;
     } else {
         MY_LOG_INFO(TAG, "TIMEOUT: Connection to '%s' timed out", ssid);
@@ -12815,19 +12905,13 @@ static int cmd_ota_info(int argc, char **argv) {
         esp_ota_get_state_partition(running, &state);
     }
 
-    MY_LOG_INFO(TAG, "OTA boot: %s offset=0x%lx size=0x%lx",
-                boot ? boot->label : "n/a",
-                boot ? (unsigned long)boot->address : 0UL,
-                boot ? (unsigned long)boot->size : 0UL);
-    MY_LOG_INFO(TAG, "OTA running: %s offset=0x%lx size=0x%lx state=%d",
+    MY_LOG_INFO(TAG, "OTA boot: %s",
+                boot ? boot->label : "n/a");
+    MY_LOG_INFO(TAG, "OTA running: %s state=%d",
                 running ? running->label : "n/a",
-                running ? (unsigned long)running->address : 0UL,
-                running ? (unsigned long)running->size : 0UL,
                 (int)state);
-    MY_LOG_INFO(TAG, "OTA next: %s offset=0x%lx size=0x%lx",
-                next ? next->label : "n/a",
-                next ? (unsigned long)next->address : 0UL,
-                next ? (unsigned long)next->size : 0UL);
+    MY_LOG_INFO(TAG, "OTA next: %s",
+                next ? next->label : "n/a");
 
     const esp_partition_t *ota0 = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
                                                            ESP_PARTITION_SUBTYPE_APP_OTA_0,
@@ -12850,23 +12934,15 @@ static int cmd_ota_info(int argc, char **argv) {
         esp_err_t desc_err = esp_ota_get_partition_description(part, &desc);
         if (desc_err == ESP_OK) {
             MY_LOG_INFO(TAG,
-                        "APP[%d]: %s offset=0x%lx size=0x%lx subtype=0x%x state=%d ver=%s build=%s %s",
+                        "APP[%d]: %s state=%d ver=%s",
                         i,
                         part->label,
-                        (unsigned long)part->address,
-                        (unsigned long)part->size,
-                        part->subtype,
                         (int)part_state,
-                        desc.version,
-                        desc.date,
-                        desc.time);
+                        desc.version);
         } else {
-            MY_LOG_INFO(TAG, "APP[%d]: %s offset=0x%lx size=0x%lx subtype=0x%x state=%d",
+            MY_LOG_INFO(TAG, "APP[%d]: %s state=%d",
                         i,
                         part->label,
-                        (unsigned long)part->address,
-                        (unsigned long)part->size,
-                        part->subtype,
                         (int)part_state);
         }
     }
