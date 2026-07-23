@@ -1,7 +1,18 @@
-# Partition table - custom large partition for BLE+WiFi app
+# Main task stack - increased from 3584 to avoid overflow during startup help printing
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# Console: keep stdio only on UART0. Disabling the USB-Serial-JTAG secondary
+# console prevents the vfs_console fan-out which otherwise sends every byte
+# (logs and linenoise queries) to BOTH UART0 and USB-JTAG, causing duplicated
+# output and "ghost" characters bouncing back into stdin.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+# CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG is not set
+# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED is not set
+
+# Partition table - custom 8 MB OTA layout for BLE+WiFi app
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # Enable PSRAM
@@ -9,6 +20,8 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 # Default log level - ERROR only
 CONFIG_LOG_DEFAULT_LEVEL_ERROR=y
@@ -18,11 +31,19 @@ CONFIG_LOG_DEFAULT_LEVEL=1
 CONFIG_LOG_BOOTLOADER_LEVEL_ERROR=y
 CONFIG_LOG_BOOTLOADER_LEVEL=1
 
+# UART-only console
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
 # Enable Bluetooth with NimBLE stack
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 
 # NimBLE roles: scanning + HID peripheral (keyboard injection)
+# Enable native IEEE 802.15.4 radio for passive Zigbee/Thread recon
+CONFIG_IEEE802154_ENABLED=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_MAX_BONDS=3
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
@@ -35,13 +56,17 @@ CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
 CONFIG_BT_NIMBLE_SM_LEGACY=y
 CONFIG_BT_NIMBLE_SM_SC=y
 
-# WiFi buffer settings - reduced to fit with NimBLE static allocations
-# System can only allocate ~6 static RX buffers with NimBLE compiled in
+# WiFi buffer settings for MITM forwarding (dynamic buffers use PSRAM via SPIRAM_TRY_ALLOCATE_WIFI_LWIP)
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=6
-CONFIG_ESP_WIFI_TX_BA_WIN=4
-CONFIG_ESP_WIFI_RX_BA_WIN=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_TX_BA_WIN=6
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+
+# lwIP IP forwarding for MITM (same-interface forwarding enabled via CMakeLists.txt)
+CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 
 # FatFs Long File Name support (required for SD card directories >8 chars)
 CONFIG_FATFS_LFN_HEAP=y

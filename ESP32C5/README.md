@@ -22,6 +22,8 @@ Important notes:
 - The bootloader and partition table must be flashed once via UART after enabling OTA/rollback. OTA only updates the app image.
 - Rollback happens if the new image crashes before it is marked valid.
 - Auto-OTA on IP is disabled; use the CLI commands below.
+- On ESP32-C5 N8R8 (8 MB flash), each OTA slot is `0x3F0000` bytes (~3.94 MiB). Two full `4 MiB` slots do not fit because boot metadata and data partitions occupy the space before `0x20000`.
+- A UART/web flash that writes only `ota_0` leaves `ota_1` empty until the first OTA update. The bundled `binaries-esp32c5/flash_board.py` now seeds `ota_1` by default by also writing the app at `0x410000`.
 
 ### OTA Commands
 - `wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]`: Connect to Wi-Fi as STA. Add `ota` to trigger OTA right after DHCP, or pass static IP settings (optionally with DNS).
@@ -31,7 +33,7 @@ Important notes:
 - `ota_channel [main|dev]`: Get/set OTA channel (saved in NVS).
   - `main`: GitHub release/latest.
   - `dev`: Pulls the app image from the `development` branch using a raw GitHub URL.
-- `ota_info`: Show OTA partitions, states, and embedded app metadata (version/date).
+- `ota_info`: Show OTA partitions, states, and embedded app version.
 - `ota_boot <ota_0|ota_1>`: Force boot to a specific OTA slot (useful for recovery/testing).
 
 ### OTA Source
