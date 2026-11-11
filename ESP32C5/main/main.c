@@ -128,7 +128,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.0"
+#define JANOS_VERSION "1.7.1"
 
 #define OTA_GITHUB_OWNER "LOCOSP"
 #define OTA_GITHUB_REPO "projectZero"
@@ -657,6 +657,7 @@ typedef struct {
 } wdp_network_t;
 
 static bool wardrive_promisc_active = false;
+static volatile bool wardrive_serial_mode = false; // serial-stream wardrive: no GPS gate, no SD; host adds GPS
 static TaskHandle_t wardrive_promisc_task_handle = NULL;
 static volatile bool antisurv_active = false;
 static TaskHandle_t antisurv_task_handle = NULL;
@@ -1997,6 +1998,7 @@ static void wardrive_promisc_task(void *pvParameters);
 static int cmd_start_wardrive_promisc(int argc, char **argv);
 static int cmd_start_wardrive_promisc_trace(int argc, char **argv);
 static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_enabled);
+static int cmd_start_wardrive_serial(int argc, char **argv);
 // DNS server task
 static void dns_server_task(void *pvParameters);
 // Portal HTTP handlers
@@ -6043,7 +6045,7 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout - use 'stop' to cancel)...");
     oled_display_update_full("> Wardrive Pro", "  Waiting GPS...", "  No timeout", "  Use 'stop'");
-    if (!wait_for_gps_fix(0)) {
+    if (!wardrive_serial_mode && !wait_for_gps_fix(0)) {
         MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, not continuing without GPS data - please ensure clear view of the sky and try again.");
         oled_display_update_full("> Wardrive Pro", "  No GPS fix!", "  Stopping...", "");
         goto cleanup;
@@ -6492,6 +6494,7 @@ cleanup:
     MY_LOG_INFO(TAG, "Wardrive promisc stopped. Total unique networks: %d, BT devices: %d, distance: %.1fm",
                 wdp_seen_count, bt_device_count, wdp_total_distance_m);
     wardrive_promisc_active = false;
+    wardrive_serial_mode = false;
     wardrive_promisc_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -6601,6 +6604,15 @@ static int cmd_start_wardrive_promisc(int argc, char **argv) {
 
 static int cmd_start_wardrive_promisc_trace(int argc, char **argv) {
     return cmd_start_wardrive_promisc_impl(argc, argv, true);
+}
+
+// Serial-stream wardrive: promiscuous D-UCB sweep, each AP streamed over UART
+// (wdp_promiscuous_cb already printf's WiGLE rows). NO on-ESP GPS gate, NO SD.
+// For hosts that drive the ESP over serial and add GPS themselves (e.g. XIAO C5
+// on a Raspberry host). Stop with 'stop'.
+static int cmd_start_wardrive_serial(int argc, char **argv) {
+    wardrive_serial_mode = true;
+    return cmd_start_wardrive_promisc_impl(argc, argv, false);
 }
 
 // ============================================================================
@@ -20782,6 +20794,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cmd));
+
+    const esp_console_cmd_t wardrive_serial_cmd = {
+        .command = "start_wardrive_serial",
+        .help = "Promiscuous wardrive, stream APs over serial (no GPS gate, no SD) - host adds GPS",
+        .hint = NULL,
+        .func = &cmd_start_wardrive_serial,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_serial_cmd));
 
     const esp_console_cmd_t get_wardrive_config_cmd = {
         .command = "get_wardrive_config",
