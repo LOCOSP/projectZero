@@ -128,7 +128,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.1"
+#define JANOS_VERSION "1.7.2"
 
 #define OTA_GITHUB_OWNER "LOCOSP"
 #define OTA_GITHUB_REPO "projectZero"
@@ -5952,7 +5952,9 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     char timestamp[32];
     get_timestamp_string(timestamp, sizeof(timestamp));
 
-    if (current_gps.valid) {
+    if (wardrive_serial_mode) {
+        // serial mode: the task flush streams the full WiGLE 1.6 row (task context, not the WiFi callback)
+    } else if (current_gps.valid) {
         printf("%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
                mac_str, escaped_ssid, auth_str, timestamp,
                beacon_channel, (int)pkt->rx_ctrl.rssi,
@@ -6029,7 +6031,7 @@ static void wardrive_promisc_task(void *pvParameters) {
         ESP_LOGW(TAG, "Failed to set LED for wardrive promisc: %s", esp_err_to_name(led_err));
     }
 
-    int file_number = find_next_wardrive_file_number();
+    int file_number = wardrive_serial_mode ? 0 : find_next_wardrive_file_number();
     MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", file_number);
     double wdp_total_distance_m = 0.0;
     double wdp_last_trace_lat = 0.0;
@@ -6233,7 +6235,7 @@ static void wardrive_promisc_task(void *pvParameters) {
 
         // Read GPS source
         int gps_len = 0;
-        if (!external_feed) {
+        if (!external_feed && !wardrive_serial_mode) {
             gps_len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(10));
             if (gps_len > 0) {
                 wardrive_gps_buffer[gps_len] = '\0';
@@ -6276,7 +6278,7 @@ static void wardrive_promisc_task(void *pvParameters) {
             }
         }
 
-        if (gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
+        if (!wardrive_serial_mode && gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
             MY_LOG_INFO(TAG, "GPS fix lost for %d cycles! Pausing wardrive...", gps_fix_lost_count);
             if (wifi_scan_enabled) esp_wifi_set_promiscuous(false);
             if (wdp_bt_running) {
@@ -6330,7 +6332,8 @@ static void wardrive_promisc_task(void *pvParameters) {
                             ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US);
         if ((current_count - last_flush_count) >= WDP_FILE_FLUSH_INTERVAL ||
             ((current_count > last_flush_count) && ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US)) ||
-            bt_flush_due || relog_flush_due) {
+            bt_flush_due || relog_flush_due ||
+            (wardrive_serial_mode && (current_count > last_flush_count || wdp_relog_pending || bt_pending > 0))) {
 
             // Clear before the write loop; any re-log marked during the loop re-arms it.
             wdp_relog_pending = false;
@@ -6338,15 +6341,20 @@ static void wardrive_promisc_task(void *pvParameters) {
             char filename[64];
             snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", file_number);
 
+            const bool serial_out = wardrive_serial_mode;  // XIAO: full WiGLE 1.6 rows over serial, no SD
+#define WDP_OUT(...) do { if (file) fprintf(file, __VA_ARGS__); if (serial_out) printf(__VA_ARGS__); } while (0)
             struct stat st;
-            if (stat("/sdcard/lab/wardrives", &st) != 0) {
+            FILE *file = NULL;
+            if (!serial_out && stat("/sdcard/lab/wardrives", &st) != 0) {
                 MY_LOG_INFO(TAG, "Error: /sdcard/lab/wardrives directory not accessible");
             } else {
-                FILE *file = fopen(filename, "a");
-                if (!file) file = fopen(filename, "w");
-                if (file) {
-                    fseek(file, 0, SEEK_END);
-                    if (ftell(file) == 0) {
+                if (!serial_out) {
+                    file = fopen(filename, "a");
+                    if (!file) file = fopen(filename, "w");
+                }
+                if (file || serial_out) {
+                    if (file) fseek(file, 0, SEEK_END);
+                    if (file && ftell(file) == 0) {
                         fprintf(file, "WigleWifi-1.6,appRelease=v1.1,model=MonsterC5,release=v1.0,device=MonsterC5,display=SPI TFT,board=ESP32C5,brand=LAB5\n");
                         fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
                     }
@@ -6370,13 +6378,13 @@ static void wardrive_promisc_task(void *pvParameters) {
                         int wifi_freq_mhz = wigle_wifi_channel_to_frequency_mhz(wdp_seen_networks[i].channel);
 
                         if (current_gps.valid) {
-                            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
+                            WDP_OUT("%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
                                     wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi,
                                     current_gps.latitude, current_gps.longitude,
                                     current_gps.altitude, current_gps.accuracy);
                         } else {
-                            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
+                            WDP_OUT("%s,%s,[%s],%s,%d,%d,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
                                     wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi);
                         }
@@ -6409,7 +6417,7 @@ static void wardrive_promisc_task(void *pvParameters) {
                             const char *bt_cap = bt_devices[i].is_airtag  ? "AirTag [LE]"  :
                                                  bt_devices[i].is_smarttag ? "SmartTag [LE]" : "Misc [LE]";
                             if (current_gps.valid) {
-                                fprintf(file, "%s,%s,%s,%s,0,,%d,%.7f,%.7f,%.2f,%.2f,,%s,BLE\n",
+                                if (file) fprintf(file, "%s,%s,%s,%s,0,,%d,%.7f,%.7f,%.2f,%.2f,,%s,BLE\n",
                                         bt_mac, escaped_bt_name, bt_cap, timestamp,
                                         (int)bt_devices[i].rssi,
                                         current_gps.latitude, current_gps.longitude,
@@ -6420,7 +6428,7 @@ static void wardrive_promisc_task(void *pvParameters) {
                                        current_gps.latitude, current_gps.longitude,
                                        current_gps.altitude, current_gps.accuracy, bt_mfgr_id);
                             } else {
-                                fprintf(file, "%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
+                                if (file) fprintf(file, "%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
                                         bt_mac, escaped_bt_name, bt_cap, timestamp,
                                         (int)bt_devices[i].rssi, bt_mfgr_id);
                                 printf("%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
@@ -6440,18 +6448,18 @@ static void wardrive_promisc_task(void *pvParameters) {
                         wdp_bt_flush_count = bt_total;
                     }
 
-                    fclose(file);
-                    sd_sync();
+                    if (file) { fclose(file); sd_sync(); }
                     last_flush_count = current_count;
-                    MY_LOG_INFO(TAG, "Flushed %d networks + %d BT devices to %s",
-                                current_count, wdp_bt_flush_count, filename);
-                    {
+                    if (!serial_out) {
+                        MY_LOG_INFO(TAG, "Flushed %d networks + %d BT devices to %s",
+                                    current_count, wdp_bt_flush_count, filename);
                         char wdp_fl3[64];
                         snprintf(wdp_fl3, sizeof(wdp_fl3), "  %d nets %d BT", current_count, wdp_bt_flush_count);
                         oled_display_update_full("> Wardrive Pro", "  Flushed to SD", wdp_fl3, "  D-UCB active");
                     }
                 }
             }
+#undef WDP_OUT
         }
 
         // Periodic stats
@@ -6560,7 +6568,11 @@ static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_ena
     const bool external_feed = gps_module_uses_external_feed(current_gps_module);
 
     esp_err_t ret = ESP_OK;
-    if (!external_feed) {
+    if (wardrive_serial_mode) {
+        // Host provides GPS. Do NOT init the GPS UART: on XIAO C5 GPS_TX/RX (GPIO13/14)
+        // are the native USB D-/D+ pins - claiming them kills the USB-Serial-JTAG console.
+        MY_LOG_INFO(TAG, "Serial wardrive: GPS UART + SD skipped (host stamps GPS, rows streamed over serial)");
+    } else if (!external_feed) {
         int baud = gps_get_baud_for_module(current_gps_module);
         ret = init_gps_uart(baud);
         if (ret != ESP_OK) {
@@ -6574,6 +6586,7 @@ static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_ena
                     gps_external_position_command_name(current_gps_module));
     }
 
+    if (!wardrive_serial_mode) {
     ret = init_sd_card();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
@@ -6581,6 +6594,7 @@ static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_ena
     }
     MY_LOG_INFO(TAG, "SD card initialized on pins MISO:%d MOSI:%d CLK:%d CS:%d",
                 SD_MISO_PIN, SD_MOSI_PIN, SD_CLK_PIN, SD_CS_PIN);
+    }
 
     wardrive_promisc_active = true;
     BaseType_t result = xTaskCreate(
@@ -6603,10 +6617,12 @@ static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_ena
 }
 
 static int cmd_start_wardrive_promisc(int argc, char **argv) {
+    wardrive_serial_mode = false;
     return cmd_start_wardrive_promisc_impl(argc, argv, false);
 }
 
 static int cmd_start_wardrive_promisc_trace(int argc, char **argv) {
+    wardrive_serial_mode = false;
     return cmd_start_wardrive_promisc_impl(argc, argv, true);
 }
 
