@@ -6053,6 +6053,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f",
                 current_gps.latitude, current_gps.longitude);
     oled_display_update_full("> Wardrive Pro", "  GPS fix OK!", "  D-UCB scanning", "");
+    if (wardrive_serial_mode) { printf("WDSER M1 past-gps-gate\n"); fflush(stdout); }
 
     if (wardrive_promisc_trace_enabled) {
         if (wardrive_trace_init_file(wardrive_promisc_trace_path)) {
@@ -6078,6 +6079,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     wdp_relog_writes = 0;
     memset(wdp_seen_networks, 0, (size_t)wdp_seen_capacity * sizeof(wdp_network_t));
     wdp_ducb_init(&g_wd_cfg);
+    if (wardrive_serial_mode) { printf("WDSER M2 ducb-init done, channels=%d\n", wdp_ducb_channel_count); fflush(stdout); }
 
     // No WiFi channels selected => BLE-only mode (no promiscuous, no channel hop).
     const bool wifi_scan_enabled = (wdp_ducb_channel_count > 0);
@@ -6103,12 +6105,14 @@ static void wardrive_promisc_task(void *pvParameters) {
         esp_wifi_set_promiscuous_filter(&filter);
         esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
         esp_wifi_set_promiscuous(true);
+        if (wardrive_serial_mode) { printf("WDSER M3 promiscuous-enabled\n"); fflush(stdout); }
     }
 
     {
         char wd_bands[24];
         wardrive_config_format_bands(wd_bands, sizeof(wd_bands));
-        MY_LOG_INFO(TAG, "Promiscuous wardrive started. Bands: %s, WiFi channels: %d%s",
+        if (wardrive_serial_mode) { printf("WDSER M4 reached-started-log\n"); fflush(stdout); }
+    MY_LOG_INFO(TAG, "Promiscuous wardrive started. Bands: %s, WiFi channels: %d%s",
                     wd_bands, wdp_ducb_channel_count,
                     wifi_scan_enabled ? "" : " (BLE-only mode)");
     }
